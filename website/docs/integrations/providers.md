@@ -23,15 +23,19 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
+| **Kimi / Moonshot (China)** | `KIMI_CN_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding-cn`; aliases: `kimi-cn`, `moonshot-cn`) |
+| **Arcee AI** | `ARCEEAI_API_KEY` in `~/.hermes/.env` (provider: `arcee`; aliases: `arcee-ai`, `arceeai`) |
 | **MiniMax** | `MINIMAX_API_KEY` in `~/.hermes/.env` (provider: `minimax`) |
 | **MiniMax China** | `MINIMAX_CN_API_KEY` in `~/.hermes/.env` (provider: `minimax-cn`) |
 | **Alibaba Cloud** | `DASHSCOPE_API_KEY` in `~/.hermes/.env` (provider: `alibaba`, aliases: `dashscope`, `qwen`) |
 | **Kilo Code** | `KILOCODE_API_KEY` in `~/.hermes/.env` (provider: `kilocode`) |
+| **Xiaomi MiMo** | `XIAOMI_API_KEY` in `~/.hermes/.env` (provider: `xiaomi`, aliases: `mimo`, `xiaomi-mimo`) |
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
 | **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |
-| **Custom Endpoint** | `hermes model` (saved in `config.yaml`) or `OPENAI_BASE_URL` + `OPENAI_API_KEY` in `~/.hermes/.env` |
+| **Google / Gemini** | `GOOGLE_API_KEY` (or `GEMINI_API_KEY`) in `~/.hermes/.env` (provider: `gemini`) |
+| **Custom Endpoint** | `hermes model` → choose "Custom endpoint" (saved in `config.yaml`) |
 
 :::tip Model key alias
 In the `model:` config section, you can use either `default:` or `model:` as the key name for your model ID. Both `model: { default: my-model }` and `model: { model: my-model }` work identically.
@@ -141,9 +145,13 @@ These providers have built-in support with dedicated provider IDs. Set the API k
 hermes chat --provider zai --model glm-5
 # Requires: GLM_API_KEY in ~/.hermes/.env
 
-# Kimi / Moonshot AI
+# Kimi / Moonshot AI (international: api.moonshot.ai)
 hermes chat --provider kimi-coding --model kimi-for-coding
 # Requires: KIMI_API_KEY in ~/.hermes/.env
+
+# Kimi / Moonshot AI (China: api.moonshot.cn)
+hermes chat --provider kimi-coding-cn --model kimi-k2.5
+# Requires: KIMI_CN_API_KEY in ~/.hermes/.env
 
 # MiniMax (global endpoint)
 hermes chat --provider minimax --model MiniMax-M2.7
@@ -156,16 +164,34 @@ hermes chat --provider minimax-cn --model MiniMax-M2.7
 # Alibaba Cloud / DashScope (Qwen models)
 hermes chat --provider alibaba --model qwen3.5-plus
 # Requires: DASHSCOPE_API_KEY in ~/.hermes/.env
+
+# Xiaomi MiMo
+hermes chat --provider xiaomi --model mimo-v2-pro
+# Requires: XIAOMI_API_KEY in ~/.hermes/.env
+
+# Arcee AI (Trinity models)
+hermes chat --provider arcee --model trinity-large-thinking
+# Requires: ARCEEAI_API_KEY in ~/.hermes/.env
 ```
 
 Or set the provider permanently in `config.yaml`:
 ```yaml
 model:
-  provider: "zai"       # or: kimi-coding, minimax, minimax-cn, alibaba
+  provider: "zai"       # or: kimi-coding, kimi-coding-cn, minimax, minimax-cn, alibaba, xiaomi, arcee
   default: "glm-5"
 ```
 
-Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, or `DASHSCOPE_BASE_URL` environment variables.
+Base URLs can be overridden with `GLM_BASE_URL`, `KIMI_BASE_URL`, `MINIMAX_BASE_URL`, `MINIMAX_CN_BASE_URL`, `DASHSCOPE_BASE_URL`, or `XIAOMI_BASE_URL` environment variables.
+
+:::note Z.AI Endpoint Auto-Detection
+When using the Z.AI / GLM provider, Hermes automatically probes multiple endpoints (global, China, coding variants) to find one that accepts your API key. You don't need to set `GLM_BASE_URL` manually — the working endpoint is detected and cached automatically.
+:::
+
+### xAI (Grok) Prompt Caching
+
+When using xAI as a provider (any base URL containing `x.ai`), Hermes automatically enables prompt caching by sending the `x-grok-conv-id` header with every API request. This routes requests to the same server within a conversation session, allowing xAI's infrastructure to reuse cached system prompts and conversation history.
+
+No configuration is needed — caching activates automatically when an xAI endpoint is detected and a session ID is available. This reduces latency and cost for multi-turn conversations.
 
 ### Hugging Face Inference Providers
 
@@ -219,7 +245,7 @@ model:
 ```
 
 :::warning Legacy env vars
-`OPENAI_BASE_URL` and `LLM_MODEL` in `.env` are **deprecated**. The CLI ignores `LLM_MODEL` entirely (only the gateway reads it). Use `hermes model` or edit `config.yaml` directly — both persist correctly across restarts and Docker containers.
+`OPENAI_BASE_URL` and `LLM_MODEL` in `.env` are **removed**. Neither is read by any part of Hermes — `config.yaml` is the single source of truth for model and endpoint configuration. If you have stale entries in your `.env`, they are automatically cleared on the next `hermes setup` or config migration. Use `hermes model` or edit `config.yaml` directly.
 :::
 
 Both approaches persist to `config.yaml`, which is the source of truth for model, provider, and base URL.
@@ -478,9 +504,124 @@ To set persistent per-model defaults: My Models tab → gear icon on the model �
 
 ---
 
+### WSL2 Networking (Windows Users)
+
+Since Hermes Agent requires a Unix environment, Windows users run it inside WSL2. If your model server (Ollama, LM Studio, etc.) runs on the **Windows host**, you need to bridge the network gap — WSL2 uses a virtual network adapter with its own subnet, so `localhost` inside WSL2 refers to the Linux VM, **not** the Windows host.
+
+:::tip Both in WSL2? No problem.
+If your model server also runs inside WSL2 (common for vLLM, SGLang, and llama-server), `localhost` works as expected — they share the same network namespace. Skip this section.
+:::
+
+#### Option 1: Mirrored Networking Mode (Recommended)
+
+Available on **Windows 11 22H2+**, mirrored mode makes `localhost` work bidirectionally between Windows and WSL2 — the simplest fix.
+
+1. Create or edit `%USERPROFILE%\.wslconfig` (e.g., `C:\Users\YourName\.wslconfig`):
+   ```ini
+   [wsl2]
+   networkingMode=mirrored
+   ```
+
+2. Restart WSL from PowerShell:
+   ```powershell
+   wsl --shutdown
+   ```
+
+3. Reopen your WSL2 terminal. `localhost` now reaches Windows services:
+   ```bash
+   curl http://localhost:11434/v1/models   # Ollama on Windows — works
+   ```
+
+:::note Hyper-V Firewall
+On some Windows 11 builds, the Hyper-V firewall blocks mirrored connections by default. If `localhost` still doesn't work after enabling mirrored mode, run this in an **Admin PowerShell**:
+```powershell
+Set-NetFirewallHyperVVMSetting -Name '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -DefaultInboundAction Allow
+```
+:::
+
+#### Option 2: Use the Windows Host IP (Windows 10 / older builds)
+
+If you can't use mirrored mode, find the Windows host IP from inside WSL2 and use that instead of `localhost`:
+
+```bash
+# Get the Windows host IP (the default gateway of WSL2's virtual network)
+ip route show | grep -i default | awk '{ print $3 }'
+# Example output: 172.29.192.1
+```
+
+Use that IP in your Hermes config:
+
+```yaml
+model:
+  default: qwen2.5-coder:32b
+  provider: custom
+  base_url: http://172.29.192.1:11434/v1   # Windows host IP, not localhost
+```
+
+:::tip Dynamic helper
+The host IP can change on WSL2 restart. You can grab it dynamically in your shell:
+```bash
+export WSL_HOST=$(ip route show | grep -i default | awk '{ print $3 }')
+echo "Windows host at: $WSL_HOST"
+curl http://$WSL_HOST:11434/v1/models   # Test Ollama
+```
+
+Or use your machine's mDNS name (requires `libnss-mdns` in WSL2):
+```bash
+sudo apt install libnss-mdns
+curl http://$(hostname).local:11434/v1/models
+```
+:::
+
+#### Server Bind Address (Required for NAT Mode)
+
+If you're using **Option 2** (NAT mode with the host IP), the model server on Windows must accept connections from outside `127.0.0.1`. By default, most servers only listen on localhost — WSL2 connections in NAT mode come from a different virtual subnet and will be refused. In mirrored mode, `localhost` maps directly so the default `127.0.0.1` binding works fine.
+
+| Server | Default bind | How to fix |
+|--------|-------------|------------|
+| **Ollama** | `127.0.0.1` | Set `OLLAMA_HOST=0.0.0.0` environment variable before starting Ollama (System Settings → Environment Variables on Windows, or edit the Ollama service) |
+| **LM Studio** | `127.0.0.1` | Enable **"Serve on Network"** in the Developer tab → Server settings |
+| **llama-server** | `127.0.0.1` | Add `--host 0.0.0.0` to the startup command |
+| **vLLM** | `0.0.0.0` | Already binds to all interfaces by default |
+| **SGLang** | `127.0.0.1` | Add `--host 0.0.0.0` to the startup command |
+
+**Ollama on Windows (detailed):** Ollama runs as a Windows service. To set `OLLAMA_HOST`:
+1. Open **System Properties** → **Environment Variables**
+2. Add a new **System variable**: `OLLAMA_HOST` = `0.0.0.0`
+3. Restart the Ollama service (or reboot)
+
+#### Windows Firewall
+
+Windows Firewall treats WSL2 as a separate network (in both NAT and mirrored mode). If connections still fail after the steps above, add a firewall rule for your model server's port:
+
+```powershell
+# Run in Admin PowerShell — replace PORT with your server's port
+New-NetFirewallRule -DisplayName "Allow WSL2 to Model Server" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 11434
+```
+
+Common ports: Ollama `11434`, vLLM `8000`, SGLang `30000`, llama-server `8080`, LM Studio `1234`.
+
+#### Quick Verification
+
+From inside WSL2, test that you can reach your model server:
+
+```bash
+# Replace URL with your server's address and port
+curl http://localhost:11434/v1/models          # Mirrored mode
+curl http://172.29.192.1:11434/v1/models       # NAT mode (use your actual host IP)
+```
+
+If you get a JSON response listing your models, you're good. Use that same URL as the `base_url` in your Hermes config.
+
+---
+
 ### Troubleshooting Local Models
 
 These issues affect **all** local inference servers when used with Hermes.
+
+#### "Connection refused" from WSL2 to a Windows-hosted model server
+
+If you're running Hermes inside WSL2 and your model server on the Windows host, `http://localhost:<port>` won't work in WSL2's default NAT networking mode. See [WSL2 Networking](#wsl2-networking-windows-users) above for the fix.
 
 #### Tool calls appear as text instead of executing
 
@@ -531,8 +672,8 @@ model:
 #### Responses get cut off mid-sentence
 
 **Possible causes:**
-1. **Low `max_tokens` on the server** — SGLang defaults to 128 tokens per response. Set `--default-max-tokens` on the server or configure Hermes with `model.max_tokens` in config.yaml.
-2. **Context exhaustion** — The model filled its context window. Increase context length or enable [context compression](/docs/user-guide/configuration#context-compression) in Hermes.
+1. **Low output cap (`max_tokens`) on the server** — SGLang defaults to 128 tokens per response. Set `--default-max-tokens` on the server or configure Hermes with `model.max_tokens` in config.yaml. Note: `max_tokens` controls response length only — it is unrelated to how long your conversation history can be (that is `context_length`).
+2. **Context exhaustion** — The model filled its context window. Increase `model.context_length` or enable [context compression](/docs/user-guide/configuration#context-compression) in Hermes.
 
 ---
 
@@ -625,6 +766,15 @@ model:
 
 ### Context Length Detection
 
+:::note Two settings, easy to confuse
+**`context_length`** is the **total context window** — the combined budget for input *and* output tokens (e.g. 200,000 for Claude Opus 4.6). Hermes uses this to decide when to compress history and to validate API requests.
+
+**`model.max_tokens`** is the **output cap** — the maximum number of tokens the model may generate in a *single response*. It has nothing to do with how long your conversation history can be. The industry-standard name `max_tokens` is a common source of confusion; Anthropic's native API has since renamed it `max_output_tokens` for clarity.
+
+Set `context_length` when auto-detection gets the window size wrong.
+Set `model.max_tokens` only when you need to limit how long individual responses can be.
+:::
+
 Hermes uses a multi-source resolution chain to detect the correct context window for your model and provider:
 
 1. **Config override** — `model.context_length` in config.yaml (highest priority)
@@ -714,7 +864,7 @@ You can also select named custom providers from the interactive `hermes model` m
 | **Cost optimization** | ClawRouter or OpenRouter with `sort: "price"` |
 | **Maximum privacy** | Ollama, vLLM, or llama.cpp (fully local) |
 | **Enterprise / Azure** | Azure OpenAI with custom endpoint |
-| **Chinese AI models** | z.ai (GLM), Kimi/Moonshot, or MiniMax (first-class providers) |
+| **Chinese AI models** | z.ai (GLM), Kimi/Moonshot (`kimi-coding` or `kimi-coding-cn`), MiniMax, or Xiaomi MiMo (first-class providers) |
 
 :::tip
 You can switch between providers at any time with `hermes model` — no restart required. Your conversation history, memory, and skills carry over regardless of which provider you use.
@@ -729,8 +879,10 @@ You can switch between providers at any time with `hermes model` — no restart 
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
+| Mistral TTS + voice transcription | [Mistral](https://console.mistral.ai/) | `MISTRAL_API_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
 | Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
+| Semantic long-term memory | [Supermemory](https://supermemory.ai) | `SUPERMEMORY_API_KEY` |
 
 ### Self-Hosting Firecrawl
 
@@ -787,7 +939,7 @@ fallback_model:
 
 When activated, the fallback swaps the model and provider mid-session without losing your conversation. It fires **at most once** per session.
 
-Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`, `deepseek`, `ai-gateway`, `opencode-zen`, `opencode-go`, `kilocode`, `alibaba`, `custom`.
+Supported providers: `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `deepseek`, `ai-gateway`, `opencode-zen`, `opencode-go`, `kilocode`, `xiaomi`, `arcee`, `alibaba`, `custom`.
 
 :::tip
 Fallback is configured exclusively through `config.yaml` — there are no environment variables for it. For full details on when it triggers, supported providers, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/docs/user-guide/features/fallback-providers).

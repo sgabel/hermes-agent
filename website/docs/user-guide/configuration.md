@@ -352,6 +352,31 @@ Commands that require `stdin_data` or sudo automatically fall back to one-shot m
 
 See [Code Execution](features/code-execution.md) and the [Terminal section of the README](features/tools.md) for details on each backend.
 
+## Skill Settings
+
+Skills can declare their own configuration settings via their SKILL.md frontmatter. These are non-secret values (paths, preferences, domain settings) stored under the `skills.config` namespace in `config.yaml`.
+
+```yaml
+skills:
+  config:
+    wiki:
+      path: ~/wiki          # Used by the llm-wiki skill
+```
+
+**How skill settings work:**
+
+- `hermes config migrate` scans all enabled skills, finds unconfigured settings, and offers to prompt you
+- `hermes config show` displays all skill settings under "Skill Settings" with the skill they belong to
+- When a skill loads, its resolved config values are injected into the skill context automatically
+
+**Setting values manually:**
+
+```bash
+hermes config set skills.config.wiki.path ~/my-research-wiki
+```
+
+For details on declaring config settings in your own skills, see [Creating Skills — Config Settings](/docs/developer-guide/creating-skills#config-settings-configyaml).
+
 ## Memory Configuration
 
 ```yaml
@@ -416,10 +441,18 @@ compression:
   threshold: 0.50                                   # Compress at this % of context limit
   target_ratio: 0.20                                # Fraction of threshold to preserve as recent tail
   protect_last_n: 20                                # Min recent messages to keep uncompressed
-  summary_model: "google/gemini-3-flash-preview"    # Model for summarization
-  summary_provider: "auto"                          # Provider: "auto", "openrouter", "nous", "codex", "main", etc.
-  summary_base_url: null                            # Custom OpenAI-compatible endpoint (overrides provider)
+
+# The summarization model/provider is configured under auxiliary:
+auxiliary:
+  compression:
+    model: "google/gemini-3-flash-preview"          # Model for summarization
+    provider: "auto"                                # Provider: "auto", "openrouter", "nous", "codex", "main", etc.
+    base_url: null                                  # Custom OpenAI-compatible endpoint (overrides provider)
 ```
+
+:::info Legacy config migration
+Older configs with `compression.summary_model`, `compression.summary_provider`, and `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load (config version 17). No manual action needed.
+:::
 
 ### Common setups
 
@@ -433,29 +466,53 @@ Uses the first available provider (OpenRouter → Nous → Codex) with Gemini Fl
 
 **Force a specific provider** (OAuth or API-key based):
 ```yaml
-compression:
-  summary_provider: nous
-  summary_model: gemini-3-flash
+auxiliary:
+  compression:
+    provider: nous
+    model: gemini-3-flash
 ```
 Works with any provider: `nous`, `openrouter`, `codex`, `anthropic`, `main`, etc.
 
 **Custom endpoint** (self-hosted, Ollama, zai, DeepSeek, etc.):
 ```yaml
-compression:
-  summary_model: glm-4.7
-  summary_base_url: https://api.z.ai/api/coding/paas/v4
+auxiliary:
+  compression:
+    model: glm-4.7
+    base_url: https://api.z.ai/api/coding/paas/v4
 ```
 Points at a custom OpenAI-compatible endpoint. Uses `OPENAI_API_KEY` for auth.
 
 ### How the three knobs interact
 
-| `summary_provider` | `summary_base_url` | Result |
+| `auxiliary.compression.provider` | `auxiliary.compression.base_url` | Result |
 |---------------------|---------------------|--------|
 | `auto` (default) | not set | Auto-detect best available provider |
 | `nous` / `openrouter` / etc. | not set | Force that provider, use its auth |
 | any | set | Use the custom endpoint directly (provider ignored) |
 
-The `summary_model` must support a context length at least as large as your main model's, since it receives the full middle section of the conversation for compression.
+:::warning Summary model context length requirement
+The summary model **must** have a context window at least as large as your main agent model's. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is smaller than the main model's, the summarization call will fail with a context length error. When this happens, the middle turns are **dropped without a summary**, losing conversation context silently. If you override the model, verify its context length meets or exceeds your main model's.
+:::
+
+## Context Engine
+
+The context engine controls how conversations are managed when approaching the model's token limit. The built-in `compressor` engine uses lossy summarization (see [Context Compression](/docs/developer-guide/context-compression-and-caching)). Plugin engines can replace it with alternative strategies.
+
+```yaml
+context:
+  engine: "compressor"    # default — built-in lossy summarization
+```
+
+To use a plugin engine (e.g., LCM for lossless context management):
+
+```yaml
+context:
+  engine: "lcm"          # must match the plugin's name
+```
+
+Plugin engines are **never auto-activated** — you must explicitly set `context.engine` to the plugin name. Available engines can be browsed and selected via `hermes plugins` → Provider Plugins → Context Engine.
+
+See [Memory Providers](/docs/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
 
 ## Iteration Budget Pressure
 
@@ -474,6 +531,22 @@ agent:
 ```
 
 Budget pressure is enabled by default. The agent sees warnings naturally as part of tool results, encouraging it to consolidate its work and deliver a response before running out of iterations.
+
+When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (90/90) — response may be incomplete`. If the budget runs out during active work, the agent generates a summary of what was accomplished before stopping.
+
+### Streaming Timeouts
+
+The LLM streaming connection has two timeout layers. Both auto-adjust for local providers (localhost, LAN IPs) — no configuration needed for most setups.
+
+| Timeout | Default | Local providers | Env var |
+|---------|---------|----------------|---------|
+| Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
+| Stale stream detection | 180s | Auto-disabled | `HERMES_STREAM_STALE_TIMEOUT` |
+| API call (non-streaming) | 1800s | Unchanged | `HERMES_API_TIMEOUT` |
+
+The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
+
+The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. This is disabled entirely for local providers since they don't send keep-alive pings during prefill.
 
 ## Context Pressure Warnings
 
@@ -528,7 +601,11 @@ Every model slot in Hermes — auxiliary tasks, compression, fallback — uses t
 
 When `base_url` is set, Hermes ignores the provider and calls that endpoint directly (using `api_key` or `OPENAI_API_KEY` for auth). When only `provider` is set, Hermes uses that provider's built-in auth and base URL.
 
-Available providers: `auto`, `openrouter`, `nous`, `codex`, `copilot`, `anthropic`, `main`, `zai`, `kimi-coding`, `minimax`, and any provider registered in the [provider registry](/docs/reference/environment-variables).
+Available providers for auxiliary tasks: `auto`, `openrouter`, `nous`, `codex`, `copilot`, `anthropic`, `main`, `zai`, `kimi-coding`, `kimi-coding-cn`, `arcee`, `minimax`, any provider registered in the [provider registry](/docs/reference/environment-variables), or any named custom provider from your `custom_providers` list (e.g. `provider: "beans"`).
+
+:::warning `"main"` is for auxiliary tasks only
+The `"main"` provider option means "use whatever provider my main agent uses" — it's only valid inside `auxiliary:`, `compression:`, and `fallback_model:` configs. It is **not** a valid value for your top-level `model.provider` setting. If you use a custom OpenAI-compatible endpoint, set `provider: custom` in your `model:` section. See [AI Providers](/docs/integrations/providers) for all main model provider options.
+:::
 
 ### Full auxiliary config reference
 
@@ -540,7 +617,7 @@ auxiliary:
     model: ""                  # e.g. "openai/gpt-4o", "google/gemini-2.5-flash"
     base_url: ""               # Custom OpenAI-compatible endpoint (overrides provider)
     api_key: ""                # API key for base_url (falls back to OPENAI_API_KEY)
-    timeout: 30                # seconds — LLM API call; increase for slow local vision models
+    timeout: 120               # seconds — LLM API call timeout; vision payloads need generous timeout
     download_timeout: 30       # seconds — image HTTP download; increase for slow connections
 
   # Web page summarization + browser page text extraction
@@ -549,7 +626,7 @@ auxiliary:
     model: ""                  # e.g. "google/gemini-2.5-flash"
     base_url: ""
     api_key: ""
-    timeout: 30                # seconds
+    timeout: 360               # seconds (6min) — per-attempt LLM summarization
 
   # Dangerous command approval classifier
   approval:
@@ -597,11 +674,11 @@ auxiliary:
 ```
 
 :::tip
-Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 30s, web_extract 30s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
+Each auxiliary task has a configurable `timeout` (in seconds). Defaults: vision 120s, web_extract 360s, approval 30s, compression 120s. Increase these if you use slow local models for auxiliary tasks. Vision also has a separate `download_timeout` (default 30s) for the HTTP image download — increase this for slow connections or self-hosted image servers.
 :::
 
 :::info
-Context compression has its own top-level `compression:` block with `summary_provider`, `summary_model`, and `summary_base_url` — see [Context Compression](#context-compression) above. The fallback model uses a `fallback_model:` block — see [Fallback Model](/docs/integrations/providers#fallback-model). All three follow the same provider/model/base_url pattern.
+Context compression has its own `compression:` block for thresholds and an `auxiliary.compression:` block for model/provider settings — see [Context Compression](#context-compression) above. The fallback model uses a `fallback_model:` block — see [Fallback Model](/docs/integrations/providers#fallback-model). All three follow the same provider/model/base_url pattern.
 :::
 
 ### Changing the Vision Model
@@ -622,13 +699,15 @@ AUXILIARY_VISION_MODEL=openai/gpt-4o
 
 ### Provider Options
 
+These options apply to **auxiliary task configs** (`auxiliary:`, `compression:`, `fallback_model:`), not to your main `model.provider` setting.
+
 | Provider | Description | Requirements |
 |----------|-------------|-------------|
 | `"auto"` | Best available (default). Vision tries OpenRouter → Nous → Codex. | — |
 | `"openrouter"` | Force OpenRouter — routes to any model (Gemini, GPT-4o, Claude, etc.) | `OPENROUTER_API_KEY` |
-| `"nous"` | Force Nous Portal | `hermes login` |
+| `"nous"` | Force Nous Portal | `hermes auth` |
 | `"codex"` | Force Codex OAuth (ChatGPT account). Supports vision (gpt-5.3-codex). | `hermes model` → Codex |
-| `"main"` | Use your active custom/main endpoint. This can come from `OPENAI_BASE_URL` + `OPENAI_API_KEY` or from a custom endpoint saved via `hermes model` / `config.yaml`. Works with OpenAI, local models, or any OpenAI-compatible API. | Custom endpoint credentials + base URL |
+| `"main"` | Use your active custom/main endpoint. This can come from `OPENAI_BASE_URL` + `OPENAI_API_KEY` or from a custom endpoint saved via `hermes model` / `config.yaml`. Works with OpenAI, local models, or any OpenAI-compatible API. **Auxiliary tasks only — not valid for `model.provider`.** | Custom endpoint credentials + base URL |
 
 ### Common Setups
 
@@ -679,7 +758,7 @@ auxiliary:
     model: "my-local-model"
 ```
 
-`provider: "main"` follows the same custom endpoint Hermes uses for normal chat. That endpoint can be set directly with `OPENAI_BASE_URL`, or saved once through `hermes model` and persisted in `config.yaml`.
+`provider: "main"` uses whatever provider Hermes uses for normal chat — whether that's a named custom provider (e.g. `beans`), a built-in provider like `openrouter`, or a legacy `OPENAI_BASE_URL` endpoint.
 
 :::tip
 If you use Codex OAuth as your main model provider, vision works automatically — no extra configuration needed. Codex is included in the auto-detection chain for vision.
@@ -716,7 +795,7 @@ Control how much "thinking" the model does before responding:
 
 ```yaml
 agent:
-  reasoning_effort: ""   # empty = medium (default). Options: xhigh (max), high, medium, low, minimal, none
+  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh (max)
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
@@ -733,7 +812,7 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 
 ## Tool-Use Enforcement
 
-Some models (especially GPT-family) occasionally describe intended actions as text instead of making tool calls. Tool-use enforcement injects guidance that steers the model back to actually calling tools.
+Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.
 
 ```yaml
 agent:
@@ -742,27 +821,52 @@ agent:
 
 | Value | Behavior |
 |-------|----------|
-| `"auto"` (default) | Enabled for GPT models (`gpt-`, `openai/gpt-`) and disabled for all others. |
-| `true` | Always enabled for all models. |
-| `false` | Always disabled. |
-| `["gpt-", "o1-", "custom-model"]` | Enabled only for models whose name contains one of the listed substrings. |
+| `"auto"` (default) | Enabled for models matching: `gpt`, `codex`, `gemini`, `gemma`, `grok`. Disabled for all others (Claude, DeepSeek, Qwen, etc.). |
+| `true` | Always enabled, regardless of model. Useful if you notice your current model describing actions instead of performing them. |
+| `false` | Always disabled, regardless of model. |
+| `["gpt", "codex", "qwen", "llama"]` | Enabled only when the model name contains one of the listed substrings (case-insensitive). |
 
-When enabled, the system prompt includes guidance reminding the model to make actual tool calls rather than describing what it would do. This is transparent to the user and has no effect on models that already use tools reliably.
+### What it injects
+
+When enabled, three layers of guidance may be added to the system prompt:
+
+1. **General tool-use enforcement** (all matched models) — instructs the model to make tool calls immediately instead of describing intentions, keep working until the task is complete, and never end a turn with a promise of future action.
+
+2. **OpenAI execution discipline** (GPT and Codex models only) — additional guidance addressing GPT-specific failure modes: abandoning work on partial results, skipping prerequisite lookups, hallucinating instead of using tools, and declaring "done" without verification.
+
+3. **Google operational guidance** (Gemini and Gemma models only) — conciseness, absolute paths, parallel tool calls, and verify-before-edit patterns.
+
+These are transparent to the user and only affect the system prompt. Models that already use tools reliably (like Claude) don't need this guidance, which is why `"auto"` excludes them.
+
+### When to turn it on
+
+If you're using a model not in the default auto list and notice it frequently describes what it *would* do instead of doing it, set `tool_use_enforcement: true` or add the model substring to the list:
+
+```yaml
+agent:
+  tool_use_enforcement: ["gpt", "codex", "gemini", "grok", "my-custom-model"]
+```
 
 ## TTS Configuration
 
 ```yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "neutts"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "neutts"
+  speed: 1.0                    # Global speed multiplier (fallback for all providers)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
+    speed: 1.0                  # Speed multiplier (converted to rate percentage, e.g. 1.5 → +50%)
   elevenlabs:
     voice_id: "pNInz6obpgDQGcFmaJgB"
     model_id: "eleven_multilingual_v2"
   openai:
     model: "gpt-4o-mini-tts"
     voice: "alloy"              # alloy, echo, fable, onyx, nova, shimmer
+    speed: 1.0                  # Speed multiplier (clamped to 0.25–4.0 by the API)
     base_url: "https://api.openai.com/v1"  # Override for OpenAI-compatible TTS endpoints
+  minimax:
+    speed: 1.0                  # Speech speed multiplier
+    # base_url: ""              # Optional: override for OpenAI-compatible TTS endpoints
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -772,36 +876,26 @@ tts:
 
 This controls both the `text_to_speech` tool and spoken replies in voice mode (`/voice tts` in the CLI or messaging gateway).
 
+**Speed fallback hierarchy:** provider-specific speed (e.g. `tts.edge.speed`) → global `tts.speed` → `1.0` default. Set the global `tts.speed` to apply a uniform speed across all providers, or override per-provider for fine-grained control.
+
 ## Display Settings
 
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
+  tool_progress_overrides: {}  # Per-platform overrides (see below)
+  interim_assistant_messages: true  # Gateway: send natural mid-turn assistant updates as separate messages
   skin: default           # Built-in or custom CLI skin (see user-guide/features/skins)
-  theme_mode: auto        # auto | light | dark — color scheme for skin-aware rendering
   personality: "kawaii"  # Legacy cosmetic field still surfaced in some summaries
   compact: false          # Compact output mode (less whitespace)
   resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
   bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
   show_reasoning: false   # Show model reasoning/thinking above each response (toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
-  background_process_notifications: all  # all | result | error | off (gateway only)
   show_cost: false        # Show estimated $ cost in the CLI status bar
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
 ```
-
-### Theme mode
-
-The `theme_mode` setting controls whether skins render in light or dark mode:
-
-| Mode | Behavior |
-|------|----------|
-| `auto` (default) | Detects your terminal's background color automatically. Falls back to `dark` if detection fails. |
-| `light` | Forces light-mode skin colors. Skins that define a `colors_light` override use those colors instead of the default dark-mode palette. |
-| `dark` | Forces dark-mode skin colors. |
-
-This works with any skin — built-in or custom. Skin authors can provide `colors_light` in their skin definition for optimal light-terminal appearance.
 
 | Mode | What you see |
 |------|-------------|
@@ -811,6 +905,23 @@ This works with any skin — built-in or custom. Skin authors can provide `color
 | `verbose` | Full args, results, and debug logs |
 
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
+
+### Per-platform progress overrides
+
+Different platforms have different verbosity needs. For example, Signal can't edit messages, so each progress update becomes a separate message — noisy. Use `tool_progress_overrides` to set per-platform modes:
+
+```yaml
+display:
+  tool_progress: all          # global default
+  tool_progress_overrides:
+    signal: 'off'             # silence progress on Signal
+    telegram: verbose         # detailed progress on Telegram
+    slack: 'off'              # quiet in shared Slack workspace
+```
+
+Platforms without an override fall back to the global `tool_progress` value. Valid platform keys: `telegram`, `discord`, `slack`, `signal`, `whatsapp`, `matrix`, `mattermost`, `email`, `sms`, `homeassistant`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`.
+
+`interim_assistant_messages` is gateway-only. When enabled, Hermes sends completed mid-turn assistant updates as separate chat messages. This is independent from `tool_progress` and does not require gateway streaming.
 
 ## Privacy
 
@@ -837,7 +948,7 @@ Hashes are deterministic — the same user always maps to the same hash, so the 
 
 ```yaml
 stt:
-  provider: "local"            # "local" | "groq" | "openai"
+  provider: "local"            # "local" | "groq" | "openai" | "mistral"
   local:
     model: "base"              # tiny, base, small, medium, large-v3
   openai:
@@ -901,6 +1012,8 @@ streaming:
 ```
 
 When enabled, the bot sends a message on the first token, then progressively edits it as more tokens arrive. Platforms that don't support message editing (Signal, Email, Home Assistant) are auto-detected on the first attempt — streaming is gracefully disabled for that session with no flood of messages.
+
+For separate natural mid-turn assistant updates without progressive token editing, set `display.interim_assistant_messages: true`.
 
 **Overflow handling:** If the streamed text exceeds the platform's message length limit (~4096 chars), the current message is finalized and a new one starts automatically.
 

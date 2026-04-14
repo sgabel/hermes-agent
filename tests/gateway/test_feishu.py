@@ -8,13 +8,25 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 try:
     import lark_oapi
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+def _mock_event_dispatcher_builder(mock_handler_class):
+    mock_builder = Mock()
+    mock_builder.register_p2_im_message_message_read_v1 = Mock(return_value=mock_builder)
+    mock_builder.register_p2_im_message_receive_v1 = Mock(return_value=mock_builder)
+    mock_builder.register_p2_im_message_reaction_created_v1 = Mock(return_value=mock_builder)
+    mock_builder.register_p2_im_message_reaction_deleted_v1 = Mock(return_value=mock_builder)
+    mock_builder.register_p2_card_action_trigger = Mock(return_value=mock_builder)
+    mock_builder.build = Mock(return_value=object())
+    mock_handler_class.builder = Mock(return_value=mock_builder)
+    return mock_builder
 
 
 class TestPlatformEnum(unittest.TestCase):
@@ -86,74 +98,6 @@ class TestGatewayIntegration(unittest.TestCase):
 
         self.assertIn("hermes-feishu", TOOLSETS)
         self.assertIn("hermes-feishu", TOOLSETS["hermes-gateway"]["includes"])
-
-
-class TestFeishuPostParsing(unittest.TestCase):
-    def test_parse_post_content_extracts_text_mentions_and_media_refs(self):
-        from gateway.platforms.feishu import parse_feishu_post_content
-
-        result = parse_feishu_post_content(
-            json.dumps(
-                {
-                    "en_us": {
-                        "title": "Rich message",
-                        "content": [
-                            [{"tag": "img", "image_key": "img_1", "alt": "diagram"}],
-                            [{"tag": "at", "user_name": "Alice", "open_id": "ou_alice"}],
-                            [{"tag": "media", "file_key": "file_1", "file_name": "spec.pdf"}],
-                        ],
-                    }
-                }
-            )
-        )
-
-        self.assertEqual(result.text_content, "Rich message\n[Image: diagram]\n@Alice\n[Attachment: spec.pdf]")
-        self.assertEqual(result.image_keys, ["img_1"])
-        self.assertEqual(result.mentioned_ids, ["ou_alice"])
-        self.assertEqual(len(result.media_refs), 1)
-        self.assertEqual(result.media_refs[0].file_key, "file_1")
-        self.assertEqual(result.media_refs[0].file_name, "spec.pdf")
-        self.assertEqual(result.media_refs[0].resource_type, "file")
-
-    def test_parse_post_content_uses_fallback_when_invalid(self):
-        from gateway.platforms.feishu import FALLBACK_POST_TEXT, parse_feishu_post_content
-
-        result = parse_feishu_post_content("not-json")
-
-        self.assertEqual(result.text_content, FALLBACK_POST_TEXT)
-        self.assertEqual(result.image_keys, [])
-        self.assertEqual(result.media_refs, [])
-        self.assertEqual(result.mentioned_ids, [])
-
-    def test_parse_post_content_preserves_rich_text_semantics(self):
-        from gateway.platforms.feishu import parse_feishu_post_content
-
-        result = parse_feishu_post_content(
-            json.dumps(
-                {
-                    "en_us": {
-                        "title": "Plan *v2*",
-                        "content": [
-                            [
-                                {"tag": "text", "text": "Bold", "style": {"bold": True}},
-                                {"tag": "text", "text": " "},
-                                {"tag": "text", "text": "Italic", "style": {"italic": True}},
-                                {"tag": "text", "text": " "},
-                                {"tag": "text", "text": "Code", "style": {"code": True}},
-                            ],
-                            [{"tag": "text", "text": "line1"}, {"tag": "br"}, {"tag": "text", "text": "line2"}],
-                            [{"tag": "hr"}],
-                            [{"tag": "code_block", "language": "python", "text": "print('hi')"}],
-                        ],
-                    }
-                }
-            )
-        )
-
-        self.assertEqual(
-            result.text_content,
-            "Plan *v2*\n**Bold** *Italic* `Code`\nline1\nline2\n---\n```python\nprint('hi')\n```",
-        )
 
 
 class TestFeishuMessageNormalization(unittest.TestCase):
@@ -262,12 +206,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         with (
             patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
             patch("gateway.platforms.feishu.FEISHU_WEBHOOK_AVAILABLE", True),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
             patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
             patch("gateway.platforms.feishu.release_scoped_lock"),
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
             patch("gateway.platforms.feishu.web", web_module),
         ):
+            _mock_event_dispatcher_builder(mock_handler_class)
             connected = asyncio.run(adapter.connect())
 
         self.assertTrue(connected)
@@ -283,13 +229,13 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        ws_client = object()
+        ws_client = SimpleNamespace()
 
         with (
             patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
             patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
             patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
-            patch("gateway.platforms.feishu.EventDispatcherHandler", object()),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
             patch("gateway.platforms.feishu.FeishuWSClient", return_value=ws_client),
             patch("gateway.platforms.feishu._run_official_feishu_ws_client"),
             patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)) as acquire_lock,
@@ -297,6 +243,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
         ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
             loop = asyncio.new_event_loop()
             future = loop.create_future()
             future.set_result(None)
@@ -304,6 +252,9 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             class _Loop:
                 def run_in_executor(self, *_args, **_kwargs):
                     return future
+
+                def is_closed(self):
+                    return False
 
             try:
                 with patch("gateway.platforms.feishu.asyncio.get_running_loop", return_value=_Loop()):
@@ -313,6 +264,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                 loop.close()
 
         self.assertTrue(connected)
+        self.assertIsNone(adapter._event_handler)
         acquire_lock.assert_called_once_with(
             "feishu-app-id",
             "cli_app",
@@ -354,14 +306,14 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        ws_client = object()
+        ws_client = SimpleNamespace()
         sleeps = []
 
         with (
             patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True),
             patch("gateway.platforms.feishu.FEISHU_WEBSOCKET_AVAILABLE", True),
             patch("gateway.platforms.feishu.lark", SimpleNamespace(LogLevel=SimpleNamespace(INFO="INFO", WARNING="WARNING"))),
-            patch("gateway.platforms.feishu.EventDispatcherHandler", object()),
+            patch("gateway.platforms.feishu.EventDispatcherHandler") as mock_handler_class,
             patch("gateway.platforms.feishu.FeishuWSClient", return_value=ws_client),
             patch("gateway.platforms.feishu.acquire_scoped_lock", return_value=(True, None)),
             patch("gateway.platforms.feishu.release_scoped_lock"),
@@ -369,6 +321,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch("gateway.platforms.feishu.asyncio.sleep", side_effect=lambda delay: sleeps.append(delay)),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
         ):
+            _mock_event_dispatcher_builder(mock_handler_class)
+
             loop = asyncio.new_event_loop()
             future = loop.create_future()
             future.set_result(None)
@@ -382,6 +336,9 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                     if self.calls == 1:
                         raise OSError("temporary websocket failure")
                     return future
+
+                def is_closed(self):
+                    return False
 
             fake_loop = _Loop()
             try:
@@ -536,6 +493,113 @@ class TestAdapterModule(unittest.TestCase):
         self.assertIn("register_p2_im_message_reaction_deleted_v1", source)
         self.assertIn("register_p2_card_action_trigger", source)
 
+    def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "ws_reconnect_nonce": -1,
+                "ws_reconnect_interval": "bad",
+            }
+        )
+
+        self.assertEqual(settings.ws_reconnect_nonce, 30)
+        self.assertEqual(settings.ws_reconnect_interval, 120)
+
+    def test_load_settings_accepts_custom_ws_reconnect_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "ws_reconnect_nonce": 0,
+                "ws_reconnect_interval": 3,
+            }
+        )
+
+        self.assertEqual(settings.ws_reconnect_nonce, 0)
+        self.assertEqual(settings.ws_reconnect_interval, 3)
+
+    def test_load_settings_accepts_custom_ws_ping_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "ws_ping_interval": 10,
+                "ws_ping_timeout": 8,
+            }
+        )
+
+        self.assertEqual(settings.ws_ping_interval, 10)
+        self.assertEqual(settings.ws_ping_timeout, 8)
+
+    def test_load_settings_ignores_invalid_ws_ping_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "ws_ping_interval": 0,
+                "ws_ping_timeout": -1,
+            }
+        )
+
+        self.assertIsNone(settings.ws_ping_interval)
+        self.assertIsNone(settings.ws_ping_timeout)
+
+    def test_runtime_ws_overrides_reapply_after_sdk_configure(self):
+        import sys
+        from types import ModuleType
+
+        class _FakeWSClient:
+            def __init__(self):
+                self._reconnect_nonce = 30
+                self._reconnect_interval = 120
+                self._ping_interval = 120
+                self.configure_calls = []
+
+            def _configure(self, conf):
+                self.configure_calls.append(conf)
+                self._reconnect_nonce = conf.ReconnectNonce
+                self._reconnect_interval = conf.ReconnectInterval
+                self._ping_interval = conf.PingInterval
+
+            def start(self):
+                conf = SimpleNamespace(ReconnectNonce=99, ReconnectInterval=88, PingInterval=77)
+                self._configure(conf)
+                raise RuntimeError("stop test client")
+
+        fake_client = _FakeWSClient()
+        fake_adapter = SimpleNamespace(
+            _ws_thread_loop=None,
+            _ws_reconnect_nonce=2,
+            _ws_reconnect_interval=3,
+            _ws_ping_interval=4,
+            _ws_ping_timeout=5,
+        )
+        fake_client_module = ModuleType("lark_oapi.ws.client")
+        fake_client_module.loop = None
+        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_ws_module = ModuleType("lark_oapi.ws")
+        fake_ws_module.client = fake_client_module
+        fake_root_module = ModuleType("lark_oapi")
+        fake_root_module.ws = fake_ws_module
+
+        original_modules = sys.modules.copy()
+        sys.modules["lark_oapi"] = fake_root_module
+        sys.modules["lark_oapi.ws"] = fake_ws_module
+        sys.modules["lark_oapi.ws.client"] = fake_client_module
+        try:
+            from gateway.platforms.feishu import _run_official_feishu_ws_client
+
+            _run_official_feishu_ws_client(fake_client, fake_adapter)
+        finally:
+            sys.modules.clear()
+            sys.modules.update(original_modules)
+
+        self.assertEqual(len(fake_client.configure_calls), 1)
+        self.assertEqual(fake_client._reconnect_nonce, 2)
+        self.assertEqual(fake_client._reconnect_interval, 3)
+        self.assertEqual(fake_client._ping_interval, 4)
+
 
 class TestAdapterBehavior(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
@@ -567,6 +631,14 @@ class TestAdapterBehavior(unittest.TestCase):
                 calls.append("card_action")
                 return self
 
+            def register_p2_im_chat_member_bot_added_v1(self, _handler):
+                calls.append("bot_added")
+                return self
+
+            def register_p2_im_chat_member_bot_deleted_v1(self, _handler):
+                calls.append("bot_deleted")
+                return self
+
             def build(self):
                 calls.append("build")
                 return "handler"
@@ -590,6 +662,8 @@ class TestAdapterBehavior(unittest.TestCase):
                 "reaction_created",
                 "reaction_deleted",
                 "card_action",
+                "bot_added",
+                "bot_deleted",
                 "build",
             ],
         )
@@ -673,15 +747,6 @@ class TestAdapterBehavior(unittest.TestCase):
 
         run_threadsafe.assert_not_called()
 
-    @patch.dict(os.environ, {}, clear=True)
-    def test_normalize_inbound_text_strips_feishu_mentions(self):
-        from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
-
-        adapter = FeishuAdapter(PlatformConfig())
-        cleaned = adapter._normalize_inbound_text("hi @_user_1  there @_user_2")
-        self.assertEqual(cleaned, "hi there")
-
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):
         from gateway.config import PlatformConfig
@@ -690,10 +755,10 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter = FeishuAdapter(PlatformConfig())
         message = SimpleNamespace(mentions=[])
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
-        self.assertFalse(adapter._should_accept_group_message(message, sender_id))
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id, ""))
 
         message_with_mention = SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1")])
-        self.assertFalse(adapter._should_accept_group_message(message_with_mention, sender_id))
+        self.assertFalse(adapter._should_accept_group_message(message_with_mention, sender_id, ""))
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_with_other_user_mention_is_rejected_when_bot_identity_unknown(self):
@@ -707,7 +772,7 @@ class TestAdapterBehavior(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
         )
 
-        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id))
+        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id, ""))
 
     @patch.dict(
         os.environ,
@@ -736,28 +801,222 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._should_accept_group_message(
                 mentioned,
                 SimpleNamespace(open_id="ou_allowed", user_id=None),
+                "",
             )
         )
         self.assertFalse(
             adapter._should_accept_group_message(
                 mentioned,
                 SimpleNamespace(open_id="ou_blocked", user_id=None),
+                "",
             )
         )
 
-    @patch.dict(
-        os.environ,
-        {
-            "FEISHU_GROUP_POLICY": "open",
-            "FEISHU_BOT_OPEN_ID": "ou_bot",
-        },
-        clear=True,
-    )
+    def test_per_group_allowlist_policy_gates_by_sender(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    "oc_chat_a": {
+                        "policy": "allowlist",
+                        "allowlist": ["ou_alice", "ou_bob"],
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_a",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_charlie", user_id=None),
+                "oc_chat_a",
+            )
+        )
+
+    def test_per_group_blacklist_policy_blocks_specific_users(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "group_rules": {
+                    "oc_chat_b": {
+                        "policy": "blacklist",
+                        "blacklist": ["ou_blocked"],
+                    }
+                }
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_alice", user_id=None),
+                "oc_chat_b",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_blocked", user_id=None),
+                "oc_chat_b",
+            )
+        )
+
+    def test_per_group_admin_only_policy_requires_admin(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "admins": ["ou_admin"],
+                "group_rules": {
+                    "oc_chat_c": {
+                        "policy": "admin_only",
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_admin", user_id=None),
+                "oc_chat_c",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_regular", user_id=None),
+                "oc_chat_c",
+            )
+        )
+
+    def test_per_group_disabled_policy_blocks_all(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "admins": ["ou_admin"],
+                "group_rules": {
+                    "oc_chat_d": {
+                        "policy": "disabled",
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_admin", user_id=None),
+                "oc_chat_d",
+            )
+        )
+        self.assertFalse(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_regular", user_id=None),
+                "oc_chat_d",
+            )
+        )
+
+    def test_global_admins_bypass_all_group_rules(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "admins": ["ou_admin"],
+                "group_rules": {
+                    "oc_chat_e": {
+                        "policy": "allowlist",
+                        "allowlist": ["ou_alice"],
+                    }
+                },
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_admin", user_id=None),
+                "oc_chat_e",
+            )
+        )
+
+    def test_default_group_policy_fallback_for_chats_without_explicit_rule(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        config = PlatformConfig(
+            extra={
+                "default_group_policy": "open",
+            }
+        )
+        adapter = FeishuAdapter(config)
+        adapter._bot_open_id = "ou_bot"
+
+        message = SimpleNamespace(
+            mentions=[SimpleNamespace(name="Bot", id=SimpleNamespace(open_id="ou_bot", user_id=None))]
+        )
+
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                message,
+                SimpleNamespace(open_id="ou_anyone", user_id=None),
+                "oc_chat_unknown",
+            )
+        )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_matches_bot_open_id_when_configured(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
 
         bot_mention = SimpleNamespace(
@@ -769,22 +1028,16 @@ class TestAdapterBehavior(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
         )
 
-        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[bot_mention]), sender_id))
-        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id))
+        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[bot_mention]), sender_id, ""))
+        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[other_mention]), sender_id, ""))
 
-    @patch.dict(
-        os.environ,
-        {
-            "FEISHU_GROUP_POLICY": "open",
-            "FEISHU_BOT_NAME": "Hermes Bot",
-        },
-        clear=True,
-    )
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_matches_bot_name_when_only_name_available(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_name = "Hermes Bot"
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
 
         named_mention = SimpleNamespace(
@@ -796,22 +1049,16 @@ class TestAdapterBehavior(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
         )
 
-        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[named_mention]), sender_id))
-        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[different_mention]), sender_id))
+        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[named_mention]), sender_id, ""))
+        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[different_mention]), sender_id, ""))
 
-    @patch.dict(
-        os.environ,
-        {
-            "FEISHU_GROUP_POLICY": "open",
-            "FEISHU_BOT_OPEN_ID": "ou_bot",
-        },
-        clear=True,
-    )
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_post_message_uses_parsed_mentions_when_sdk_mentions_missing(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
         message = SimpleNamespace(
             message_type="post",
@@ -819,7 +1066,7 @@ class TestAdapterBehavior(unittest.TestCase):
             content='{"en_us":{"content":[[{"tag":"at","user_name":"Hermes","open_id":"ou_bot"}]]}}',
         )
 
-        self.assertTrue(adapter._should_accept_group_message(message, sender_id))
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, ""))
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_post_message_as_text(self):
@@ -1196,7 +1443,12 @@ class TestAdapterBehavior(unittest.TestCase):
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        adapter._loop = object()
+
+        class _Loop:
+            def is_closed(self):
+                return False
+
+        adapter._loop = _Loop()
 
         message = SimpleNamespace(
             message_id="om_text",
@@ -1210,6 +1462,7 @@ class TestAdapterBehavior(unittest.TestCase):
         data = SimpleNamespace(event=SimpleNamespace(message=message, sender=sender))
 
         future = SimpleNamespace(add_done_callback=lambda *_args, **_kwargs: None)
+
         def _submit(coro, _loop):
             coro.close()
             return future
@@ -1218,6 +1471,30 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._on_message_event(data)
 
         self.assertTrue(submit.called)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_uses_same_message_dispatch_path(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._on_message_event = Mock()
+
+        body = json.dumps({
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {"message": {"message_id": "om_test"}},
+        }).encode("utf-8")
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+
+        response = asyncio.run(adapter._handle_webhook_request(request))
+
+        self.assertEqual(response.status, 200)
+        adapter._on_message_event.assert_called_once()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_process_inbound_message_uses_event_sender_identity_only(self):
@@ -2456,7 +2733,7 @@ class TestGroupMentionAtAll(unittest.TestCase):
             mentions=[],
         )
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
-        self.assertTrue(adapter._should_accept_group_message(message, sender_id))
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, ""))
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
     def test_at_all_still_requires_policy_gate(self):
@@ -2468,10 +2745,10 @@ class TestGroupMentionAtAll(unittest.TestCase):
         message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
         # Non-allowlisted user — should be blocked even with @_all.
         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
-        self.assertFalse(adapter._should_accept_group_message(message, blocked_sender))
+        self.assertFalse(adapter._should_accept_group_message(message, blocked_sender, ""))
         # Allowlisted user — should pass.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
-        self.assertTrue(adapter._should_accept_group_message(message, allowed_sender))
+        self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

@@ -16,7 +16,7 @@ This page is the top-level map of Hermes Agent internals. Use it to orient yours
 │                                                                      │
 │  CLI (cli.py)    Gateway (gateway/run.py)    ACP (acp_adapter/)     │
 │  Batch Runner    API Server                  Python Library          │
-└──────────┬──────────────┬───────────────────────┬────────────────────┘
+└──────────┬──────────────┬───────────────────────┬───────────────────┘
            │              │                       │
            ▼              ▼                       ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -33,7 +33,7 @@ This page is the top-level map of Hermes Agent internals. Use it to orient yours
 │  │ Compression  │ │ 3 API Modes  │ │ Tool Registry│                │
 │  │ & Caching    │ │ chat_compl.  │ │ (registry.py)│                │
 │  │              │ │ codex_resp.  │ │ 47 tools     │                │
-│  │              │ │ anthropic    │ │ 37 toolsets   │                │
+│  │              │ │ anthropic    │ │ 19 toolsets  │                │
 │  └──────────────┘ └──────────────┘ └──────────────┘                │
 └─────────────────────────────────────────────────────────────────────┘
            │                                    │
@@ -52,8 +52,8 @@ This page is the top-level map of Hermes Agent internals. Use it to orient yours
 
 ```text
 hermes-agent/
-├── run_agent.py              # AIAgent — core conversation loop (~9,200 lines)
-├── cli.py                    # HermesCLI — interactive terminal UI (~8,500 lines)
+├── run_agent.py              # AIAgent — core conversation loop (~10,700 lines)
+├── cli.py                    # HermesCLI — interactive terminal UI (~10,000 lines)
 ├── model_tools.py            # Tool discovery, schema collection, dispatch
 ├── toolsets.py               # Tool groupings and platform presets
 ├── hermes_state.py           # SQLite session/state database with FTS5
@@ -62,7 +62,8 @@ hermes-agent/
 │
 ├── agent/                    # Agent internals
 │   ├── prompt_builder.py     # System prompt assembly
-│   ├── context_compressor.py # Conversation compression algorithm
+│   ├── context_engine.py     # ContextEngine ABC (pluggable)
+│   ├── context_compressor.py # Default engine — lossy summarization
 │   ├── prompt_caching.py     # Anthropic prompt caching
 │   ├── auxiliary_client.py   # Auxiliary LLM for side tasks (vision, summarization)
 │   ├── model_metadata.py     # Model context lengths, token estimation
@@ -70,18 +71,19 @@ hermes-agent/
 │   ├── anthropic_adapter.py  # Anthropic Messages API format conversion
 │   ├── display.py            # KawaiiSpinner, tool preview formatting
 │   ├── skill_commands.py     # Skill slash commands
-│   ├── memory_store.py       # Persistent memory read/write
+│   ├── memory_manager.py    # Memory manager orchestration
+│   ├── memory_provider.py   # Memory provider ABC
 │   └── trajectory.py         # Trajectory saving helpers
 │
 ├── hermes_cli/               # CLI subcommands and setup
-│   ├── main.py               # Entry point — all `hermes` subcommands (~4,200 lines)
+│   ├── main.py               # Entry point — all `hermes` subcommands (~6,000 lines)
 │   ├── config.py             # DEFAULT_CONFIG, OPTIONAL_ENV_VARS, migration
 │   ├── commands.py           # COMMAND_REGISTRY — central slash command definitions
 │   ├── auth.py               # PROVIDER_REGISTRY, credential resolution
 │   ├── runtime_provider.py   # Provider → api_mode + credentials
 │   ├── models.py             # Model catalog, provider model lists
 │   ├── model_switch.py       # /model command logic (CLI + gateway shared)
-│   ├── setup.py              # Interactive setup wizard (~3,500 lines)
+│   ├── setup.py              # Interactive setup wizard (~3,100 lines)
 │   ├── skin_engine.py        # CLI theming engine
 │   ├── skills_config.py      # hermes skills — enable/disable per platform
 │   ├── skills_hub.py         # /skills slash command
@@ -97,17 +99,17 @@ hermes-agent/
 │   ├── process_registry.py   # Background process management
 │   ├── file_tools.py         # read_file, write_file, patch, search_files
 │   ├── web_tools.py          # web_search, web_extract
-│   ├── browser_tool.py       # 11 browser automation tools
+│   ├── browser_tool.py       # 10 browser automation tools
 │   ├── code_execution_tool.py # execute_code sandbox
 │   ├── delegate_tool.py      # Subagent delegation
-│   ├── mcp_tool.py           # MCP client (~1,050 lines)
+│   ├── mcp_tool.py           # MCP client (~2,200 lines)
 │   ├── credential_files.py   # File-based credential passthrough
 │   ├── env_passthrough.py    # Env var passthrough for sandboxes
 │   ├── ansi_strip.py         # ANSI escape stripping
 │   └── environments/         # Terminal backends (local, docker, ssh, modal, daytona, singularity)
 │
 ├── gateway/                  # Messaging platform gateway
-│   ├── run.py                # GatewayRunner — message dispatch (~5,800 lines)
+│   ├── run.py                # GatewayRunner — message dispatch (~9,000 lines)
 │   ├── session.py            # SessionStore — conversation persistence
 │   ├── delivery.py           # Outbound message delivery
 │   ├── pairing.py            # DM pairing authorization
@@ -115,13 +117,15 @@ hermes-agent/
 │   ├── mirror.py             # Cross-session message mirroring
 │   ├── status.py             # Token locks, profile-scoped process tracking
 │   ├── builtin_hooks/        # Always-registered hooks
-│   └── platforms/            # 14 adapters: telegram, discord, slack, whatsapp,
+│   └── platforms/            # 18 adapters: telegram, discord, slack, whatsapp,
 │                             #   signal, matrix, mattermost, email, sms,
-│                             #   dingtalk, feishu, wecom, homeassistant, webhook
+│                             #   dingtalk, feishu, wecom, wecom_callback, weixin,
+│                             #   bluebubbles, qqbot, homeassistant, webhook, api_server
 │
 ├── acp_adapter/              # ACP server (VS Code / Zed / JetBrains)
 ├── cron/                     # Scheduler (jobs.py, scheduler.py)
 ├── plugins/memory/           # Memory provider plugins
+├── plugins/context_engine/   # Context engine plugins
 ├── environments/             # RL training environments (Atropos)
 ├── skills/                   # Bundled skills (always available)
 ├── optional-skills/          # Official optional skills (install explicitly)
@@ -208,7 +212,7 @@ A shared runtime resolver used by CLI, gateway, cron, ACP, and auxiliary calls. 
 
 ### Tool System
 
-Central tool registry (`tools/registry.py`) with 47 registered tools across 20 toolsets. Each tool file self-registers at import time. The registry handles schema collection, dispatch, availability checking, and error wrapping. Terminal tools support 6 backends (local, Docker, SSH, Daytona, Modal, Singularity).
+Central tool registry (`tools/registry.py`) with 47 registered tools across 19 toolsets. Each tool file self-registers at import time. The registry handles schema collection, dispatch, availability checking, and error wrapping. Terminal tools support 6 backends (local, Docker, SSH, Daytona, Modal, Singularity).
 
 → [Tools Runtime](./tools-runtime.md)
 
@@ -220,13 +224,13 @@ SQLite-based session storage with FTS5 full-text search. Sessions have lineage t
 
 ### Messaging Gateway
 
-Long-running process with 14 platform adapters, unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
+Long-running process with 18 platform adapters, unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
 
 → [Gateway Internals](./gateway-internals.md)
 
 ### Plugin System
 
-Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Memory providers are a specialized plugin type under `plugins/memory/`.
+Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Two specialized plugin types exist: memory providers (`plugins/memory/`) and context engines (`plugins/context_engine/`). Both are single-select — only one of each can be active at a time, configured via `hermes plugins` or `config.yaml`.
 
 → [Plugin Guide](/docs/guides/build-a-hermes-plugin), [Memory Provider Plugin](./memory-provider-plugin.md)
 

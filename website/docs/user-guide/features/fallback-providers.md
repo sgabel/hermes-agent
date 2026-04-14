@@ -37,7 +37,7 @@ Both `provider` and `model` are **required**. If either is missing, the fallback
 |----------|-------|-------------|
 | AI Gateway | `ai-gateway` | `AI_GATEWAY_API_KEY` |
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
-| Nous Portal | `nous` | `hermes login` (OAuth) |
+| Nous Portal | `nous` | `hermes auth` (OAuth) |
 | OpenAI Codex | `openai-codex` | `hermes model` (ChatGPT OAuth) |
 | GitHub Copilot | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` |
 | GitHub Copilot ACP | `copilot-acp` | External process (editor integration) |
@@ -50,6 +50,8 @@ Both `provider` and `model` are **required**. If either is missing, the fallback
 | OpenCode Zen | `opencode-zen` | `OPENCODE_ZEN_API_KEY` |
 | OpenCode Go | `opencode-go` | `OPENCODE_GO_API_KEY` |
 | Kilo Code | `kilocode` | `KILOCODE_API_KEY` |
+| Xiaomi MiMo | `xiaomi` | `XIAOMI_API_KEY` |
+| Arcee AI | `arcee` | `ARCEEAI_API_KEY` |
 | Alibaba / DashScope | `alibaba` | `DASHSCOPE_API_KEY` |
 | Hugging Face | `huggingface` | `HF_TOKEN` |
 | Custom endpoint | `custom` | `base_url` + `api_key_env` (see below) |
@@ -155,7 +157,7 @@ Hermes uses separate lightweight models for side tasks. Each task has its own pr
 |------|-------------|-----------|
 | Vision | Image analysis, browser screenshots | `auxiliary.vision` |
 | Web Extract | Web page summarization | `auxiliary.web_extract` |
-| Compression | Context compression summaries | `auxiliary.compression` or `compression.summary_provider` |
+| Compression | Context compression summaries | `auxiliary.compression` |
 | Session Search | Past session summarization | `auxiliary.session_search` |
 | Skills Hub | Skill search and discovery | `auxiliary.skills_hub` |
 | MCP | MCP helper operations | `auxiliary.mcp` |
@@ -169,7 +171,7 @@ When a task's provider is set to `"auto"` (the default), Hermes tries providers 
 
 ```text
 OpenRouter → Nous Portal → Custom endpoint → Codex OAuth →
-API-key providers (z.ai, Kimi, MiniMax, Hugging Face, Anthropic) → give up
+API-key providers (z.ai, Kimi, MiniMax, Xiaomi MiMo, Hugging Face, Anthropic) → give up
 ```
 
 **For vision tasks:**
@@ -218,13 +220,14 @@ auxiliary:
     model: ""
 ```
 
-Every task above follows the same **provider / model / base_url** pattern. Context compression uses its own top-level block:
+Every task above follows the same **provider / model / base_url** pattern. Context compression is configured under `auxiliary.compression`:
 
 ```yaml
-compression:
-  summary_provider: main                             # Same provider options as auxiliary tasks
-  summary_model: google/gemini-3-flash-preview
-  summary_base_url: null                             # Custom OpenAI-compatible endpoint
+auxiliary:
+  compression:
+    provider: main                                    # Same provider options as other auxiliary tasks
+    model: google/gemini-3-flash-preview
+    base_url: null                                    # Custom OpenAI-compatible endpoint
 ```
 
 And the fallback model uses:
@@ -240,13 +243,15 @@ All three — auxiliary, compression, fallback — work the same way: set `provi
 
 ### Provider Options for Auxiliary Tasks
 
+These options apply to `auxiliary:`, `compression:`, and `fallback_model:` configs only — `"main"` is **not** a valid value for your top-level `model.provider`. For custom endpoints, use `provider: custom` in your `model:` section (see [AI Providers](/docs/integrations/providers)).
+
 | Provider | Description | Requirements |
 |----------|-------------|-------------|
 | `"auto"` | Try providers in order until one works (default) | At least one provider configured |
 | `"openrouter"` | Force OpenRouter | `OPENROUTER_API_KEY` |
-| `"nous"` | Force Nous Portal | `hermes login` |
+| `"nous"` | Force Nous Portal | `hermes auth` |
 | `"codex"` | Force Codex OAuth | `hermes model` → Codex |
-| `"main"` | Use whatever provider the main agent uses | Active main provider configured |
+| `"main"` | Use whatever provider the main agent uses (auxiliary tasks only) | Active main provider configured |
 | `"anthropic"` | Force Anthropic native | `ANTHROPIC_API_KEY` or Claude Code credentials |
 
 ### Direct Endpoint Override
@@ -267,15 +272,18 @@ auxiliary:
 
 ## Context Compression Fallback
 
-Context compression has a legacy configuration path in addition to the auxiliary system:
+Context compression uses the `auxiliary.compression` config block to control which model and provider handles summarization:
 
 ```yaml
-compression:
-  summary_provider: "auto"                    # auto | openrouter | nous | main
-  summary_model: "google/gemini-3-flash-preview"
+auxiliary:
+  compression:
+    provider: "auto"                              # auto | openrouter | nous | main
+    model: "google/gemini-3-flash-preview"
 ```
 
-This is equivalent to configuring `auxiliary.compression.provider` and `auxiliary.compression.model`. If both are set, the `auxiliary.compression` values take precedence.
+:::info Legacy migration
+Older configs with `compression.summary_model` / `compression.summary_provider` / `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load (config version 17).
+:::
 
 If no provider is available for compression, Hermes drops middle conversation turns without generating a summary rather than failing the session.
 
@@ -322,7 +330,7 @@ See [Scheduled Tasks (Cron)](/docs/user-guide/features/cron) for full configurat
 | Main agent model | `fallback_model` in config.yaml — one-shot failover on errors | `fallback_model:` (top-level) |
 | Vision | Auto-detection chain + internal OpenRouter retry | `auxiliary.vision` |
 | Web extraction | Auto-detection chain + internal OpenRouter retry | `auxiliary.web_extract` |
-| Context compression | Auto-detection chain, degrades to no-summary if unavailable | `auxiliary.compression` or `compression.summary_provider` |
+| Context compression | Auto-detection chain, degrades to no-summary if unavailable | `auxiliary.compression` |
 | Session search | Auto-detection chain | `auxiliary.session_search` |
 | Skills hub | Auto-detection chain | `auxiliary.skills_hub` |
 | MCP helpers | Auto-detection chain | `auxiliary.mcp` |

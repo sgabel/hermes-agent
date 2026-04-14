@@ -67,6 +67,11 @@ metadata:
     category: devops
     fallback_for_toolsets: [web]    # Optional — conditional activation (see below)
     requires_toolsets: [terminal]   # Optional — conditional activation (see below)
+    config:                          # Optional — config.yaml settings
+      - key: my.setting
+        description: "What this controls"
+        default: "value"
+        prompt: "Prompt for setup"
 ---
 
 # Skill Title
@@ -141,6 +146,24 @@ required_environment_variables:
 When a missing value is encountered, Hermes asks for it securely only when the skill is actually loaded in the local CLI. You can skip setup and keep using the skill. Messaging surfaces never ask for secrets in chat — they tell you to use `hermes setup` or `~/.hermes/.env` locally instead.
 
 Once set, declared env vars are **automatically passed through** to `execute_code` and `terminal` sandboxes — the skill's scripts can use `$TENOR_API_KEY` directly. For non-skill env vars, use the `terminal.env_passthrough` config option. See [Environment Variable Passthrough](/docs/user-guide/security#environment-variable-passthrough) for details.
+
+### Skill Config Settings
+
+Skills can also declare non-secret config settings (paths, preferences) stored in `config.yaml`:
+
+```yaml
+metadata:
+  hermes:
+    config:
+      - key: wiki.path
+        description: Path to the wiki directory
+        default: "~/wiki"
+        prompt: Wiki directory path
+```
+
+Settings are stored under `skills.config` in your config.yaml. `hermes config migrate` prompts for unconfigured settings, and `hermes config show` displays them. When a skill loads, its resolved config values are injected into the context so the agent knows the configured values automatically.
+
+See [Skill Settings](/docs/user-guide/configuration#skill-settings) and [Creating Skills — Config Settings](/docs/developer-guide/creating-skills#config-settings-configyaml) for details.
 
 ## Skill Directory Structure
 
@@ -402,6 +425,10 @@ hermes skills update react   # Update one specific installed hub skill
 ```
 
 This uses the stored source identifier plus the current upstream bundle content hash to detect drift.
+
+:::tip GitHub rate limits
+Skills hub operations use the GitHub API, which has a rate limit of 60 requests/hour for unauthenticated users. If you see rate-limit errors during install or search, set `GITHUB_TOKEN` in your `.env` file to increase the limit to 5,000 requests/hour. The error message includes an actionable hint when this happens.
+:::
 
 ### Slash commands (inside chat)
 
