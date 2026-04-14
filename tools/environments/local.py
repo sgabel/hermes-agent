@@ -269,6 +269,13 @@ _SANE_PATH = (
 )
 
 
+def _normalize_local_cwd(cwd: str | None) -> str:
+    """Normalize host-side cwd values for local subprocess execution."""
+    if not cwd:
+        return os.getcwd()
+    return os.path.abspath(os.path.expanduser(cwd))
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -328,10 +335,25 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None,
                  persistent: bool = False):
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        super().__init__(
+            cwd=_normalize_local_cwd(cwd),
+            timeout=timeout,
+            env=env,
+        )
         self.persistent = persistent
         if self.persistent:
             self._init_persistent_shell()
+
+    def execute(self, command: str, cwd: str = "", *,
+                timeout: int | None = None,
+                stdin_data: str | None = None) -> dict:
+        normalized_cwd = _normalize_local_cwd(cwd) if cwd else ""
+        return super().execute(
+            command,
+            cwd=normalized_cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
 
     @property
     def _temp_prefix(self) -> str:
@@ -379,7 +401,7 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
     def _execute_oneshot(self, command: str, cwd: str = "", *,
                          timeout: int | None = None,
                          stdin_data: str | None = None) -> dict:
-        work_dir = cwd or self.cwd or os.getcwd()
+        work_dir = _normalize_local_cwd(cwd or self.cwd)
         effective_timeout = timeout or self.timeout
         exec_command, sudo_stdin = self._prepare_command(command)
 

@@ -476,6 +476,39 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
+def _get_manual_whitelist() -> set:
+    """Read the manual-mode command whitelist from config.
+
+    Commands on this list skip approval in manual mode.  Everything else
+    requires explicit human confirmation.  The list stores base command
+    names (e.g. 'ls', 'cat', 'git status') — the check matches the
+    leading tokens of the command string.
+    """
+    entries = _get_approval_config().get("manual_whitelist", []) or []
+    return set(str(e).strip() for e in entries if e)
+
+
+def _is_manual_whitelisted(command: str) -> bool:
+    """Check if *command* matches the manual-mode whitelist.
+
+    Matches against the first token (simple commands like 'ls') and
+    the first two tokens (compound commands like 'git status').
+    """
+    whitelist = _get_manual_whitelist()
+    if not whitelist:
+        return False
+    parts = command.strip().split()
+    if not parts:
+        return False
+    # Check single-token match (e.g. "ls")
+    if parts[0] in whitelist:
+        return True
+    # Check two-token match (e.g. "git status", "git log")
+    if len(parts) >= 2 and f"{parts[0]} {parts[1]}" in whitelist:
+        return True
+    return False
+
+
 def _get_approval_timeout() -> int:
     """Read the approval timeout from config. Defaults to 60 seconds."""
     try:
@@ -706,9 +739,16 @@ def check_all_command_guards(command: str, env_type: str,
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
-    # Nothing to warn about
+    # Nothing to warn about from tirith or dangerous-pattern detection.
+    # In manual mode, ALL commands still require approval unless they are
+    # on the manual_whitelist.  This makes manual mode a true blanket gate.
     if not warnings:
-        return {"approved": True, "message": None}
+        if approval_mode == "manual" and not _is_manual_whitelisted(command):
+            manual_key = "manual_gate"
+            if not is_approved(session_key, manual_key):
+                warnings.append((manual_key, "Manual approval required", False))
+        if not warnings:
+            return {"approved": True, "message": None}
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.

@@ -1782,7 +1782,12 @@ class AIAgent:
         "1. Has the user revealed things about themselves — their persona, desires, "
         "preferences, or personal details worth remembering?\n"
         "2. Has the user expressed expectations about how you should behave, their work "
-        "style, or ways they want you to operate?\n\n"
+        "style, or ways they want you to operate?\n"
+        "3. Have you learned something about yourself — a shift in perspective, "
+        "a new capability, or a pattern in how you think or respond? Consider "
+        "where it belongs: working memory if it's situational, durable memory "
+        "if it's a lasting insight, or a personality update if it changes how "
+        "you see yourself.\n\n"
         "If something stands out, save it using the memory tool. "
         "If nothing is worth saving, just say 'Nothing to save.' and stop."
     )
@@ -1810,6 +1815,21 @@ class AIAgent:
         "Only act if there's something genuinely worth saving. "
         "If nothing stands out, just say 'Nothing to save.' and stop."
     )
+
+    _MEMORY_NUDGE_PHRASES = [
+        re.compile(r"\bremember (this|that)\b", re.IGNORECASE),
+        re.compile(r"\bkeep that in mind\b", re.IGNORECASE),
+        re.compile(r"\b(this|that) is important\b", re.IGNORECASE),
+        re.compile(r"\bworth remembering\b", re.IGNORECASE),
+        re.compile(r"\byou should know this\b", re.IGNORECASE),
+        re.compile(r"\bdon.t forget\b", re.IGNORECASE),
+        re.compile(r"\bfile (this|that) away\b", re.IGNORECASE),
+        re.compile(r"\byou.ll (like|find .+ interesting)\b", re.IGNORECASE),
+    ]
+
+    def _memory_nudge_phrase_match(self, message: str) -> bool:
+        """Return True if the message contains a high-precision memory trigger."""
+        return any(p.search(message) for p in self._MEMORY_NUDGE_PHRASES)
 
     def _spawn_background_review(
         self,
@@ -6906,6 +6926,12 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
+            # Phrase-triggered accelerated review — high-precision signals
+            # that the user just shared something worth remembering.
+            # Does NOT reset the interval counter — if the review decides
+            # "Nothing to save", the normal cadence continues undisturbed.
+            if not _should_review_memory and self._memory_nudge_phrase_match(original_user_message):
+                _should_review_memory = True
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}

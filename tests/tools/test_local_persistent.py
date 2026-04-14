@@ -1,6 +1,7 @@
 """Tests for the local persistent shell backend."""
 
 import glob as glob_mod
+from pathlib import Path
 
 import pytest
 
@@ -74,6 +75,15 @@ class TestLocalOneShotRegression:
         assert "__hermes_rc" not in r["output"]
         assert "printf '" not in r["output"]
         assert "exit $" not in r["output"]
+
+    def test_workdir_tilde_expands_for_oneshot(self):
+        env = LocalEnvironment(persistent=False)
+        try:
+            r = env.execute("pwd", cwd="~/hermes")
+            assert r["returncode"] == 0
+            assert r["output"].strip() == str(Path.home() / "hermes")
+        finally:
+            env.cleanup()
 
 
 class TestLocalPersistent:
@@ -162,3 +172,8 @@ class TestLocalPersistent:
     def test_multiple_commands_semicolon(self, env):
         r = env.execute("X=42; echo $X")
         assert r["output"].strip() == "42"
+
+    def test_workdir_tilde_expands_for_persistent_fallback(self, env):
+        r = env.execute("pwd", cwd="~/hermes")
+        assert r["returncode"] == 0
+        assert r["output"].strip() == str(Path.home() / "hermes")

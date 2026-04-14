@@ -25,6 +25,14 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 
+from .chronicle import ChronicleSearcher
+from .orchestrator import (
+    ContextBudget,
+    Deduplicator,
+    IntentGate,
+    QueryModeRouter,
+)
+
 logger = logging.getLogger(__name__)
 
 # Circuit breaker: after this many consecutive failures, pause API calls
@@ -111,6 +119,30 @@ CONCLUDE_SCHEMA = {
     },
 }
 
+CHRONICLE_SEARCH_SCHEMA = {
+    "name": "chronicle_search",
+    "description": (
+        "Search the conversation chronicle — archived past sessions with Scott. "
+        "Use when asked to recall or reference previous conversations, events, "
+        "or discussions from specific dates or time periods."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for in past conversations."},
+            "speaker": {
+                "type": "string",
+                "enum": ["scott", "sylva", "any"],
+                "description": "Filter by speaker (default: any).",
+            },
+            "date_from": {"type": "string", "description": "Start date filter (YYYY-MM-DD)."},
+            "date_to": {"type": "string", "description": "End date filter (YYYY-MM-DD)."},
+            "top_k": {"type": "integer", "description": "Max results (default: 5, max: 15)."},
+        },
+        "required": ["query"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
@@ -134,6 +166,10 @@ class Mem0MemoryProvider(MemoryProvider):
         # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
+        # Orchestration state
+        self._had_tool_calls = False
+        self._last_assistant_content = ""
+        self._chronicle = None
 
     @property
     def name(self) -> str:
@@ -141,6 +177,10 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
+        # OSS mode: available if mem0.json has vector_store config
+        if cfg.get("vector_store"):
+            return True
+        # Platform mode: available if API key is set
         return bool(cfg.get("api_key"))
 
     def save_config(self, values, hermes_home):
@@ -166,13 +206,29 @@ class Mem0MemoryProvider(MemoryProvider):
         ]
 
     def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
+        """Thread-safe client accessor with lazy initialization.
+
+        Uses OSS Memory class if mem0.json contains vector_store config
+        (self-hosted Qdrant + embedder + LLM). Falls back to MemoryClient
+        for Mem0 Platform API if api_key is set.
+        """
         with self._client_lock:
             if self._client is not None:
                 return self._client
             try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
+                if self._config and self._config.get("vector_store"):
+                    # OSS self-hosted mode
+                    from mem0 import Memory
+                    oss_cfg = {
+                        k: self._config[k]
+                        for k in ("vector_store", "embedder", "llm", "history_db_path")
+                        if k in self._config
+                    }
+                    self._client = Memory.from_config({"version": "v1.1", **oss_cfg})
+                else:
+                    # Mem0 Platform API mode
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
                 return self._client
             except ImportError:
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
@@ -206,14 +262,41 @@ class Mem0MemoryProvider(MemoryProvider):
         self._user_id = self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
+        # Chronicle searcher — direct Qdrant + TEI, bypasses mem0 client
+        qdrant_url = (self._config.get("vector_store", {})
+                      .get("config", {}).get("url", "http://localhost:6333"))
+        tei_url = (self._config.get("embedder", {})
+                   .get("config", {}).get("openai_base_url", "http://localhost:8085"))
+        searcher = ChronicleSearcher(
+            qdrant_url=qdrant_url, tei_url=tei_url,
+        )
+        # Cache availability at init — don't do network I/O on every get_tool_schemas()
+        self._chronicle = searcher if searcher.is_available() else None
+        if self._chronicle:
+            logger.info("Chronicle searcher initialized (sylva_chronicle)")
+        else:
+            logger.info("Chronicle searcher unavailable — tool will not be registered")
 
-    def _read_filters(self) -> Dict[str, Any]:
-        """Filters for search/get_all — scoped to user only for cross-session recall."""
-        return {"user_id": self._user_id}
+    @property
+    def _is_oss(self) -> bool:
+        return bool(self._config and self._config.get("vector_store"))
 
-    def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
+    def _read_kwargs(self) -> Dict[str, Any]:
+        """Kwargs for search/get_all — scoped to user only for cross-session recall.
+
+        OSS Memory uses user_id= kwarg; Platform uses filters= dict.
+        """
+        if self._is_oss:
+            return {"user_id": self._user_id}
+        return {"filters": {"user_id": self._user_id}}
+
+    def _write_kwargs(self) -> Dict[str, Any]:
+        """Kwargs for add — scoped to user + agent for attribution."""
         return {"user_id": self._user_id, "agent_id": self._agent_id}
+
+    def _search_limit_key(self) -> str:
+        """OSS uses 'limit', Platform uses 'top_k'."""
+        return "limit" if self._is_oss else "top_k"
 
     @staticmethod
     def _unwrap_results(response: Any) -> list:
@@ -225,12 +308,18 @@ class Mem0MemoryProvider(MemoryProvider):
         return []
 
     def system_prompt_block(self) -> str:
-        return (
-            "# Mem0 Memory\n"
-            f"Active. User: {self._user_id}.\n"
+        lines = [
+            "# Mem0 Memory",
+            f"Active. User: {self._user_id}.",
             "Use mem0_search to find memories, mem0_conclude to store facts, "
-            "mem0_profile for a full overview."
-        )
+            "mem0_profile for a full overview.",
+        ]
+        if self._chronicle:
+            lines.append(
+                "Use chronicle_search to recall past conversations by topic, "
+                "speaker, or date range."
+            )
+        return "\n".join(lines)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -240,25 +329,59 @@ class Mem0MemoryProvider(MemoryProvider):
             self._prefetch_result = ""
         if not result:
             return ""
-        return f"## Mem0 Memory\n{result}"
+        # Deduplicate against current user message + last assistant response
+        dedup_context = f"{query} {self._last_assistant_content}"
+        lines = [line for line in result.split("\n") if line.strip()]
+        filtered = Deduplicator.deduplicate(lines, dedup_context)
+        if not filtered:
+            return ""
+        return "## Mem0 Memory\n" + "\n".join(filtered)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if self._is_breaker_open():
             return
 
         def _run():
+            # Intent gate — skip retrieval for social/confirmation messages
+            if not IntentGate.should_retrieve(query, self._had_tool_calls):
+                logger.debug("Mem0 prefetch skipped by intent gate: %r", query[:60])
+                return
+
+            mode = QueryModeRouter.classify(query)
+            facts: list[str] = []
+            chronicle_results: list[str] = []
+
             try:
+                if mode == "historical_memory" and self._chronicle:
+                    # Route to chronicle collection
+                    try:
+                        results = self._chronicle.search(query, top_k=5)
+                        chronicle_results = [
+                            f"[{r['date']} {r['speaker']}] {r['data']}"
+                            for r in results if r.get("data")
+                        ]
+                    except Exception as e:
+                        logger.debug("Chronicle prefetch failed, falling back: %s", e)
+                        # Fall through to stable_knowledge on failure
+
+                # Always search stable knowledge (curated facts)
                 client = self._get_client()
-                results = self._unwrap_results(client.search(
+                mem_results = self._unwrap_results(client.search(
                     query=query,
-                    filters=self._read_filters(),
+                    **self._read_kwargs(),
                     rerank=self._rerank,
-                    top_k=5,
+                    **{self._search_limit_key(): 10},
                 ))
-                if results:
-                    lines = [r.get("memory", "") for r in results if r.get("memory")]
+                if mem_results:
+                    facts = [r.get("memory", "") for r in mem_results if r.get("memory")]
+
+                # Assemble within budget
+                assembled = ContextBudget.assemble(
+                    facts=facts, chronicle=chronicle_results,
+                )
+                if assembled:
                     with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                        self._prefetch_result = assembled
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -268,34 +391,69 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
-        if self._is_breaker_open():
-            return
+        """Cache turn state for orchestration but skip per-turn fact extraction.
 
-        def _sync():
-            try:
-                client = self._get_client()
-                messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
-                ]
-                client.add(messages, **self._write_filters())
-                self._record_success()
-            except Exception as e:
-                self._record_failure()
-                logger.warning("Mem0 sync failed: %s", e)
-
-        # Wait for any previous sync before starting a new one
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=5.0)
-
-        self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
-        self._sync_thread.start()
+        Per-turn extraction via Qwen3 produced low-signal fragments without
+        attribution or quality gating.  Durable memory writes now happen only
+        through the nightly reflection cron (mem0_conclude) and explicit agent
+        tool calls.  The orchestration state (last assistant content, tool-call
+        proxy) is still maintained here for the intent gate and deduplicator.
+        """
+        # Cache state for orchestration (intent gate + dedup)
+        self._last_assistant_content = (assistant_content or "")[:2000]
+        # Length proxy: substantive responses (>200 chars) likely involved tool use
+        self._had_tool_calls = len(assistant_content) > 200 if assistant_content else False
+        # NOTE: per-turn client.add() extraction disabled — nightly reflection
+        # is the sole write path for durable memories.  To re-enable, uncomment
+        # the _sync block below and restart the gateway.
+        #
+        # if self._is_breaker_open():
+        #     return
+        # def _sync():
+        #     try:
+        #         client = self._get_client()
+        #         messages = [
+        #             {"role": "user", "content": user_content},
+        #             {"role": "assistant", "content": assistant_content},
+        #         ]
+        #         client.add(messages, **self._write_kwargs())
+        #         self._record_success()
+        #     except Exception as e:
+        #         self._record_failure()
+        #         logger.warning("Mem0 sync failed: %s", e)
+        # if self._sync_thread and self._sync_thread.is_alive():
+        #     self._sync_thread.join(timeout=5.0)
+        # self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
+        # self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
+        schemas = [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
+        if self._chronicle:
+            schemas.append(CHRONICLE_SEARCH_SCHEMA)
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        # Chronicle uses its own backend — not gated by mem0 breaker
+        if tool_name == "chronicle_search":
+            if not self._chronicle:
+                return json.dumps({"error": "Chronicle not available."})
+            query = args.get("query", "")
+            if not query:
+                return json.dumps({"error": "Missing required parameter: query"})
+            try:
+                results = self._chronicle.search(
+                    query,
+                    speaker=args.get("speaker", "any"),
+                    date_from=args.get("date_from", ""),
+                    date_to=args.get("date_to", ""),
+                    top_k=min(int(args.get("top_k", 5)), 15),
+                )
+                if not results:
+                    return json.dumps({"result": "No matching chronicle entries found."})
+                return json.dumps({"results": results, "count": len(results)})
+            except Exception as e:
+                return json.dumps({"error": f"Chronicle search failed: {e}"})
+
         if self._is_breaker_open():
             return json.dumps({
                 "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
@@ -308,7 +466,7 @@ class Mem0MemoryProvider(MemoryProvider):
 
         if tool_name == "mem0_profile":
             try:
-                memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
+                memories = self._unwrap_results(client.get_all(**self._read_kwargs()))
                 self._record_success()
                 if not memories:
                     return json.dumps({"result": "No memories stored yet."})
@@ -327,9 +485,9 @@ class Mem0MemoryProvider(MemoryProvider):
             try:
                 results = self._unwrap_results(client.search(
                     query=query,
-                    filters=self._read_filters(),
+                    **self._read_kwargs(),
                     rerank=rerank,
-                    top_k=top_k,
+                    **{self._search_limit_key(): top_k},
                 ))
                 self._record_success()
                 if not results:
@@ -347,7 +505,7 @@ class Mem0MemoryProvider(MemoryProvider):
             try:
                 client.add(
                     [{"role": "user", "content": conclusion}],
-                    **self._write_filters(),
+                    **self._write_kwargs(),
                     infer=False,
                 )
                 self._record_success()
