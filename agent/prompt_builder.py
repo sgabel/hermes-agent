@@ -307,7 +307,11 @@ PLATFORM_HINTS = {
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
-        "in markdown format ![alt](url) and they will be sent as attachments."
+        "in markdown format ![alt](url) and they will be sent as attachments. "
+        "Messages you send are screenshot-visible and can be forwarded — never "
+        "paste credentials, API keys, tokens, or the contents of credential "
+        "files (e.g. ~/.env, auth.json, anything *.key or *secret*) into chat. "
+        "Reference paths or env var names instead of resolved values."
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
