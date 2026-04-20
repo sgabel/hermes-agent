@@ -317,6 +317,13 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Per-user personalization. `display_name`, when set, is substituted into
+    # platform hints wherever they reference the human (e.g. "communicating
+    # with <display_name>" instead of "communicating with your user"). Empty
+    # string preserves the generic "your user" / "the user" phrasing.
+    "user": {
+        "display_name": "",
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).

@@ -3301,7 +3301,17 @@ class AIAgent:
 
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
-            prompt_parts.append(PLATFORM_HINTS[platform_key])
+            # Read user.display_name from config so the hint refers to the
+            # human by name (e.g. "communicating with Scott") instead of the
+            # generic "your user". Falls back to "your user" when unset.
+            try:
+                from hermes_cli.config import load_config as _lc
+                _user_cfg = (_lc() or {}).get("user", {}) or {}
+                _display_name = str(_user_cfg.get("display_name", "") or "")
+            except Exception:
+                _display_name = ""
+            from agent.prompt_builder import get_platform_hint
+            prompt_parts.append(get_platform_hint(platform_key, _display_name))
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 

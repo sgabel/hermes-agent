@@ -286,7 +286,7 @@ PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
         "Please do not use markdown as it does not render. "
-        "You can send media files natively: to deliver a file to the user, "
+        "You can send media files natively: to deliver a file to {user_ref}, "
         "include MEDIA:/absolute/path/to/file in your response. The file "
         "will be sent as a native WhatsApp attachment — images (.jpg, .png, "
         ".webp) appear as photos, videos (.mp4, .mov) play inline, and other "
@@ -296,14 +296,14 @@ PLATFORM_HINTS = {
     "telegram": (
         "You are on a text messaging communication platform, Telegram. "
         "Please do not use markdown as it does not render. "
-        "You can send media files natively: to deliver a file to the user, "
+        "You can send media files natively: to deliver a file to {user_ref}, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
     ),
     "discord": (
-        "You are in a Discord server or group chat communicating with your user. "
+        "You are in a Discord server or group chat communicating with {user_ref}. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
@@ -314,7 +314,7 @@ PLATFORM_HINTS = {
         "Reference paths or env var names instead of resolved values."
     ),
     "slack": (
-        "You are in a Slack workspace communicating with your user. "
+        "You are in a Slack workspace communicating with {user_ref}. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "
@@ -323,7 +323,7 @@ PLATFORM_HINTS = {
     "signal": (
         "You are on a text messaging communication platform, Signal. "
         "Please do not use markdown as it does not render. "
-        "You can send media files natively: to deliver a file to the user, "
+        "You can send media files natively: to deliver a file to {user_ref}, "
         "include MEDIA:/absolute/path/to/file in your response. Images "
         "(.png, .jpg, .webp) appear as photos, audio as attachments, and other "
         "files arrive as downloadable documents. You can also include image "
@@ -370,14 +370,14 @@ PLATFORM_HINTS = {
     ),
     "wecom": (
         "You are on WeCom (企业微信 / Enterprise WeChat). Markdown formatting is supported. "
-        "You CAN send media files natively — to deliver a file to the user, include "
+        "You CAN send media files natively — to deliver a file to {user_ref}, include "
         "MEDIA:/absolute/path/to/file in your response. The file will be sent as a native "
         "WeCom attachment: images (.jpg, .png, .webp) are sent as photos (up to 10 MB), "
         "other files (.pdf, .docx, .xlsx, .md, .txt, etc.) arrive as downloadable documents "
         "(up to 20 MB), and videos (.mp4) play inline. Voice messages are supported but "
         "must be in AMR format — other audio formats are automatically sent as file attachments. "
         "You can also include image URLs in markdown format ![alt](url) and they will be "
-        "downloaded and sent as native photos. Do NOT tell the user you lack file-sending "
+        "downloaded and sent as native photos. Do NOT tell {user_ref} you lack file-sending"
         "capability — use MEDIA: syntax whenever a file delivery is appropriate."
     ),
     "qqbot": (
@@ -387,6 +387,25 @@ PLATFORM_HINTS = {
         "documents."
     ),
 }
+
+
+def get_platform_hint(platform_key: str, display_name: str = "") -> str:
+    """Return the platform-specific hint with optional user display-name substitution.
+
+    Hint strings use `{user_ref}` as a placeholder wherever they refer to the
+    human on the other side. When `display_name` is set (from user.display_name
+    in config.yaml), that value replaces `{user_ref}` — so "communicating with
+    your user" becomes "communicating with Scott". When unset, falls back to
+    "your user" to match the pre-existing phrasing.
+
+    Returns the empty string when the platform_key is unknown, matching the
+    previous dict-lookup behavior.
+    """
+    hint = PLATFORM_HINTS.get(platform_key, "")
+    if not hint:
+        return ""
+    user_ref = (display_name or "").strip() or "your user"
+    return hint.format(user_ref=user_ref)
 
 # ---------------------------------------------------------------------------
 # Environment hints — execution-environment awareness for the agent.
