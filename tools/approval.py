@@ -193,6 +193,65 @@ def detect_dangerous_command(command: str) -> tuple:
 
 
 # =========================================================================
+# Secret redaction for user-facing approval prompts
+# =========================================================================
+# The approval prompt (CLI terminal, Discord/Slack message, logs) renders the
+# flagged command text so the user can decide. If that text contains creds —
+# API keys, Bearer tokens, DSN passwords — they end up on-screen, in logs, or
+# in message-platform screenshots. Redact the displayed/notified copy; the
+# raw command is unchanged and still what executes after approval.
+#
+# Scope: high-confidence, low-false-positive patterns only. In-house token
+# formats (project-specific prefixes, opaque internal tokens) need explicit
+# additions here. The complementary policy lives at the agent layer — tell
+# the agent not to pass secrets in argv in the first place (skill / USER.md).
+
+_SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Anthropic API key (must come before generic sk- pattern)
+    (re.compile(r'\bsk-ant-[A-Za-z0-9_\-]{20,}'), '[REDACTED:anthropic-key]'),
+    # OpenAI API keys (sk-, sk-proj-)
+    (re.compile(r'\bsk-(?:proj-)?[A-Za-z0-9]{20,}'), '[REDACTED:openai-key]'),
+    # Stripe keys (sk_live_, sk_test_, rk_live_, pk_live_)
+    (re.compile(r'\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{20,}'), '[REDACTED:stripe-key]'),
+    # GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_, gha_)
+    (re.compile(r'\bgh[poursa]_[A-Za-z0-9]{20,}'), '[REDACTED:github-token]'),
+    # Slack tokens (xoxb-, xoxp-, xoxa-, xoxr-, xoxs-, xoxo-, xoxe-)
+    (re.compile(r'\bxox[abeoprs]-[A-Za-z0-9\-]{10,}'), '[REDACTED:slack-token]'),
+    # AWS access key IDs
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), '[REDACTED:aws-access-key]'),
+    # Google API keys (AIza prefix + ~35 chars; lenient match for format variance)
+    (re.compile(r'\bAIza[0-9A-Za-z\-_]{30,}'), '[REDACTED:google-api-key]'),
+    # Bearer tokens in Authorization headers
+    (re.compile(r'(Bearer\s+)([A-Za-z0-9_\-\.=]{20,})'), r'\1[REDACTED:bearer-token]'),
+    # Basic auth in Authorization headers
+    (re.compile(r'(Basic\s+)([A-Za-z0-9+/=]{16,})'), r'\1[REDACTED:basic-auth]'),
+    # DSN-style URIs with embedded passwords: scheme://user:password@host
+    # Preserves scheme + user + host; redacts only the password.
+    (re.compile(
+        r'((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|https?)://[^:/@\s]+:)'
+        r'([^@/\s]+)'
+        r'(@)',
+    ), r'\1[REDACTED:password]\3'),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact well-known secret patterns from text before user-facing display.
+
+    Applied to command and description strings before they reach the CLI
+    approval prompt, Discord notifier, or logs. See _SECRET_PATTERNS for
+    the covered formats. Returns the input unchanged when it contains no
+    matching patterns; returns the empty string / None unchanged.
+    """
+    if not text:
+        return text
+    result = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+# =========================================================================
 # Per-session approval state (thread-safe)
 # =========================================================================
 
@@ -420,9 +479,14 @@ def prompt_dangerous_approval(command: str, description: str,
     if timeout_seconds is None:
         timeout_seconds = _get_approval_timeout()
 
+    # Redact secrets before any user-visible rendering. The original `command`
+    # is still what executes after approval; only what the user sees is scrubbed.
+    display_command = _redact_secrets(command)
+    display_description = _redact_secrets(description)
+
     if approval_callback is not None:
         try:
-            return approval_callback(command, description,
+            return approval_callback(display_command, display_description,
                                      allow_permanent=allow_permanent)
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
@@ -432,8 +496,8 @@ def prompt_dangerous_approval(command: str, description: str,
     try:
         while True:
             print()
-            print(f"  ⚠️  DANGEROUS COMMAND: {description}")
-            print(f"      {command}")
+            print(f"  ⚠️  DANGEROUS COMMAND: {display_description}")
+            print(f"      {display_command}")
             print()
             if allow_permanent:
                 print("      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny")
@@ -841,11 +905,16 @@ def check_all_command_guards(command: str, env_type: str,
             # --- Blocking gateway approval (queue-based) ---
             # Each call gets its own _ApprovalEntry so parallel subagents
             # and execute_code threads can block concurrently.
+            #
+            # Redact secrets in the notified payload: Discord/Slack/etc.
+            # render this dict directly, and messages get screenshotted.
+            # The raw `command` still executes after approval via the
+            # closure below, so redaction affects display only.
             approval_data = {
-                "command": command,
+                "command": _redact_secrets(command),
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
-                "description": combined_desc,
+                "description": _redact_secrets(combined_desc),
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
