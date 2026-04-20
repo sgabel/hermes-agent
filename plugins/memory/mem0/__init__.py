@@ -429,10 +429,16 @@ class Mem0MemoryProvider(MemoryProvider):
         # self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        schemas = [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
-        if self._chronicle:
-            schemas.append(CHRONICLE_SEARCH_SCHEMA)
-        return schemas
+        # Always advertise chronicle_search regardless of self._chronicle state.
+        # The memory_manager builds its _tool_to_provider routing map by calling
+        # get_tool_schemas() at add_provider() time — which runs BEFORE
+        # initialize_all() populates self._chronicle. Gating schema advertisement
+        # on self._chronicle there caused chronicle_search to never enter the
+        # routing map, producing "Unknown tool: chronicle_search" at dispatch.
+        # The dispatch handler at the top of handle_tool_call() still checks
+        # self._chronicle and returns "Chronicle not available." when the
+        # backend isn't ready, so graceful degradation is preserved.
+        return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA, CHRONICLE_SEARCH_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         # Chronicle uses its own backend — not gated by mem0 breaker
