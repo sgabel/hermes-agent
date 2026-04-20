@@ -6353,6 +6353,19 @@ class AIAgent:
                         "effort": "medium"
                     }
 
+        # Local llama.cpp Qwen3/Qwen3.6: the OpenAI-style `reasoning` extra_body
+        # is not honored by llama.cpp. These templates instead expose an
+        # `enable_thinking` Jinja variable that prefills <think></think> to
+        # force-skip reasoning when false. Translate reasoning_config into
+        # chat_template_kwargs so the Hermes UX knob actually reaches the model.
+        # Runs independently of _supports_reasoning_extra_body (which only
+        # handles cloud providers that speak the OpenAI reasoning field).
+        if self._supports_local_thinking_toggle():
+            if self.reasoning_config and self.reasoning_config.get("enabled") is False:
+                ctk = dict(extra_body.get("chat_template_kwargs", {}))
+                ctk["enable_thinking"] = False
+                extra_body["chat_template_kwargs"] = ctk
+
         # Nous Portal product attribution
         if _is_nous:
             extra_body["tags"] = ["product=hermes-agent"]
@@ -6384,6 +6397,31 @@ class AIAgent:
             api_kwargs.update(self.request_overrides)
 
         return api_kwargs
+
+    def _supports_local_thinking_toggle(self) -> bool:
+        """Return True for local/LAN llama.cpp endpoints serving Qwen3-family models.
+
+        Unlike _supports_reasoning_extra_body (which expects the OpenAI
+        `reasoning` field), this path handles the Qwen3 chat template's
+        `enable_thinking` Jinja variable, passed via `chat_template_kwargs`
+        in the request body. llama.cpp with --jinja honors this flag for
+        any template that declares it (Qwen3 and Qwen3.6 do).
+
+        Narrowly scoped on purpose: only Qwen3-family, only local/LAN URLs.
+        Other thinking-capable templates can be added here once verified.
+        """
+        url = self._base_url_lower or ""
+        is_local = (
+            "localhost" in url
+            or "127.0.0.1" in url
+            or "0.0.0.0" in url
+            or "://192.168." in url
+            or "://10." in url
+        )
+        if not is_local:
+            return False
+        model = (self.model or "").lower()
+        return "qwen3" in model  # matches qwen3 and qwen3.6 variants
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
