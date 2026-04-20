@@ -6417,21 +6417,11 @@ class AIAgent:
         in the request body. llama.cpp with --jinja honors this flag for
         any template that declares it (Qwen3 and Qwen3.6 do).
 
-        Narrowly scoped on purpose: only Qwen3-family, only local/LAN URLs.
-        Other thinking-capable templates can be added here once verified.
+        Delegates to the shared `is_local_qwen3_endpoint` helper so the
+        main-agent path and auxiliary-call path agree on the gate.
         """
-        url = self._base_url_lower or ""
-        is_local = (
-            "localhost" in url
-            or "127.0.0.1" in url
-            or "0.0.0.0" in url
-            or "://192.168." in url
-            or "://10." in url
-        )
-        if not is_local:
-            return False
-        model = (self.model or "").lower()
-        return "qwen3" in model  # matches qwen3 and qwen3.6 variants
+        from agent.auxiliary_client import is_local_qwen3_endpoint
+        return is_local_qwen3_endpoint(self._base_url_lower or "", self.model or "")
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.

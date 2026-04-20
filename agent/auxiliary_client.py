@@ -147,6 +147,34 @@ _CODEX_AUX_MODEL = "gpt-5.2-codex"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
+def is_local_qwen3_endpoint(base_url: str, model: str) -> bool:
+    """Return True for local/LAN llama.cpp endpoints serving Qwen3-family models.
+
+    Shared detection used by both the main-agent path
+    (run_agent.py::_build_api_kwargs) and the auxiliary-call path
+    (_build_chat_completions_kwargs below). When True, callers should
+    translate a ``reasoning_effort: none`` preference into
+    ``chat_template_kwargs.enable_thinking: false`` — llama.cpp honors that
+    Jinja variable for Qwen3/Qwen3.6 templates but does not honor the
+    OpenAI-style ``reasoning`` extra_body field.
+
+    Narrowly scoped: only Qwen3-family, only local/LAN URLs (localhost,
+    127.0.0.1, 0.0.0.0, RFC-1918 /16 prefixes for 192.168 and 10). Other
+    thinking-capable templates can be added here once verified.
+    """
+    url = (base_url or "").lower()
+    is_local = (
+        "localhost" in url
+        or "127.0.0.1" in url
+        or "0.0.0.0" in url
+        or "://192.168." in url
+        or "://10." in url
+    )
+    if not is_local:
+        return False
+    return "qwen3" in (model or "").lower()
+
+
 def _to_openai_base_url(base_url: str) -> str:
     """Normalize an Anthropic-style base URL to OpenAI-compatible format.
 
@@ -2222,6 +2250,31 @@ def _build_call_kwargs(
     merged_extra = dict(extra_body or {})
     if provider == "nous" or auxiliary_is_nous:
         merged_extra.setdefault("tags", []).extend(["product=hermes-agent"])
+
+    # Translate global reasoning_effort into chat_template_kwargs for local
+    # Qwen3 endpoints. Mirrors run_agent.py::_build_api_kwargs behavior so
+    # aux calls (session_search summarization, compression, memory nudge,
+    # smart approval, title gen) honor the user's configured thinking
+    # preference instead of defaulting to thinking-on on Qwen's chat
+    # template. Without this, long sessions trigger parallel aux calls that
+    # each burn unlimited reasoning budget on 24K+ token prompts and lock
+    # every slot at once.
+    aux_base = base_url or _current_custom_base_url()
+    if is_local_qwen3_endpoint(aux_base, model):
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+            _effort = str(
+                (_load_cfg() or {}).get("agent", {}).get("reasoning_effort", "") or ""
+            ).strip().lower()
+            if _effort == "none":
+                ctk = dict(merged_extra.get("chat_template_kwargs", {}))
+                ctk["enable_thinking"] = False
+                merged_extra["chat_template_kwargs"] = ctk
+        except Exception:
+            # Config read is best-effort — on failure, leave the aux call
+            # alone rather than blocking it.
+            pass
+
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
