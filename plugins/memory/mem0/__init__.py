@@ -277,9 +277,18 @@ class Mem0MemoryProvider(MemoryProvider):
         self._config = _load_config()
         self._api_key = self._config.get("api_key", "")
         self._host = self._config.get("host", "")
-        # Prefer gateway-provided user_id for per-user memory scoping;
-        # fall back to config/env default for CLI (single-user) sessions.
-        self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
+        # Single-persona pin (PRD-020 post-merge fix): an explicit MEM0_USER_ID
+        # makes ALL surfaces (CLI, Discord, etc.) share one unified memory
+        # namespace. Without it set, prefer the gateway-provided per-user id
+        # (upstream multi-user scoping), then the config default. The merge's
+        # newer gateway began passing the platform user id (e.g. Discord
+        # snowflake), which fragmented Sylva's memory per-platform — this pin
+        # restores the single unified `sylva` namespace.
+        self._user_id = (
+            os.environ.get("MEM0_USER_ID")
+            or kwargs.get("user_id")
+            or self._config.get("user_id", "hermes-user")
+        )
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
         # Chronicle searcher — direct Qdrant + TEI, bypasses mem0 client
