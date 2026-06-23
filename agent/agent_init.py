@@ -212,7 +212,10 @@ def init_agent(
     gateway_session_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
-    skip_memory: bool = False,
+    skip_memory: "bool | None" = None,
+    skip_file_memory: bool = False,
+    skip_provider_memory: bool = False,
+    memory_passive_enabled: bool = True,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -1135,6 +1138,27 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
+    # PRD-022 — memory read/write split.
+    # 1) Resolve the legacy `skip_memory` alias FIRST. When set (not None) it
+    #    forces BOTH new flags, preserving exact behavior for every existing
+    #    skip_memory=True call site (cron, batch, delegate, gateway flush, /btw,
+    #    curator, background-review, feishu, ~58 tests). New default skip_memory=None
+    #    leaves the split flags at their own defaults (both memories on).
+    # 2) Hoist `mem_config` so BOTH the file- and provider-memory blocks can read
+    #    it even when only one gate is open. Without this, splitting the gates
+    #    leaves mem_config undefined in the provider block (skip_file_memory=True,
+    #    skip_provider_memory=False) → NameError swallowed by the block's bare
+    #    except → mem0 silently never loads.
+    # 3) Stash the passive-memory flag: when False (cron), post-turn auto-extraction
+    #    (sync_all/queue_prefetch_all), prefetch read, and provider lifecycle hooks
+    #    are suppressed so cron scaffolding is never ingested — explicit tool writes
+    #    (mem0_conclude) still work because they bypass this flag.
+    if skip_memory is not None:
+        skip_file_memory = skip_memory
+        skip_provider_memory = skip_memory
+    agent._memory_passive_enabled = bool(memory_passive_enabled)
+    mem_config = _agent_cfg.get("memory", {})
+
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
@@ -1142,9 +1166,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    if not skip_memory:
+    if not skip_file_memory:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1163,9 +1186,9 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_provider_memory:
         try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _mem_provider_name = mem_config.get("provider", "")  # mem_config hoisted above
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
