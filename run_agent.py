@@ -414,7 +414,7 @@ class AIAgent:
         gateway_session_key: str = None,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
-        skip_memory: bool = False,
+        skip_memory: "bool | None" = None,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -425,6 +425,13 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        # PRD-022: memory read/write split. `skip_memory` (above) is retained as a
+        # backward-compatible alias; when set (not None) it forces BOTH of the new
+        # flags. New params are appended at the END of the signature so the
+        # ``*args`` passthrough at cli.py:823 does not shift existing positional slots.
+        skip_file_memory: bool = False,
+        skip_provider_memory: bool = False,
+        memory_passive_enabled: bool = True,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -490,6 +497,9 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            skip_file_memory=skip_file_memory,
+            skip_provider_memory=skip_provider_memory,
+            memory_passive_enabled=memory_passive_enabled,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -3032,10 +3042,14 @@ class AIAgent:
         session expiry, etc.
         """
         if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            # PRD-022: on_session_end is end-of-session EXTRACTION (Honcho persists
+            # here). Suppress when passive memory is off (cron) so cron context is
+            # not ingested. shutdown_all() below is resource cleanup — always runs.
+            if getattr(self, "_memory_passive_enabled", True):
+                try:
+                    self._memory_manager.on_session_end(messages or [])
+                except Exception as e:
+                    logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
@@ -3055,7 +3069,9 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        # PRD-022: end-of-session extraction is passive memory; suppress when
+        # passive memory is off (cron). No-op-safe for mem0.
+        if self._memory_manager and getattr(self, "_memory_passive_enabled", True):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -3111,7 +3127,12 @@ class AIAgent:
         """
         if interrupted:
             return
-        if not (self._memory_manager and final_response and original_user_message):
+        # PRD-022: passive memory off (cron) suppresses post-turn auto-extraction
+        # (sync_all) + prefetch warming so cron scaffolding is never ingested.
+        # getattr default True: agent_init always sets this, but test doubles /
+        # partial constructions may not — default to passive-on (current behavior).
+        if not (self._memory_manager and getattr(self, "_memory_passive_enabled", True)
+                and final_response and original_user_message):
             return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for

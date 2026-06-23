@@ -2041,7 +2041,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # PRD-022: split the old `skip_memory=True`. File memory stays OFF
+            # (cron must never mutate MEMORY.md / USER.md). Provider memory is ON
+            # so the nightly reflection's explicit mem0_conclude writes persist.
+            # Passive memory is OFF so cron scaffolding is never auto-extracted —
+            # only explicit tool writes land. (Was: skip_memory=True, which made
+            # the reflection cron a silent no-op for 20+ nights.)
+            skip_file_memory=True,
+            skip_provider_memory=False,
+            memory_passive_enabled=False,
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,

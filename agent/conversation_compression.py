@@ -443,8 +443,11 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    # Notify external memory provider before compression discards context
-    if agent._memory_manager:
+    # Notify external memory provider before compression discards context.
+    # PRD-022: lifecycle hooks are passive memory behavior (Honcho persists via
+    # them); suppress when passive memory is off (cron) so cron context is not
+    # ingested. No-op-safe for mem0 (mem0 does not override on_pre_compress).
+    if agent._memory_manager and getattr(agent, "_memory_passive_enabled", True):
         try:
             agent._memory_manager.on_pre_compress(messages)
         except Exception:
@@ -709,7 +712,7 @@ def compress_context(
     # parent (the conversation didn't fork, but the buffer must still be told
     # the transcript was compacted so it doesn't double-count dropped turns).
     try:
-        if _is_boundary and agent._memory_manager:
+        if _is_boundary and agent._memory_manager and getattr(agent, "_memory_passive_enabled", True):
             agent._memory_manager.on_session_switch(
                 agent.session_id or "",
                 parent_session_id=_boundary_parent,
