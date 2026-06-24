@@ -87,18 +87,55 @@ def _resolve_to_parent(db, session_id: str) -> str:
     return cur
 
 
-def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
-    """Slim a message row for the tool response. Keeps content even if empty."""
+# Per-message content caps (PRD-023 FR-1). The discover/search path packs up to
+# `limit` (≤10) per-session windows + bookends, so an uncapped long message — or a
+# large `tool_calls` blob — can flood a small model's context (the nightly-reflection
+# crash: 29 calls, results up to 159 KB, past the 64K cron window). Caps are explicit
+# per call site so search (tight) and read/scroll (generous transcript pulls) differ.
+_DISCOVER_CONTENT_CAP = 1_200
+_READ_CONTENT_CAP = 4_000
+
+
+def _truncate_text(value: str, cap: int) -> str:
+    """Truncate a string to ``cap`` chars with an explicit marker. No-op at/under cap."""
+    if cap <= 0 or not isinstance(value, str) or len(value) <= cap:
+        return value
+    return value[:cap] + f"… [truncated {len(value) - cap} chars]"
+
+
+def _shape_message(
+    m: Dict[str, Any],
+    anchor_id: Optional[int] = None,
+    content_cap: int = 0,
+) -> Dict[str, Any]:
+    """Slim a message row for the tool response. Keeps content even if empty.
+
+    ``content_cap`` (chars, 0 = unbounded) bounds both the ``content`` string and
+    the serialized ``tool_calls`` blob so no single message can flood the context.
+    It is passed explicitly by each call site (discover=tight, read/scroll=generous);
+    the 0 default keeps any un-migrated caller byte-identical to the old behavior.
+    """
+    content = m.get("content")
+    if content_cap and isinstance(content, str):
+        content = _truncate_text(content, content_cap)
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": content,
         "timestamp": m.get("timestamp"),
     }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        tool_calls = m.get("tool_calls")
+        if content_cap:
+            # tool_calls is a deserialized list/dict (json.loads in hermes_state) —
+            # serialize THEN truncate to a str. Never slice the structure in place
+            # (that yields structurally-wrong JSON once the response is re-dumped).
+            serialized = json.dumps(tool_calls, ensure_ascii=False, default=str)
+            if len(serialized) > content_cap:
+                tool_calls = _truncate_text(serialized, content_cap)
+        entry["tool_calls"] = tool_calls
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:
@@ -197,7 +234,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
         logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
 
-    shaped = [_shape_message(m) for m in rows]
+    shaped = [_shape_message(m, content_cap=_READ_CONTENT_CAP) for m in rows]
     total = len(shaped)
     truncated = total > head + tail
     window = shaped[:head] + shaped[-tail:] if truncated else shaped
@@ -382,7 +419,10 @@ def _scroll(
             "title": session_meta.get("title"),
         },
         "window": window,
-        "messages": [_shape_message(m, anchor_id=around_message_id) for m in messages],
+        "messages": [
+            _shape_message(m, anchor_id=around_message_id, content_cap=_READ_CONTENT_CAP)
+            for m in messages
+        ],
         "messages_before": view.get("messages_before", 0),
         "messages_after": view.get("messages_after", 0),
     }
@@ -472,9 +512,18 @@ def _discover(
             "matched_role": match_info.get("role"),
             "match_message_id": msg_id,
             "snippet": match_info.get("snippet") or "",
-            "bookend_start": [_shape_message(m) for m in (view.get("bookend_start") or [])],
-            "messages": [_shape_message(m, anchor_id=msg_id) for m in (view.get("window") or [])],
-            "bookend_end": [_shape_message(m) for m in (view.get("bookend_end") or [])],
+            "bookend_start": [
+                _shape_message(m, content_cap=_DISCOVER_CONTENT_CAP)
+                for m in (view.get("bookend_start") or [])
+            ],
+            "messages": [
+                _shape_message(m, anchor_id=msg_id, content_cap=_DISCOVER_CONTENT_CAP)
+                for m in (view.get("window") or [])
+            ],
+            "bookend_end": [
+                _shape_message(m, content_cap=_DISCOVER_CONTENT_CAP)
+                for m in (view.get("bookend_end") or [])
+            ],
             "messages_before": view.get("messages_before", 0),
             "messages_after": view.get("messages_after", 0),
         }

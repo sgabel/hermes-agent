@@ -8,8 +8,13 @@ from typing import Dict
 
 # Tools whose thresholds must never be overridden.
 # read_file=inf prevents infinite persist->read->persist loops.
+# session_search=30K (PRD-023 FR-2): a backstop so a pathological multi-result
+# payload is bounded by the budget system regardless of the per-message source cap
+# (session_search_tool._shape_message). session_search registers no max_result_size,
+# so absent this pin it falls to the 100K default and sub-100K floods pass whole.
 PINNED_THRESHOLDS: Dict[str, float] = {
     "read_file": float("inf"),
+    "session_search": 30_000,
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.
