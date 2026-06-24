@@ -57,6 +57,10 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Claude Sonnet second-opinion (PRD-024) — gated: check_fn hides it in cron
+    # (HERMES_CRON_SESSION) until the budget governor (PRD-028) exists, and the
+    # handler runs the approval+tirith gate + input secret-redaction itself.
+    "ask_claude",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -222,7 +226,13 @@ TOOLSETS = {
         "tools": ["session_search"],
         "includes": []
     },
-    
+
+    "ask_claude": {
+        "description": "Gated Claude Sonnet second-opinion tool (interactive-only; PRD-024)",
+        "tools": ["ask_claude"],
+        "includes": []
+    },
+
     "clarify": {
         "description": "Ask the user clarifying questions (multiple-choice or open-ended)",
         "tools": ["clarify"],
