@@ -4282,6 +4282,46 @@ def cmd_security(args):
     sys.exit(2)
 
 
+def cmd_autonomy(args):
+    """Dispatch `hermes autonomy <off|on|status>` — PRD-028 kill switch + ledger."""
+    from autonomy import audit, budget, killswitch
+
+    sub = getattr(args, "autonomy_command", None) or "status"
+    if sub == "off":
+        reason = getattr(args, "reason", "") or "manual via CLI"
+        path = killswitch.quiesce(reason)
+        print(f"Autonomy QUIESCED. Flag: {path}")
+        print("New autonomous work (cron/proactive) halts on next poll. Re-arm: hermes autonomy on")
+        return
+    if sub == "on":
+        existed = killswitch.rearm()
+        print("Autonomy RE-ARMED (flag removed)." if existed
+              else "Autonomy was not quiesced (no flag present).")
+        return
+
+    # status (default)
+    st = killswitch.status()
+    print(f"Kill switch: {'ENGAGED (quiesced)' if st['quiesced'] else 'armed (running)'}  flag={st['flag']}")
+    if st.get("detail"):
+        print("  " + st["detail"].replace("\n", "; "))
+    try:
+        usage = budget.get_usage()
+        t, c = usage["totals"], usage["caps"]
+        print(f"Budget {usage['day']}: actions {t['actions']}/{c['max_autonomous_actions']}, "
+              f"second-opinion {t['second_opinion_calls']}/{c['max_second_opinion_calls']}, "
+              f"tokens {t['tokens']}/{c['max_autonomous_tokens']}")
+    except Exception as exc:  # pragma: no cover
+        print(f"Budget: unavailable ({exc})")
+    hours = getattr(args, "hours", 24.0) or 24.0
+    recent = audit.query(hours=hours)
+    ok, bad = audit.verify_chain()
+    chain = "OK" if ok else f"BROKEN at line {bad}"
+    print(f"Audit ledger: {len(recent)} record(s) in last {hours:g}h; hash chain {chain}")
+    for r in recent[-10:]:
+        print(f"  {r.get('ts','?')} [{r.get('tier','?')}/{r.get('surface','?')}] "
+              f"{r.get('action','')} -> {r.get('outcome','')}")
+
+
 def cmd_dump(args):
     """Dump setup summary for support/debugging."""
     from hermes_cli.dump import run_dump
@@ -11272,7 +11312,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "auth", "autonomy", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
@@ -12032,6 +12072,26 @@ def main():
     # security command  (parser built in hermes_cli/subcommands/security.py)
     # =========================================================================
     build_security_parser(subparsers, cmd_security=cmd_security)
+
+    # =========================================================================
+    # autonomy command — PRD-028 kill switch + audit ledger + budget status
+    # =========================================================================
+    autonomy_parser = subparsers.add_parser(
+        "autonomy",
+        help="Autonomous-operation kill switch + audit/budget status (PRD-028)",
+        description=(
+            "Quiesce all autonomous loops (cron/proactive) via a flag file, "
+            "re-arm, or inspect the append-only audit ledger and daily budget. "
+            "Interactive Sylva and the LLM servers are never affected."
+        ),
+    )
+    autonomy_sub = autonomy_parser.add_subparsers(dest="autonomy_command")
+    _au_off = autonomy_sub.add_parser("off", help="Engage kill switch — halt new autonomous work")
+    _au_off.add_argument("reason", nargs="?", default="", help="optional reason recorded in the ledger")
+    autonomy_sub.add_parser("on", help="Re-arm — allow autonomous work again (deletes the flag)")
+    _au_status = autonomy_sub.add_parser("status", help="Kill-switch state + budget usage + recent ledger")
+    _au_status.add_argument("--hours", type=float, default=24.0, help="ledger window in hours (default 24)")
+    autonomy_parser.set_defaults(func=cmd_autonomy)
 
     # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)

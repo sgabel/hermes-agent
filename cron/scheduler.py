@@ -2281,6 +2281,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # PRD-028 kill switch: poll the flag file before doing ANY autonomous work.
+    # This is the shared firing body for both the in-process ticker and an
+    # external provider's fire_due, so the guard here covers the gateway-wedged
+    # / directly-invoked path (AC-009) — not just tick(). The skip is audited.
+    try:
+        from autonomy import killswitch as _killswitch
+
+        if _killswitch.guard("cron"):
+            logger.info("Job '%s': skipped — autonomy kill switch engaged", job.get("id"))
+            return True  # cleanly skipped, not a processing failure
+    except Exception as _ks_exc:  # never let governance break the cron path
+        logger.debug("autonomy kill-switch check failed (continuing): %s", _ks_exc)
+
     try:
         success, output, final_response, error = run_job(job)
 
@@ -2316,12 +2329,42 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+        # PRD-028: record the autonomous action to the append-only ledger and
+        # debit the daily budget (degrade-to-ask on breach). Best-effort —
+        # governance must never break a cron run.
+        _record_autonomous_cron_run(job, success, error or delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         mark_job_run(job["id"], False, str(e))
+        _record_autonomous_cron_run(job, False, str(e))
         return False
+
+
+def _record_autonomous_cron_run(job: dict, success: bool, error: Optional[str]) -> None:
+    """Audit + budget-debit one autonomous cron run (PRD-028 R-2/R-3). Never raises."""
+    try:
+        from autonomy import audit, budget
+
+        name = job.get("name") or job.get("prompt") or job.get("id") or "cron job"
+        audit.record(
+            tier="T3",
+            surface="cron",
+            action=f"cron run: {str(name)[:200]}",
+            rationale=f"scheduled job {job.get('id', '?')}",
+            authority="auto-by-tier",
+            outcome="ok" if success else f"error: {str(error)[:160]}" if error else "error",
+        )
+        result = budget.debit("cron", "actions", 1)
+        if result.get("degrade"):
+            logger.warning(
+                "PRD-028 budget: daily autonomous-action cap exceeded — degrade-to-ask "
+                "(autonomous cron initiative should pause until the cap resets)."
+            )
+    except Exception as exc:  # pragma: no cover - governance must not break cron
+        logger.debug("autonomy audit/budget record failed (continuing): %s", exc)
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -2375,6 +2418,19 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         return 0
 
     try:
+        # PRD-028 kill switch (ticker path): silent stat poll — no per-tick audit
+        # spam. The per-job skip is audited in run_one_job's guard. Provider
+        # fire_due paths are also covered there (run_one_job is the shared body).
+        try:
+            from autonomy import killswitch as _killswitch
+
+            if _killswitch.is_quiesced():
+                if verbose:
+                    logger.info("Autonomy kill switch engaged — tick skipped")
+                return 0
+        except Exception as _ks_exc:
+            logger.debug("autonomy kill-switch check failed (continuing tick): %s", _ks_exc)
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
