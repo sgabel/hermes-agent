@@ -52,8 +52,8 @@ else
   printf 'API_SERVER_HOST=0.0.0.0\n' >> "$ENVF"
 fi
 
-echo "--- FR-13: tighten mem0.json to owner-only ---"
-chmod 600 "$MEM0"
+echo "--- FR-13: enforce owner-only perms (sed -i above can reset config.yaml/.env from 600) ---"
+chmod 600 "$MEM0" "$CFG" "$ENVF"
 
 echo "=== applied. verification (all diagnostics guarded; never abort under set -e): ==="
 { grep -nE 'base_url' "$CFG" | grep -E 'llama-qwen36-35b|localhost'; } || true
