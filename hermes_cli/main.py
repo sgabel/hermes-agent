@@ -4299,6 +4299,34 @@ def cmd_autonomy(args):
               else "Autonomy was not quiesced (no flag present).")
         return
 
+    if sub in {"pending", "approve"}:
+        # PRD-032 R4 — durable one-shot T4 approvals.
+        from tools import capability_approvals as approvals
+        if sub == "approve":
+            h = getattr(args, "hash", None) or ""
+            if not h:
+                print("Usage: hermes autonomy approve <hash-or-prefix>")
+                return
+            res = approvals.approve(h)
+            if res.get("ok"):
+                print(f"Approved (one-shot): {res['hash']}")
+                print("The next attempt of this exact action runs once, then expires.")
+            else:
+                print(f"Could not approve: {res.get('error')}")
+            return
+        # pending
+        items = approvals.pending()
+        if not items:
+            print("No T4 actions awaiting approval.")
+            return
+        print(f"{len(items)} T4 action(s) awaiting one-shot approval:")
+        for e in items:
+            print(f"  {e['hash'][:12]}  [{e.get('tier','T4')}] {e.get('tool','?')}  "
+                  f"target={e.get('resolved_target','') or '-'}")
+            print(f"      args={e.get('args_summary','')}")
+            print(f"      approve: hermes autonomy approve {e['hash'][:12]}")
+        return
+
     # status (default)
     st = killswitch.status()
     print(f"Kill switch: {'ENGAGED (quiesced)' if st['quiesced'] else 'armed (running)'}  flag={st['flag']}")
@@ -12091,6 +12119,9 @@ def main():
     autonomy_sub.add_parser("on", help="Re-arm — allow autonomous work again (deletes the flag)")
     _au_status = autonomy_sub.add_parser("status", help="Kill-switch state + budget usage + recent ledger")
     _au_status.add_argument("--hours", type=float, default=24.0, help="ledger window in hours (default 24)")
+    autonomy_sub.add_parser("pending", help="List T4 actions awaiting one-shot approval (PRD-032 R4)")
+    _au_approve = autonomy_sub.add_parser("approve", help="Approve a queued T4 action one-shot (PRD-032 R4)")
+    _au_approve.add_argument("hash", help="approval hash or unique prefix (from 'autonomy pending')")
     autonomy_parser.set_defaults(func=cmd_autonomy)
 
     # =========================================================================

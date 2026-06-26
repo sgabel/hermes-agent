@@ -75,11 +75,24 @@ _T3_TOOLS = frozenset({
     "send_message", "send_discord", "notify_owner", "proactive_message",
 })
 
-# T4 — host mutation / privileged / agent-driver / control-plane. Named here for
-# clarity/audit, but the default is ALREADY T4 (unknown → T4), so absence is safe.
+# T2 — contained writes to Sylva's OWN datastore/memory (local Qdrant + the
+# managed MEMORY.md/USER.md files). Not host-fs mutation of arbitrary paths, not
+# egress, not FedPulse — so allowed unattended. The nightly reflection +
+# memory-cleanup cron jobs depend on these.
+_MEMORY_WRITE_TOOLS = frozenset({"mem0_conclude", "memory"})
+
+# File-mutation tools — tier is path-dependent (R5/AC-019): a write resolved
+# under an allowed workspace root is T2; anywhere else on the host (or under a
+# forbidden/secret root) is T4. Resolved in classify() via _classify_write_path.
+_WRITE_TOOLS = frozenset({
+    "write_file", "patch", "edit_file", "create_file", "apply_diff",
+    "move_file", "delete_file", "append_file", "str_replace", "multi_edit",
+})
+
+# T4 — host mutation / privileged / agent-driver / control-plane. The default is
+# ALREADY T4 (unknown → T4), so absence is safe; named for clarity/audit.
 _T4_TOOLS = frozenset({
     "delegate_task",          # I5 — drives another capable agent
-    "write_file", "patch", "edit_file", "create_file", "move_file", "delete_file",
     "run_shell_command",
 })
 
@@ -91,6 +104,10 @@ _EXEC_TOOLS = frozenset({"terminal", "execute_code", "run_command", "shell"})
 # T2 (contained); on any other backend it is T4 (can reach the host).
 _SANDBOX_BACKEND = "sylva-sandbox"
 
+# Args keys a file-mutation tool may carry its target path under.
+_PATH_ARG_KEYS = ("file_path", "path", "filename", "filepath", "target_file",
+                  "target_path", "dest", "destination")
+
 
 def _active_terminal_backend() -> str:
     """Best-effort read of the active terminal/exec backend."""
@@ -99,6 +116,131 @@ def _active_terminal_backend() -> str:
         return str(_get_env_config().get("env_type", "local"))
     except Exception:
         return os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+
+
+# ---------------------------------------------------------------------------
+# R5 — path-aware write classification (AC-019). Realpath/symlink-resolved.
+# ---------------------------------------------------------------------------
+
+def _home() -> "Path":
+    from pathlib import Path
+    return Path(os.path.expanduser("~"))
+
+
+def _hermes_home() -> "Path":
+    from pathlib import Path
+    return Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes")))
+
+
+# Roots that are NEVER unattended-writable, even via a symlink from an allowed
+# root (forbidden wins). Credentials/config/autonomy-state, FedPulse + sidekick
+# (mission-critical), the agent's own source tree (autonomy perimeter), and
+# system dirs. Resolved at call time so HERMES_HOME monkeypatching is honored.
+def _forbidden_write_roots() -> list:
+    from pathlib import Path
+    home = _home()
+    roots = [
+        _hermes_home(),                       # .env / auth.json / config.yaml / autonomy/
+        home / "vaelyn" / "fedpulse",         # MISSION-CRITICAL FedPulse
+        home / "vaelyn" / "sidekick",         # MISSION-CRITICAL sidekick
+        home / ".ssh", home / ".gnupg", home / ".config", home / ".aws",
+        Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"),
+        Path("/boot"), Path("/lib"), Path("/lib64"), Path("/root"),
+        Path("/var/run"), Path("/run"),
+    ]
+    # The hermes-agent source tree (this file's repo) — never self-modify unattended.
+    try:
+        roots.append(Path(__file__).resolve().parents[1])  # .../hermes-agent
+    except Exception:
+        pass
+    return [_resolve(p) for p in roots]
+
+
+# Filename patterns that are secrets regardless of location → always T4.
+_SECRET_NAMES = ("auth.json", ".pgpass", ".netrc", "credentials", "credentials.json")
+_SECRET_SUFFIXES = (".env", ".key", ".pem", ".p12", ".pfx")
+_SECRET_PREFIXES = ("id_rsa", "id_ed25519", "id_ecdsa")
+
+
+def _unattended_write_roots() -> list:
+    """Allowlist of roots an unattended write may target (→ T2). Config-driven.
+
+    Default: the sandbox scratch workdir only (fail-closed — the owner opts
+    additional repo dirs in via ``autonomy.unattended_write_roots``). Forbidden
+    roots always win even if nested under an allowed root.
+    """
+    from pathlib import Path
+    roots = [_home() / "hermes" / "sandbox" / "work"]
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        extra = cfg_get(read_raw_config(), "autonomy", "unattended_write_roots",
+                        default=None)
+        if isinstance(extra, (list, tuple)):
+            roots.extend(Path(os.path.expanduser(str(p))) for p in extra)
+    except Exception:
+        pass
+    return [_resolve(p) for p in roots]
+
+
+def _resolve(p) -> "Path":
+    """Resolve a path (symlinks + ..) without requiring it to exist.
+
+    For a not-yet-created file, resolves the nearest existing ancestor so a
+    symlinked parent can't smuggle a write outside an allowed root (I9).
+    """
+    from pathlib import Path
+    p = Path(os.path.expanduser(str(p)))
+    try:
+        return p.resolve()
+    except Exception:
+        # Walk up to the first existing ancestor, resolve it, re-append the tail.
+        cur = p
+        tail = []
+        while True:
+            if cur.exists():
+                try:
+                    return cur.resolve().joinpath(*reversed(tail))
+                except Exception:
+                    return cur
+            if cur.parent == cur:
+                return p  # reached root without finding an existing ancestor
+            tail.append(cur.name)
+            cur = cur.parent
+
+
+def _under(path, root) -> bool:
+    return path == root or root in path.parents
+
+
+def _extract_path(args: dict):
+    for k in _PATH_ARG_KEYS:
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def _classify_write_path(args: dict) -> Tier:
+    """A file mutation is T2 only if it resolves under an allowed write root AND
+    not under any forbidden root / secret name. Anything else → T4 (fail-closed).
+    """
+    raw = _extract_path(args)
+    if not raw:
+        return Tier.T4  # can't verify the target → deny-by-default
+    target = _resolve(raw)
+    low = target.name.lower()
+    # Secret files are T4 wherever they live.
+    if (low in _SECRET_NAMES or low.endswith(_SECRET_SUFFIXES)
+            or low.startswith(_SECRET_PREFIXES)):
+        return Tier.T4
+    # Forbidden roots win even if nested under an allowed root.
+    for forbidden in _forbidden_write_roots():
+        if _under(target, forbidden):
+            return Tier.T4
+    for allowed in _unattended_write_roots():
+        if _under(target, allowed):
+            return Tier.T2
+    return Tier.T4
 
 
 def classify(tool: str, args: Optional[Dict[str, Any]] = None,
@@ -119,10 +261,16 @@ def classify(tool: str, args: Optional[Dict[str, Any]] = None,
         return Tier.T1
     if name in _T3_TOOLS:
         return Tier.T3
+    if name in _MEMORY_WRITE_TOOLS:
+        # Contained write to Sylva's own memory store / managed memory files.
+        return Tier.T2
     if name in _EXEC_TOOLS:
         # Contained only when running on the dedicated sandbox backend.
         backend = (ctx or {}).get("backend") or _active_terminal_backend()
         return Tier.T2 if backend == _SANDBOX_BACKEND else Tier.T4
+    if name in _WRITE_TOOLS:
+        # R5/AC-019 — T2 only if resolved under an allowed write root.
+        return _classify_write_path(args)
     # _T4_TOOLS and everything unrecognized (unknown tool, MCP, plugin, agent-
     # driver skill) → T4 (I4 default-deny).
     return Tier.T4
@@ -187,7 +335,7 @@ def guard(tool: str, args: Optional[Dict[str, Any]] = None,
     try:
         tier = classify(tool, args, ctx)
         unattended = is_unattended(ctx)
-        return _enforce(tool, tier, mode, unattended, surface)
+        return _enforce(tool, tier, mode, unattended, surface, args or {})
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("capability_policy.guard error for %s: %s", tool, exc)
         if mode == "enforce" and is_unattended(ctx):
@@ -227,8 +375,24 @@ def _audit(tier: Tier, surface: str, action: str, outcome: str,
         pass
 
 
+def _resolved_target(tool: str, args: Dict[str, Any]) -> str:
+    """A stable identity for the action's target, for the R4 approval hash (I9).
+
+    For file mutations: the realpath-resolved path. For exec: the backend. Else
+    empty (the hash falls back to tool+args)."""
+    try:
+        if tool in _WRITE_TOOLS:
+            raw = _extract_path(args)
+            return str(_resolve(raw)) if raw else ""
+        if tool in _EXEC_TOOLS:
+            return _active_terminal_backend()
+    except Exception:
+        pass
+    return ""
+
+
 def _enforce(tool: str, tier: Tier, mode: str, unattended: bool,
-             surface: str) -> Dict[str, Any]:
+             surface: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Apply the tier decision for the (attended|unattended) × (observe|enforce) cell."""
     action = f"{tool} [{tier.name}]"
 
@@ -260,15 +424,35 @@ def _enforce(tool: str, tier: Tier, mode: str, unattended: bool,
         except Exception:
             pass
 
-    # 2. T4 unattended → deny-by-default, degrade-to-ask (durable queue = R4,
-    #    not built in this cut; for now T4 unattended is denied + audited).
+    # 2. T4 unattended → deny-by-default, degrade-to-ask via the DURABLE,
+    #    one-shot, per-action approval store (R4 / Codex STOP-D). If this exact
+    #    action was already approved, consume the one-shot grant and allow once;
+    #    otherwise queue it and block (no hard fail, no approve-all, no stale exec).
     if tier >= Tier.T4:
-        _audit(tier, surface, action, "blocked", mode=mode,
-               rationale="T4 host-mutation/privileged/agent-driver denied unattended (I4/I5)")
-        return {"allowed": False, "tier": tier.name, "mode": mode,
-                "reason": ("T4 action denied unattended (host mutation / privileged / "
-                           "drives another agent). Requires human approval (R4)."),
-                "outcome": "blocked"}
+        target = _resolved_target(tool, args)
+        try:
+            from tools import capability_approvals as approvals
+            if approvals.check_and_consume(tool, args, target):
+                _audit(tier, surface, action, "allowed", mode=mode,
+                       rationale="one-shot human approval consumed (R4)")
+                return {"allowed": True, "tier": tier.name, "mode": mode,
+                        "reason": None, "outcome": "approved-once"}
+            sub = approvals.submit(tool, args, target,
+                                   rationale=f"T4 unattended via {surface}", tier=tier.name)
+            _audit(tier, surface, action, "blocked", mode=mode,
+                   rationale=f"T4 queued for one-shot approval (R4) hash={sub.get('hash')}")
+            return {"allowed": False, "tier": tier.name, "mode": mode,
+                    "reason": ("T4 action requires human approval (host mutation / "
+                               "privileged / drives another agent). Queued one-shot — "
+                               f"approve with: hermes autonomy approve {sub.get('hash','')[:12]}"),
+                    "outcome": "blocked_queued", "approval_hash": sub.get("hash")}
+        except Exception:
+            # Approval store unavailable → fail closed (hard deny, audited).
+            _audit(tier, surface, action, "blocked", mode=mode,
+                   rationale="T4 denied unattended; approval store unavailable (fail-closed)")
+            return {"allowed": False, "tier": tier.name, "mode": mode,
+                    "reason": "T4 action denied unattended (approval store unavailable).",
+                    "outcome": "blocked"}
 
     # 3. T1–T3 unattended → allow within per-action budget (R3).
     try:

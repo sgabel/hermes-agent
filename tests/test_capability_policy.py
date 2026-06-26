@@ -6,11 +6,13 @@ import pytest
 
 
 @pytest.fixture()
-def cp(monkeypatch):
+def cp(monkeypatch, tmp_path):
     # Default to observe unless a test sets enforce; clear cron/autonomous markers.
     monkeypatch.delenv("HERMES_CAPABILITY_POLICY_MODE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
     monkeypatch.delenv("HERMES_AUTONOMOUS", raising=False)
+    # Isolate the durable approval store so tests never touch real ~/.hermes.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import tools.capability_policy as m
     importlib.reload(m)
     return m
@@ -76,11 +78,12 @@ def test_enforce_attended_allows_t4(cp, monkeypatch):
 
 
 def test_enforce_unattended_denies_t4(cp, monkeypatch):
+    # T4 unattended degrades to ask (R4): not executed, queued for one-shot approval.
     monkeypatch.setenv("HERMES_CAPABILITY_POLICY_MODE", "enforce")
     for t in ("write_file", "delegate_task", "unknown_tool"):
         g = cp.guard(t, ctx={"unattended": True, "backend": "local"})
         assert g["allowed"] is False, t
-        assert g["outcome"] == "blocked"
+        assert g["outcome"] == "blocked_queued", t
         assert g["tier"] == "T4"
 
 
@@ -113,3 +116,75 @@ def test_deny_result_is_json_error(cp):
     out = json.loads(cp.deny_result("write_file", g))
     assert "BLOCKED by capability policy" in out["error"]
     assert out["capability_tier"] == "T4"
+
+
+# --- R5: path-aware write classification ---
+
+def test_memory_writes_are_t2(cp):
+    assert cp.classify("mem0_conclude") == cp.Tier.T2
+    assert cp.classify("memory") == cp.Tier.T2
+
+
+def test_write_under_allowed_root_is_t2(cp, monkeypatch, tmp_path):
+    allowed = tmp_path / "work"
+    allowed.mkdir()
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(allowed)])
+    monkeypatch.setattr(cp, "_forbidden_write_roots", lambda: [])
+    t = cp.classify("write_file", {"file_path": str(allowed / "out.md")})
+    assert t == cp.Tier.T2
+
+
+def test_write_outside_allowed_root_is_t4(cp, monkeypatch, tmp_path):
+    allowed = tmp_path / "work"
+    allowed.mkdir()
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(allowed)])
+    monkeypatch.setattr(cp, "_forbidden_write_roots", lambda: [])
+    t = cp.classify("write_file", {"file_path": str(tmp_path / "elsewhere.txt")})
+    assert t == cp.Tier.T4
+
+
+def test_write_to_forbidden_root_is_t4_even_if_nested_in_allowed(cp, monkeypatch, tmp_path):
+    allowed = tmp_path / "work"
+    secrets = allowed / "secrets"
+    secrets.mkdir(parents=True)
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(allowed)])
+    monkeypatch.setattr(cp, "_forbidden_write_roots", lambda: [cp._resolve(secrets)])
+    t = cp.classify("write_file", {"file_path": str(secrets / "x")})
+    assert t == cp.Tier.T4  # forbidden wins
+
+
+def test_write_secret_filename_is_t4(cp, monkeypatch, tmp_path):
+    allowed = tmp_path / "work"
+    allowed.mkdir()
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(allowed)])
+    monkeypatch.setattr(cp, "_forbidden_write_roots", lambda: [])
+    for fn in (".env", "auth.json", "id_ed25519", "server.key"):
+        assert cp.classify("write_file", {"file_path": str(allowed / fn)}) == cp.Tier.T4, fn
+
+
+def test_write_no_path_is_t4(cp):
+    assert cp.classify("write_file", {}) == cp.Tier.T4
+
+
+def test_symlink_escape_is_t4(cp, monkeypatch, tmp_path):
+    allowed = tmp_path / "work"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = allowed / "escape"
+    link.symlink_to(outside)  # allowed/escape -> outside
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(allowed)])
+    monkeypatch.setattr(cp, "_forbidden_write_roots", lambda: [])
+    # A write "inside" allowed via the symlink resolves outside -> T4.
+    t = cp.classify("write_file", {"file_path": str(link / "pwned.txt")})
+    assert t == cp.Tier.T4
+
+
+def test_hermes_home_is_forbidden_by_default(cp, monkeypatch, tmp_path):
+    # ~/.hermes is always forbidden even when set as an allowed root.
+    fake_home = tmp_path / ".hermes"
+    fake_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(fake_home)])
+    t = cp.classify("write_file", {"file_path": str(fake_home / "config.yaml")})
+    assert t == cp.Tier.T4
