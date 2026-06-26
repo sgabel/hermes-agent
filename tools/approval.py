@@ -1323,6 +1323,10 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
+    # NB: "sylva-sandbox" (PRD-026 FR-7) is DELIBERATELY NOT in this skip-set.
+    # That backend is contained, but unlike the generic docker backend it is the
+    # autonomous T2 execution lane, so the tirith/dangerous-command/manual gate
+    # MUST still fire for it (AGENT_SECURITY_MODEL §7a gap 3, AC-012). Do not add.
     if env_type in {"docker", "singularity", "modal", "daytona"}:
         return {"approved": True, "message": None}
 
@@ -1573,7 +1577,9 @@ def check_all_command_guards(command: str, env_type: str,
     a gateway force=True replay from bypassing one check when only the
     other was shown to the user.
     """
-    # Skip containers for both checks
+    # Skip containers for both checks.
+    # NB: "sylva-sandbox" (PRD-026 FR-7) is DELIBERATELY excluded — it is the
+    # autonomous T2 lane and MUST keep hitting the gate (AC-012). Do not add it.
     if env_type in {"docker", "singularity", "modal", "daytona"}:
         return {"approved": True, "message": None}
 
@@ -1906,6 +1912,8 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
 
     # Isolated backends already sandbox the child — matches the container skip
     # in check_all_command_guards / check_dangerous_command.
+    # NB: "sylva-sandbox" (PRD-026 FR-7) is DELIBERATELY excluded — execute_code
+    # on the autonomous T2 lane MUST still hit this guard (AC-012). Do not add it.
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
         return {"approved": True, "message": None}
 

@@ -1365,10 +1365,21 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             timeout=timeout,
         )
 
+    elif env_type == "sylva-sandbox":
+        # PRD-026 FR-7: the dedicated, locked backend. Execs into the verified
+        # `sylva-sandbox-worker` compose container (internal:true bridge +
+        # tinyproxy egress, no creds/cache/skills/docker.sock, no extra_args).
+        # Deliberately NOT in the approval container-skip set (approval.py) so
+        # the tirith/manual-approval gate still fires (AC-012). Ignores image /
+        # container_config / ssh_config / host_cwd — it attaches to the fixed,
+        # runtime-validated worker, not a freshly-run container.
+        from tools.environments.sylva_sandbox import SylvaSandboxEnvironment
+        return SylvaSandboxEnvironment(cwd=cwd, timeout=timeout)
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'ssh', or 'sylva-sandbox'"
         )
 
 
