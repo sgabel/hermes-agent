@@ -1923,6 +1923,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
+            # PRD-032 R1 — central capability gate (site 2: inline agent-runtime
+            # branch). delegate_task drives another capable agent (I5) and is
+            # dispatched inline, so it never reaches registry.dispatch / the
+            # handle_function_call gate — it MUST be gated here. Observe-by-
+            # default; T4 → denied unattended in enforce mode.
+            try:
+                from tools.capability_policy import guard, deny_result
+                _gate = guard("delegate_task", next_args if isinstance(next_args, dict) else {},
+                              surface="agent-runtime")
+                if not _gate.get("allowed", True):
+                    return _finish_agent_tool(deny_result("delegate_task", _gate), next_args)
+            except Exception:
+                pass
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
         def _execute(next_args: dict) -> Any:

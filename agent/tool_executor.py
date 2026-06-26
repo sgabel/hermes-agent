@@ -1142,6 +1142,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _delegate_result = None
             try:
                 def _execute(next_args: dict) -> Any:
+                    # PRD-032 R1 — central capability gate (site 2: inline
+                    # delegate_task on the sequential executor path; I5 surface
+                    # never reaches registry.dispatch). Observe-by-default.
+                    try:
+                        from tools.capability_policy import guard, deny_result
+                        _gate = guard("delegate_task",
+                                      next_args if isinstance(next_args, dict) else {},
+                                      surface="agent-runtime")
+                        if not _gate.get("allowed", True):
+                            return deny_result("delegate_task", _gate)
+                    except Exception:
+                        pass
                     return agent._dispatch_delegate_task(next_args)
                 function_result, function_args = _run_agent_tool_execution_middleware(
                     agent,

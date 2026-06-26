@@ -397,6 +397,20 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+        # PRD-032 R1 — central capability gate (site 1: the registry fan-in).
+        # Covers handle_function_call's two dispatch sites AND the plugin bypass
+        # (hermes_cli/plugins.py PluginContext.dispatch_tool). Observe-by-default
+        # so this never blocks until enforcement is deliberately enabled; the
+        # call is exception-safe (the gate fails open in observe / closed in
+        # enforce-unattended internally — it never raises into dispatch).
+        try:
+            from tools.capability_policy import guard, deny_result
+            _gate = guard(name, args if isinstance(args, dict) else {},
+                          surface="registry")
+            if not _gate.get("allowed", True):
+                return deny_result(name, _gate)
+        except Exception as _gate_exc:  # never let the gate break dispatch
+            logger.debug("capability gate skipped for %s: %s", name, _gate_exc)
         try:
             if entry.is_async:
                 from model_tools import _run_async
