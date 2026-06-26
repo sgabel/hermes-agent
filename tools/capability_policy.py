@@ -173,7 +173,15 @@ def _unattended_write_roots() -> list:
     roots always win even if nested under an allowed root.
     """
     from pathlib import Path
-    roots = [_home() / "hermes" / "sandbox" / "work"]
+    roots = [
+        _home() / "hermes" / "sandbox" / "work",
+        # Narrow carve-out (owner decision 2026-06-26): trusted host-maintenance
+        # cron jobs (skill-audit, etc.) write reports here. This is benign report
+        # output, NOT secrets — and it sits UNDER the forbidden ~/.hermes root, so
+        # the most-specific-match rule in _classify_write_path lets a write here
+        # through (T2) while .env/auth.json/config.yaml/autonomy/ stay forbidden.
+        _hermes_home() / "cron" / "output",
+    ]
     try:
         from hermes_cli.config import cfg_get, read_raw_config
         extra = cfg_get(read_raw_config(), "autonomy", "unattended_write_roots",
@@ -224,26 +232,38 @@ def _extract_path(args: dict):
 
 
 def _classify_write_path(args: dict) -> Tier:
-    """A file mutation is T2 only if it resolves under an allowed write root AND
-    not under any forbidden root / secret name. Anything else → T4 (fail-closed).
+    """A file mutation is T2 only if it resolves under an allowed write root and
+    is not a secret file. Anything else → T4 (fail-closed).
+
+    **Most-specific match wins** (owner decision 2026-06-26): an allowed root may
+    be nested *inside* a forbidden root (e.g. `~/.hermes/cron/output` under the
+    forbidden `~/.hermes`). The decision is made by the **deepest** matching root;
+    ties go to forbidden (safer). Secret-name patterns are T4 regardless of root.
     """
     raw = _extract_path(args)
     if not raw:
         return Tier.T4  # can't verify the target → deny-by-default
     target = _resolve(raw)
     low = target.name.lower()
-    # Secret files are T4 wherever they live.
+    # Secret files are T4 wherever they live (cannot be carved out).
     if (low in _SECRET_NAMES or low.endswith(_SECRET_SUFFIXES)
             or low.startswith(_SECRET_PREFIXES)):
         return Tier.T4
-    # Forbidden roots win even if nested under an allowed root.
+
+    best_depth = -1
+    best_kind: Optional[str] = None  # "forbid" | "allow"
+    # Forbidden first; an allowed root only wins if STRICTLY deeper (ties→forbid).
     for forbidden in _forbidden_write_roots():
         if _under(target, forbidden):
-            return Tier.T4
+            d = len(forbidden.parts)
+            if d > best_depth:
+                best_depth, best_kind = d, "forbid"
     for allowed in _unattended_write_roots():
         if _under(target, allowed):
-            return Tier.T2
-    return Tier.T4
+            d = len(allowed.parts)
+            if d > best_depth:  # strictly deeper than any forbidden match
+                best_depth, best_kind = d, "allow"
+    return Tier.T2 if best_kind == "allow" else Tier.T4
 
 
 def classify(tool: str, args: Optional[Dict[str, Any]] = None,

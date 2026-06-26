@@ -227,3 +227,26 @@ def test_hermes_home_is_forbidden_by_default(cp, monkeypatch, tmp_path):
     monkeypatch.setattr(cp, "_unattended_write_roots", lambda: [cp._resolve(fake_home)])
     t = cp.classify("write_file", {"file_path": str(fake_home / "config.yaml")})
     assert t == cp.Tier.T4
+
+
+# --- Most-specific-match carve-out: ~/.hermes/cron/output allowed, rest forbidden ---
+
+def test_cron_output_carveout_is_t2(cp, monkeypatch, tmp_path):
+    hh = tmp_path / "dot-hermes"
+    (hh / "cron" / "output").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hh))
+    # Use the REAL forbidden/allowed roots (carve-out logic), not monkeypatched.
+    t = cp.classify("write_file", {"file_path": str(hh / "cron" / "output" / "skill-audit.md")})
+    assert t == cp.Tier.T2  # deeper allowed root wins over forbidden ~/.hermes
+
+
+def test_hermes_secrets_still_forbidden_despite_carveout(cp, monkeypatch, tmp_path):
+    hh = tmp_path / "dot-hermes"
+    (hh / "cron" / "output").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hh))
+    # Sibling files in ~/.hermes remain T4 (only cron/output is carved out).
+    assert cp.classify("write_file", {"file_path": str(hh / "config.yaml")}) == cp.Tier.T4
+    assert cp.classify("write_file", {"file_path": str(hh / "auth.json")}) == cp.Tier.T4
+    assert cp.classify("write_file", {"file_path": str(hh / ".env")}) == cp.Tier.T4
+    # A secret filename even inside the carved-out dir stays T4 (secret-name wins).
+    assert cp.classify("write_file", {"file_path": str(hh / "cron" / "output" / ".env")}) == cp.Tier.T4
