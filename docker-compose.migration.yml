@@ -1,0 +1,116 @@
+#
+# PRD-033 — full-agent Docker migration compose (REPLACES docker-compose.yml for the
+# contained deployment; the ship file's `network_mode: host` is unacceptable here).
+#
+# Cutover:
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#     docker compose -p hermes-agent -f docker-compose.migration.yml up -d --build
+# Then attach the externally-managed dependency containers to the internal net
+# (docker/migration/cutover.sh does this via `docker network connect`, no recreate).
+#
+# Security invariants (verified at preflight by docker inspect):
+#   - NO network_mode: host, NO privileged, NO pid/ipc: host, NO docker.sock mount.
+#   - Agent (gateway/dashboard) is on `hermes-agent-deps` (internal: true) ONLY → it has
+#     NO default route → it CANNOT reach the host LAN, FedPulse, sidekick, or the internet.
+#   - The ONLY egress is the dual-homed Discord proxy (allowlist deny-by-default).
+#   - The ONLY host mount is ~/.hermes:/opt/data.
+#
+services:
+  gateway:
+    image: hermes-agent:migration
+    container_name: hermes
+    restart: unless-stopped
+    networks:
+      - hermes-agent-deps          # internal-only; reaches deps by service DNS, no route out
+    volumes:
+      - ~/.hermes:/opt/data        # the ONLY host mount
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - API_SERVER_HOST=0.0.0.0    # host exposure stays loopback-only via the publish below
+      # Discord egress through the allowlist proxy. Targeted + standard proxy vars; deps
+      # and loopback bypass the proxy so the agent talks to LLM/embed/Qdrant directly.
+      - DISCORD_PROXY=http://hermes-discord-proxy:8888
+      - HTTP_PROXY=http://hermes-discord-proxy:8888
+      - HTTPS_PROXY=http://hermes-discord-proxy:8888
+      - http_proxy=http://hermes-discord-proxy:8888
+      - https_proxy=http://hermes-discord-proxy:8888
+      - NO_PROXY=llama-qwen36-35b,llama-qwen3-4b,tei-bge-m3,qdrant,hermes-kokoro,localhost,127.0.0.1
+      - no_proxy=llama-qwen36-35b,llama-qwen3-4b,tei-bge-m3,qdrant,hermes-kokoro,localhost,127.0.0.1
+    # NOTE: the agent is internal-only, so Docker disables published-port DNAT here.
+    # Host ingress (127.0.0.1:8642 for cockpit/RTVC) is provided by the host-ingress
+    # forwarder below, which reaches this container as `hermes:8642` on the internal net.
+    command: ["gateway", "run"]
+    # FR-11 — resource containment (replaces sylva-autonomy.slice). Hard cgroup caps.
+    mem_limit: 48g
+    pids_limit: 8192
+    oom_score_adj: 500             # agent is sacrificed before the LLM servers (-900)
+
+  dashboard:
+    image: hermes-agent:migration
+    container_name: hermes-dashboard
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    networks:
+      - hermes-agent-deps
+    volumes:
+      - ~/.hermes:/opt/data
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+    # Internal-only (no host publish here); host ingress 127.0.0.1:9119 via host-ingress.
+    # Bind 0.0.0.0 INSIDE so the forwarder can reach it; --insecure required to bind
+    # non-localhost; safe because the only host exposure is the loopback forwarder.
+    command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]
+    mem_limit: 2g
+    pids_limit: 1024
+
+  # FR-6 — host-ingress forwarder. Publishes the loopback endpoints the cockpit (host)
+  # and RTVC voice expect, and forwards them to the internal-only agent/dashboard.
+  # Dual-homed so publishing works; fixed-target socat so it grants the agent no egress.
+  host-ingress:
+    build:
+      context: ./docker/host-ingress
+    image: hermes-host-ingress:local
+    container_name: hermes-host-ingress
+    restart: unless-stopped
+    depends_on:
+      - gateway
+      - dashboard
+    networks:
+      - hermes-agent-deps          # reaches hermes:8642 / hermes-dashboard:9119
+      - hermes-egress              # non-internal -> enables host port publishing
+    ports:
+      - "127.0.0.1:8642:8642"          # gateway API — host cockpit (FR-6) + RTVC voice (FR-7); loopback-only (sensitive)
+      - "127.0.0.1:9119:9119"          # dashboard — local + SSH-tunnel access
+      - "192.168.50.182:9119:9119"     # dashboard — LAN-accessible (gaming rig), bound to the LAN IP only
+                                        # (not 0.0.0.0). Matches the pre-migration posture; --insecure on the
+                                        # dashboard is acceptable because exposure is the single LAN interface.
+    mem_limit: 128m
+    pids_limit: 128
+
+  discord-proxy:
+    build:
+      context: ./docker/discord-proxy
+    image: hermes-discord-proxy:local
+    container_name: hermes-discord-proxy
+    restart: unless-stopped
+    networks:
+      - hermes-agent-deps          # reachable by the agent as hermes-discord-proxy:8888
+      - hermes-egress              # its (only) path to the allowlisted Discord hosts
+    mem_limit: 256m
+    pids_limit: 128
+
+networks:
+  # Both networks are created imperatively by docker/migration/cutover.sh BEFORE this
+  # compose runs, so the four dependency containers can be multi-homed onto the internal
+  # net and are reachable the instant the agent starts. Declared external here.
+  #   hermes-agent-deps: `docker network create --internal hermes-agent-deps`
+  #   hermes-egress:     `docker network create hermes-egress`
+  # Internal bridge: NO default route off the box. The agent lives here and ONLY here.
+  hermes-agent-deps:
+    external: true
+  # Normal egress bridge: ONLY the Discord proxy touches this (its second foot).
+  hermes-egress:
+    external: true

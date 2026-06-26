@@ -1,0 +1,18 @@
+# PRD-033 FR-3 — Discord egress allowlist (tinyproxy Filter, FilterDefaultDeny On).
+# Each line is an extended regex matched against the request HOST. ONLY these hosts
+# are reachable through the proxy; everything else (incl. all RFC1918/LAN/FedPulse)
+# is denied and logged. Keep MINIMAL.
+#
+# Covers: REST API + webhooks (discord.com), the realtime gateway WSS
+# (gateway*.discord.gg / *.discord.gg), and CDN/attachments
+# (cdn.discordapp.com, media.discordapp.net). Voice (discord.media) deliberately
+# omitted — the gateway is a text bot, not a voice client.
+
+# REST API + webhooks
+^discord\.com$
+# Realtime gateway (shard hostnames like gateway-us-east1-b.discord.gg)
+(^|\.)discord\.gg$
+# CDN + media attachments (anchored exactly; NO `*.discordapp.com` wildcard — the bot
+# only needs these two, and a wildcard would widen egress + shadow these anchored lines)
+^cdn\.discordapp\.com$
+^media\.discordapp\.net$
