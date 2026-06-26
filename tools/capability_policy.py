@@ -383,16 +383,16 @@ def guard(tool: str, args: Optional[Dict[str, Any]] = None,
 def _should_audit(tier: Tier, mode: str, outcome: str) -> bool:
     """Keep the hash-chained ledger meaningful — don't flood it on the hot path.
 
-    Always record a block. In enforce mode record T1+ decisions (the audited
-    autonomous surface). In observe mode record only T4 (the actionable "this
-    would be denied" signal); T0–T3 allows go to debug log. Per-call auditing of
-    T0 reads is a deliberate volume tradeoff (T0 is allow-broadly regardless).
+    Always record a block/queue. Otherwise record **T1+** in BOTH modes — the
+    "actions that touch the outside world or mutate/escalate" stream (egress,
+    contained writes, messages, host, agent-driver) that the R10 cockpit shows.
+    **T0 reads are intentionally skipped** (the high-frequency firehose: every
+    read_file/grep/list) and go to debug log only — they are allow-broadly
+    regardless and would drown the ledger + the live viewport.
     """
-    if outcome == "blocked":
+    if outcome in ("blocked", "blocked_queued"):
         return True
-    if mode == "enforce":
-        return tier >= Tier.T1
-    return tier >= Tier.T4
+    return tier >= Tier.T1
 
 
 def _audit(tier: Tier, surface: str, action: str, outcome: str,
