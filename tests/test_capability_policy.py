@@ -180,6 +180,45 @@ def test_symlink_escape_is_t4(cp, monkeypatch, tmp_path):
     assert t == cp.Tier.T4
 
 
+def test_validated_read_tools_are_t0(cp):
+    # Registry-name reads that were mis-defaulting to T4 before the 2026-06-26
+    # tier-map validation.
+    for t in ("search_files", "skills_list", "skill_view", "kanban_show",
+              "kanban_list", "clarify"):
+        assert cp.classify(t) == cp.Tier.T0, t
+
+
+def test_missing_browser_ops_are_t1(cp):
+    for t in ("browser_console", "browser_get_images", "browser_press", "browser_vision"):
+        assert cp.classify(t) == cp.Tier.T1, t
+
+
+# --- Site 3: cron script classification ---
+
+def test_cron_script_in_trusted_dir_is_t2(cp, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    s = scripts / "watchdog.sh"
+    s.write_text("echo hi")
+    assert cp.classify("cron_script", {"script_path": str(s)}) == cp.Tier.T2
+
+
+def test_cron_script_outside_trusted_dir_is_t4(cp, monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "scripts").mkdir()
+    outside = tmp_path / "evil.sh"
+    outside.write_text("echo pwned")
+    assert cp.classify("cron_script", {"script_path": str(outside)}) == cp.Tier.T4
+    assert cp.classify("cron_script", {}) == cp.Tier.T4  # no path → fail-closed
+
+
+# --- Site 4: MCP sampling defaults to T4 (fail-closed) ---
+
+def test_mcp_sampling_is_t4(cp):
+    assert cp.classify("mcp_sampling", {"server": "x"}) == cp.Tier.T4
+
+
 def test_hermes_home_is_forbidden_by_default(cp, monkeypatch, tmp_path):
     # ~/.hermes is always forbidden even when set as an allowed root.
     fake_home = tmp_path / ".hermes"

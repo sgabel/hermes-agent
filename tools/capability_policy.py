@@ -52,12 +52,14 @@ class Tier(IntEnum):
 # ---------------------------------------------------------------------------
 
 # T0 — pure observation: reads, searches, local introspection. None of these
-# egress, spawn host subprocesses, or mutate host state.
+# egress, spawn host subprocesses, or mutate host state. (Tool names verified
+# against the live registry 2026-06-26.)
 _T0_TOOLS = frozenset({
     "read_file", "read_many_files", "list_directory", "list_dir", "glob",
-    "grep", "search_file_content", "ripgrep", "find_files",
-    "session_search", "chronicle_search", "todo", "read_terminal",
+    "grep", "search_file_content", "ripgrep", "find_files", "search_files",
+    "session_search", "chronicle_search", "todo", "read_terminal", "clarify",
     "get_diff", "git_status", "mem0_search", "mem0_profile",
+    "skills_list", "skill_view", "kanban_show", "kanban_list",
 })
 
 # T1 — read-external (egress to a sanctioned destination). These are exfil
@@ -68,6 +70,7 @@ _T1_TOOLS = frozenset({
     "browser_select", "browser_scroll", "browser_extract", "browser_screenshot",
     "browser_dialog", "browser_back", "browser_forward", "browser_wait",
     "browser_tabs", "browser_close", "browser_evaluate", "fetch_url",
+    "browser_console", "browser_get_images", "browser_press", "browser_vision",
 })
 
 # T3 — outbound message to the owner (consent-first).
@@ -264,6 +267,16 @@ def classify(tool: str, args: Optional[Dict[str, Any]] = None,
     if name in _MEMORY_WRITE_TOOLS:
         # Contained write to Sylva's own memory store / managed memory files.
         return Tier.T2
+    if name == "cron_script":
+        # An owner-authored script under ~/.hermes/scripts/ is a deliberate
+        # capability grant (I3) → T2 (trusted automation, audited + kill-switch-
+        # gated upstream). A path that resolves outside that dir → T4.
+        raw = args.get("script_path") or args.get("path")
+        if not raw:
+            return Tier.T4
+        target = _resolve(raw)
+        scripts_dir = _resolve(_hermes_home() / "scripts")
+        return Tier.T2 if _under(target, scripts_dir) else Tier.T4
     if name in _EXEC_TOOLS:
         # Contained only when running on the dedicated sandbox backend.
         backend = (ctx or {}).get("backend") or _active_terminal_backend()

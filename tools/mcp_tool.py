@@ -1089,6 +1089,24 @@ class SamplingHandler:
         ``CreateMessageResult``, ``CreateMessageResultWithTools``, or
         ``ErrorData``.
         """
+        # PRD-032 R1 — central capability gate (site 4: MCP server-initiated
+        # sampling drives OUR aux LLM and is NOT a registry tool, so it bypasses
+        # the registry.dispatch gate). A foreign server steering our model is a
+        # taint (I10) + budget surface → gated. Observe-by-default; unattended
+        # enforce degrades-to-ask. Classified T4 (fail-closed default).
+        try:
+            from tools.capability_policy import guard
+            _gate = guard("mcp_sampling", {"server": self.server_name},
+                          surface="mcp")
+            if not _gate.get("allowed", True):
+                self.metrics["errors"] += 1
+                return self._error(
+                    f"MCP sampling blocked by capability policy "
+                    f"({_gate.get('tier')}): {_gate.get('reason') or 'denied'}"
+                )
+        except Exception:
+            pass  # never let the gate break the MCP callback
+
         # Rate limit
         if not self._check_rate_limit():
             logger.warning(

@@ -1196,6 +1196,23 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    # PRD-032 R1 — central capability gate (site 3: cron scripts shell out via
+    # subprocess.run and never enter registry.dispatch / handle_function_call,
+    # so they MUST be gated here, by resolved path). Observe-by-default; a script
+    # under ~/.hermes/scripts/ is T2 (trusted owner automation) and proceeds, a
+    # path that escaped that dir is T4 (degrade-to-ask / deny unattended).
+    try:
+        from tools.capability_policy import guard
+        _gate = guard("cron_script", {"script_path": str(path)},
+                      ctx={"unattended": True}, surface="cron")
+        if not _gate.get("allowed", True):
+            return False, (
+                f"Blocked by capability policy ({_gate.get('tier')}): "
+                f"{_gate.get('reason') or 'denied'}"
+            )
+    except Exception:
+        pass  # never let the gate break the cron path
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
