@@ -261,12 +261,30 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
-    """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    extra_exclude_sources: Optional[List[str]] = None,
+    min_messages: int = 1,
+) -> str:
+    """Return metadata for the most recent sessions (no LLM calls, no FTS5).
+
+    ``extra_exclude_sources`` is unioned with the always-hidden subagent/tool
+    sources — callers (e.g. the nightly reflection) pass ``["cron"]`` to get a
+    chronological view of *user-facing* sessions only, instead of re-reading
+    their own prior reflection/cleanup runs. ``min_messages`` defaults to 1 so
+    empty orphan sessions (e.g. 0-message platform handshakes) are skipped.
+    """
+    exclude = list(_HIDDEN_SESSION_SOURCES)
+    for s in (extra_exclude_sources or []):
+        if s and s not in exclude:
+            exclude.append(s)
     try:
         sessions = db.list_sessions_rich(
             limit=limit + 5,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            exclude_sources=exclude,
+            min_message_count=min_messages,
             order_by_last_active=True,
         )  # fetch extra so we can skip current
 
@@ -438,15 +456,21 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    extra_exclude_sources: Optional[List[str]] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
+
+    exclude = list(_HIDDEN_SESSION_SOURCES)
+    for s in (extra_exclude_sources or []):
+        if s and s not in exclude:
+            exclude.append(s)
 
     try:
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            exclude_sources=exclude,
             limit=50,  # widen so dedup-by-lineage can find distinct sessions
             offset=0,
             sort=sort,
@@ -553,6 +577,9 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
+    # Discovery + browse shapes: comma-separated session sources to exclude
+    # (unioned with the always-hidden subagent/tool sources).
+    exclude_sources: str = None,
     # Cross-profile (any shape)
     profile: str = None,
 ) -> str:
@@ -639,9 +666,16 @@ def session_search(
             limit = 3
     limit = max(1, min(limit, 10))
 
+    # Parse exclude_sources (comma-separated) — applies to browse + discovery.
+    extra_exclude: Optional[List[str]] = None
+    if isinstance(exclude_sources, str) and exclude_sources.strip():
+        extra_exclude = [s.strip() for s in exclude_sources.split(",") if s.strip()]
+
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db, limit, current_session_id, extra_exclude_sources=extra_exclude
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -662,6 +696,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        extra_exclude_sources=extra_exclude,
     )
 
 
@@ -723,10 +758,14 @@ SESSION_SEARCH_SCHEMA = {
         "large). This is how you resolve an `@session:<profile>/<id>` link the "
         "user dropped into the chat: split the value on `/` into profile + id "
         "and call session_search(session_id=id, profile=profile).\n\n"
-        "  4) BROWSE — no args:\n"
-        "     session_search()\n"
-        "     Returns recent sessions chronologically: titles, previews, timestamps. "
-        "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
+        "  4) BROWSE — no query:\n"
+        "     session_search()  ·  session_search(exclude_sources=\"cron\", limit=10)\n"
+        "     Returns recent sessions chronologically (by last activity): titles, "
+        "previews, timestamps. This — NOT keyword search — is the right way to answer "
+        "\"what happened recently / since yesterday\": keyword search with sort='newest' "
+        "only re-ranks rows that already MATCH your query, so short recent sessions that "
+        "don't contain your guessed keywords are invisible. Pass exclude_sources to drop "
+        "noise (e.g. \"cron\" to see only user-facing conversations).\n\n"
         "FTS5 SYNTAX\n\n"
         "  AND is the default — multi-word queries require all terms. Use OR explicitly "
         "for broader recall (`alpha OR beta OR gamma`), quoted phrases for exact match "
@@ -807,6 +846,17 @@ SESSION_SEARCH_SCHEMA = {
                     "behaviour) or 'tool' to search tool output only."
                 ),
             },
+            "exclude_sources": {
+                "type": "string",
+                "description": (
+                    "Optional (discovery + browse shapes). Comma-separated session "
+                    "sources to exclude, unioned with the always-hidden subagent/tool "
+                    "sources. Pass 'cron' to drop automated reflection/cleanup runs and "
+                    "see only user-facing conversations (discord/tui/cli/voice/api) — "
+                    "use this in nightly reflection so you don't consolidate your own "
+                    "prior summaries."
+                ),
+            },
             "profile": {
                 "type": "string",
                 "description": (
@@ -837,6 +887,7 @@ registry.register(
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
         sort=args.get("sort"),
+        exclude_sources=args.get("exclude_sources"),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
