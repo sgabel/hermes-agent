@@ -417,8 +417,11 @@ def _resolved_target(tool: str, args: Dict[str, Any]) -> str:
         if tool in _WRITE_TOOLS:
             raw = _extract_path(args)
             return str(_resolve(raw)) if raw else ""
+        if tool == "cron_script":
+            raw = args.get("script_path") or args.get("path")
+            return str(_resolve(raw)) if raw else ""
         if tool in _EXEC_TOOLS:
-            return _active_terminal_backend()
+            return f"backend:{_active_terminal_backend()}"
     except Exception:
         pass
     return ""
@@ -427,7 +430,11 @@ def _resolved_target(tool: str, args: Dict[str, Any]) -> str:
 def _enforce(tool: str, tier: Tier, mode: str, unattended: bool,
              surface: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Apply the tier decision for the (attended|unattended) × (observe|enforce) cell."""
-    action = f"{tool} [{tier.name}]"
+    # Enrich the audit label with the resolved target so the R10 stream is
+    # self-explanatory ("write_file [T4] → ~/.hermes/MEMORY.md" tells you WHY it's
+    # T4). autonomy.audit redacts secrets from this string before it persists.
+    _target = _resolved_target(tool, args)
+    action = f"{tool} [{tier.name}]" + (f" → {_target}" if _target else "")
 
     # Observe mode: classify + audit, never block. Safe default.
     if mode != "enforce":
@@ -462,7 +469,7 @@ def _enforce(tool: str, tier: Tier, mode: str, unattended: bool,
     #    action was already approved, consume the one-shot grant and allow once;
     #    otherwise queue it and block (no hard fail, no approve-all, no stale exec).
     if tier >= Tier.T4:
-        target = _resolved_target(tool, args)
+        target = _target
         try:
             from tools import capability_approvals as approvals
             if approvals.check_and_consume(tool, args, target):
