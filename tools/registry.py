@@ -410,7 +410,25 @@ class ToolRegistry:
             if not _gate.get("allowed", True):
                 return deny_result(name, _gate)
         except Exception as _gate_exc:  # never let the gate break dispatch
-            logger.debug("capability gate skipped for %s: %s", name, _gate_exc)
+            logger.warning("capability gate error for %s: %s", name, _gate_exc)
+            # In enforce mode a gate error must fail CLOSED — deny the tool
+            # call rather than silently continuing unexamined.  In observe
+            # mode (the safe rollout default) we keep the existing fail-open
+            # behaviour so wiring the gate never bricks the agent.
+            try:
+                from tools.capability_policy import policy_mode
+                if policy_mode() == "enforce":
+                    import json as _json
+                    return _json.dumps({
+                        "error": (
+                            f"BLOCKED by capability policy (gate error, fail-closed): "
+                            f"{_gate_exc}"
+                        ),
+                        "capability_tier": "T4",
+                        "outcome": "blocked",
+                    }, ensure_ascii=False)
+            except Exception:
+                pass  # can't determine mode → keep fail-open (observe-safe)
         try:
             if entry.is_async:
                 from model_tools import _run_async

@@ -1210,8 +1210,20 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 f"Blocked by capability policy ({_gate.get('tier')}): "
                 f"{_gate.get('reason') or 'denied'}"
             )
-    except Exception:
-        pass  # never let the gate break the cron path
+    except Exception as _gate_exc:
+        # In enforce mode a gate error must fail CLOSED — block execution rather
+        # than silently continuing unexamined.  In observe mode (the safe rollout
+        # default) we keep the existing fail-open behaviour.
+        logger.warning("capability gate error for cron_script %s: %s", path, _gate_exc)
+        try:
+            from tools.capability_policy import policy_mode
+            if policy_mode() == "enforce":
+                return False, (
+                    f"Blocked by capability policy (gate error, fail-closed): "
+                    f"{_gate_exc}"
+                )
+        except Exception:
+            pass  # can't determine mode → keep fail-open (observe-safe)
 
     script_timeout = _get_script_timeout()
 

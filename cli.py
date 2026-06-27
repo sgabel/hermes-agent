@@ -8082,22 +8082,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # PRD-032 R1 — route through the capability gate before
+                        # execution. A quick_command exec is treated as a terminal
+                        # call (shell=True subprocess). The CLI path is attended
+                        # (no HERMES_CRON_SESSION), so in enforce mode the existing
+                        # manual approval gate covers T4; the gate audits and passes.
+                        # Deny is still surfaced so an explicit block (e.g. kill-
+                        # switch) is visible to the user.
                         try:
-                            # shell=True is intentional: quick_commands are user-defined
-                            # shell snippets from config.yaml — not agent/LLM controlled.
-                            result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30
-                            )
-                            output = result.stdout.strip() or result.stderr.strip()
-                            if output:
-                                self._console_print(_rich_text_from_ansi(output))
-                            else:
-                                self._console_print("[dim]Command returned no output[/]")
-                        except subprocess.TimeoutExpired:
-                            self._console_print("[bold red]Quick command timed out (30s)[/]")
-                        except Exception as e:
-                            self._console_print(f"[bold red]Quick command error: {e}[/]")
+                            from tools.capability_policy import guard
+                            _gate = guard("terminal", {"command": exec_cmd}, ctx={})
+                            if not _gate.get("allowed", True):
+                                self._console_print(
+                                    f"[bold red]Quick command blocked by capability policy "
+                                    f"({_gate.get('tier')}): "
+                                    f"{_gate.get('reason') or 'denied'}[/]"
+                                )
+                                exec_cmd = ""  # skip execution below
+                        except Exception as _gate_exc:
+                            logger.debug("capability gate skipped for quick_command: %s", _gate_exc)
+                        if exec_cmd:
+                            try:
+                                # shell=True is intentional: quick_commands are user-defined
+                                # shell snippets from config.yaml — not agent/LLM controlled.
+                                result = subprocess.run(
+                                    exec_cmd, shell=True, capture_output=True,
+                                    text=True, timeout=30
+                                )
+                                output = result.stdout.strip() or result.stderr.strip()
+                                if output:
+                                    self._console_print(_rich_text_from_ansi(output))
+                                else:
+                                    self._console_print("[dim]Command returned no output[/]")
+                            except subprocess.TimeoutExpired:
+                                self._console_print("[bold red]Quick command timed out (30s)[/]")
+                            except Exception as e:
+                                self._console_print(f"[bold red]Quick command error: {e}[/]")
                     else:
                         self._console_print(f"[bold red]Quick command '{base_cmd}' has no command defined[/]")
                 elif qcmd.get("type") == "alias":

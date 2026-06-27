@@ -181,6 +181,33 @@ _HERMES_CONFIG_PATH = (
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
     r'config\.yaml\b'
 )
+# PRD-032 enforce-hardening (dual adversarial NO-GO, 2026-06-27): the trust
+# boundary is /opt/data (= host ~/.hermes), NOT the container. A contained-T2
+# shell command referencing a secret/config/state path under it — as SOURCE
+# (exfil: cp/cat/base64/curl @path -> work/ -> :9120, or -> the discord proxy)
+# or DEST (tamper: truncate config.yaml turns enforce OFF; rm/append the ledger)
+# — is the R5 command-half hole both reviewers proved. The existing _HERMES_*_
+# PATH fragments only matched ~/.hermes/ WRITE-targets, so the container-absolute
+# `/opt/data/.env` form and READ-side refs evaded. This fragment covers BOTH
+# prefixes and is matched ANYWHERE in the command (source or dest), gated even
+# when contained (NOT in _CONTAINED_OK_DESCRIPTIONS). Structural read-only mounts
+# of .env/auth.json/config.yaml + chattr +a on the ledger back this up; together
+# they close the demonstrated payloads. RESIDUAL: relative-path traversal from
+# the cwd (e.g. `../.env`) and execute_code's arbitrary Python still evade the
+# regex — that's the full parsed-effect R5, deferred; the workshop content filter
+# + read-only mounts narrow it.
+_HERMES_HOME_PREFIX = (
+    r'(?:/opt/data/|~\/\.hermes/|'
+    r'(?:\$home|\$\{home\})/\.hermes/|'
+    r'(?:\$hermes_home|\$\{hermes_home\})/)'
+)
+_HERMES_SECRET_REF = (
+    rf'{_HERMES_HOME_PREFIX}'
+    r'(?:\.env\b|auth\.json\b|config\.yaml\b|mem0\.json\b|'
+    r'[^\s"\'`]*\.(?:key|pem)\b|id_[a-z0-9_]+\b|'
+    r'autonomy(?:/|\b)|\.migration(?:/|\b)|'
+    r'\.(?:ssh|gnupg|aws)(?:/|\b))'
+)
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = (
@@ -519,6 +546,17 @@ DANGEROUS_PATTERNS = [
     # into a single -X token. Catches the same threat class.
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
+    # PRD-032 enforce-hardening (2026-06-27): any reference to a /opt/data (or
+    # ~/.hermes) secret/config/state path, as source (exfil) or dest (tamper).
+    # NOT in _CONTAINED_OK_DESCRIPTIONS, so a contained-T2 shell cannot cp/cat/
+    # base64/curl a secret into work/ (-> :9120) or to the discord proxy, nor
+    # truncate config.yaml (which would flip enforce off), nor rm/append the
+    # autonomy ledger. Matched anywhere in the command.
+    (rf'{_HERMES_SECRET_REF}', "access to host secret/config/autonomy path"),
+    # dd write (no if= required) + truncate — overwrite/wipe a file from a
+    # contained shell; the existing dd pattern only matched if= (read side).
+    (r'\bdd\b[^\n]*\bof=', "dd output write"),
+    (r'\btruncate\b', "truncate (file size mutation)"),
 ]
 
 
@@ -666,6 +704,26 @@ def detect_dangerous_command(command: str) -> tuple:
             pattern_key = description
             return (True, pattern_key, description)
     return (False, None, None)
+
+
+def _all_dangerous_descriptions(command: str) -> set:
+    """Every dangerous-pattern description the command matches (not just the
+    first). Used for the contained-cron relaxation: a command is contained-OK
+    only if EVERY pattern it trips is in _CONTAINED_OK_DESCRIPTIONS — so a
+    `python -c` (OK) that ALSO references a secret path (NOT OK) stays blocked
+    (NF-1: first-match was order-sensitive and could mask a harmful co-match)."""
+    command_lower = _normalize_command_for_detection(command).lower()
+    return {desc for pattern_re, desc in DANGEROUS_PATTERNS_COMPILED
+            if pattern_re.search(command_lower)}
+
+
+def _is_contained_ok(command: str) -> bool:
+    """True iff the agent is containerized AND every dangerous pattern the
+    command matches is a contained-OK (code-execution, not exfil/tamper) one."""
+    if not _local_exec_is_contained():
+        return False
+    matches = _all_dangerous_descriptions(command)
+    return bool(matches) and matches <= _CONTAINED_OK_DESCRIPTIONS
 
 
 # =========================================================================
@@ -1387,10 +1445,9 @@ def check_dangerous_command(command: str, env_type: str,
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             # Contained code-execution (python -c / heredoc) is allowed when the
-            # agent runs in the locked container; destructive verbs stay blocked.
-            _contained_ok = (
-                _local_exec_is_contained() and description in _CONTAINED_OK_DESCRIPTIONS
-            )
+            # agent runs in the locked container; destructive verbs AND secret/
+            # config/ledger access stay blocked (all-match, NF-1).
+            _contained_ok = _is_contained_ok(command)
             if _get_cron_approval_mode() == "deny" and not _contained_ok:
                 return {
                     "approved": False,
@@ -1653,9 +1710,7 @@ def check_all_command_guards(command: str, env_type: str,
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
-                _contained_ok = (
-                    _local_exec_is_contained() and description in _CONTAINED_OK_DESCRIPTIONS
-                )
+                _contained_ok = _is_contained_ok(command)   # all-match (NF-1)
                 if is_dangerous and not _contained_ok:
                     return {
                         "approved": False,

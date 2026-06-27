@@ -138,10 +138,30 @@ def _local_exec_is_contained() -> bool:
     destructive shell verbs until the R5 command-half lands; the adversarial pass
     must clear this before the enforce flip.
     """
+    # NF-3 (adversarial 2026-06-27): the flag lives in the host-SHARED
+    # ~/.hermes/config.yaml, so trusting it alone would classify real host
+    # `terminal.backend:local` as T2 if a host-side hermes ever ran against this
+    # config. Require a POSITIVE containment probe too — the re-tier holds only
+    # when we are actually inside a container (Docker writes /.dockerenv; the
+    # compose also sets HERMES_CONTAINERIZED=1). Fail-closed: no probe → host → T4.
+    if not _is_actually_containerized():
+        return False
     try:
         from hermes_cli.config import cfg_get, read_raw_config
         return bool(cfg_get(read_raw_config(), "autonomy",
                             "local_exec_is_contained", default=False))
+    except Exception:
+        return False
+
+
+def _is_actually_containerized() -> bool:
+    """Positive containment probe (NF-3): True only when the process is really
+    inside a container — `HERMES_CONTAINERIZED=1` (set in the compose) or the
+    Docker-created `/.dockerenv` marker. Never trusts config alone."""
+    try:
+        if os.getenv("HERMES_CONTAINERIZED", "").strip() in ("1", "true", "yes"):
+            return True
+        return os.path.exists("/.dockerenv")
     except Exception:
         return False
 

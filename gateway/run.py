@@ -8260,6 +8260,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
+                        # PRD-032 R1 — route through the capability gate before
+                        # execution. A quick_command exec is treated as a terminal
+                        # call (shell subprocess). is_unattended() resolves via
+                        # env vars (HERMES_CRON_SESSION / HERMES_AUTONOMOUS) so
+                        # cron-sourced gateway calls are correctly classified.
+                        try:
+                            from tools.capability_policy import guard
+                            _gate = guard("terminal", {"command": exec_cmd}, ctx={})
+                            if not _gate.get("allowed", True):
+                                return (
+                                    f"Quick command blocked by capability policy "
+                                    f"({_gate.get('tier')}): "
+                                    f"{_gate.get('reason') or 'denied'}"
+                                )
+                        except Exception as _gate_exc:
+                            logger.debug("capability gate skipped for quick_command: %s", _gate_exc)
                         try:
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
