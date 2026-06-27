@@ -283,6 +283,22 @@ def test_all_facets_accepted():
         assert pt is not None, f
 
 
+# ── security: secret-shaped content is refused before durable storage ──────────
+def test_candidate_with_secret_in_statement_is_dropped():
+    secret = "xqK9fL2mP7rT4vN8wZ3bY6cH1gD5jA0eU7sQ"  # high-entropy blob
+    pt = _candidate_point(_proposal(statement=f"My key is {secret}"), model="m", now_iso="t")
+    assert pt is None  # refused — never reaches the always-loaded canon store
+
+
+def test_transcript_redacts_secrets_before_the_deriver():
+    db = _FakeDB([], {})
+    secret = "xqK9fL2mP7rT4vN8wZ3bY6cH1gD5jA0eU7sQ"  # high-entropy blob
+    db._transcripts["s1"] = [{"role": "user", "content": f"creds: {secret}"}]
+    text = _session_transcript(db, "s1", 10000)
+    assert secret not in text
+    assert "REDACTED" in text
+
+
 # ── integration: real direct-Qdrant upsert (gated) ─────────────────────────────
 _QDRANT = "http://localhost:6333"
 

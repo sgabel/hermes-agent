@@ -250,7 +250,25 @@ def _session_transcript(db, session_id: str, char_budget: int) -> str:
             break
         kept.append(line)
         used += cost
-    return "\n".join(reversed(kept))
+    text = "\n".join(reversed(kept))
+    return _scrub_secrets(text)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact credential-shaped content before it reaches the deriver / durable
+    storage (security HIGH). Fail-closed: if the redactor errors, drop the text
+    rather than leak it. Mirrors the PRD-024 ask_claude input-side screen so a
+    user-pasted key in a session never lands in a candidate payload (always-
+    loaded canon) or egresses to a (future external) adversary model."""
+    if not text:
+        return text
+    try:
+        from autonomy.redact import redact_for_autonomy
+
+        return redact_for_autonomy(text)
+    except Exception:
+        logger.warning("consolidation: redaction failed — dropping content (fail-closed)")
+        return "[REDACTED:redaction-failed]"
 
 
 # ── 2. gather: the structured agency layer (deterministic, no LLM) ──────────────
@@ -270,7 +288,16 @@ def _gather_agency_layer() -> List[Dict[str, Any]]:
     items.extend(_agency_from_ledger())
     items.extend(_agency_from_kanban())
     items.extend(_agency_from_work_blocks())
-    return items[:_MAX_AGENCY_ITEMS]
+    items = items[:_MAX_AGENCY_ITEMS]
+    # Secret-scrub the free-text claim/hint (kanban titles etc. are user-authored
+    # and unredacted; ledger rationale is already redacted but double-scrub is
+    # cheap and idempotent).
+    for it in items:
+        if it.get("claim"):
+            it["claim"] = _scrub_secrets(it["claim"])
+        if it.get("interpretation_hint"):
+            it["interpretation_hint"] = _scrub_secrets(it["interpretation_hint"])
+    return items
 
 
 def _agency_from_ledger() -> List[Dict[str, Any]]:
@@ -567,6 +594,14 @@ def _candidate_point(
     refs = [str(x) for x in refs] if isinstance(refs, list) else []
     source_event = make_source_event(claim, refs)
     interpretation = (proposal.get("interpretation") or "").strip()
+
+    # Refuse to persist any candidate whose durable text trips the secret screen
+    # (security HIGH): canon is always-loaded + a future external-model egress, so
+    # a secret-shaped statement/claim/interpretation must never reach the store.
+    for fieldval in (statement, claim, interpretation):
+        if fieldval and "[REDACTED:" in _scrub_secrets(fieldval):
+            logger.warning("consolidation: dropped candidate with secret-shaped content")
+            return None
 
     payload = make_payload(
         statement=statement,

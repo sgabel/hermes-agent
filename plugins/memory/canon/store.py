@@ -200,6 +200,39 @@ class CanonStore:
                 break
         return out
 
+    def get_point(self, collection: str, point_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single point's payload by id, or None if absent. Used by the
+        ratification merge path (bump an existing canon entry's last_affirmed_at)."""
+        try:
+            r = requests.post(
+                f"{self._qdrant_url}/collections/{collection}/points",
+                json={"ids": [point_id], "with_payload": True, "with_vector": False},
+                timeout=_TIMEOUT,
+            )
+            if r.status_code != 200:
+                return None
+            pts = r.json().get("result", [])
+            if not pts:
+                return None
+            return pts[0].get("payload") or {}
+        except Exception:
+            return None
+
+    def set_payload(
+        self, collection: str, point_id: str, payload_updates: Dict[str, Any]
+    ) -> None:
+        """Merge ``payload_updates`` into an existing point's payload (Qdrant
+        set-payload — overwrites the given keys, leaves the rest and the vector
+        untouched). The status-transition primitive: candidate→rejected/tension/
+        canon tombstone without re-embedding. Never deletes (rollback survives)."""
+        resp = requests.post(
+            f"{self._qdrant_url}/collections/{collection}/points/payload",
+            params={"wait": "true"},
+            json={"payload": payload_updates, "points": [point_id]},
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+
     def count(self, collection: str) -> int:
         try:
             r = requests.post(

@@ -1437,6 +1437,19 @@ DEFAULT_CONFIG = {
             "timeout": 180,        # seconds — one batch derivation call per run
             "extra_body": {},
         },
+        # PRD-029 Phase 4: the adversary ("skeptic-Sylva") that fact-checks each
+        # identity candidate before ratification. Empty model = inherit the main
+        # provider/model. Cross-model doctrine favours a DIFFERENT model from the
+        # proposer: set model to ``model.second_opinion_model`` (Sonnet) once the
+        # PRD-026 egress allowlist makes api.anthropic.com reachable in-container.
+        "canon_adversary": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,        # seconds — one verdict call per candidate
+            "extra_body": {},
+        },
         "skills_hub": {
             "provider": "auto",
             "model": "",
