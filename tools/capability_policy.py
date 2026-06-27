@@ -121,6 +121,31 @@ def _active_terminal_backend() -> str:
         return os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
 
 
+def _local_exec_is_contained() -> bool:
+    """True when the owner has declared the whole agent runs inside the PRD-033
+    locked container, so the ``local`` terminal/exec backend IS itself contained
+    (no host route except the ``/opt/data`` bind-mount). Explicit opt-in via
+    ``autonomy.local_exec_is_contained``; default **False** (fail-closed — an
+    un-declared deployment treats local exec as host-shell = T4, the prior
+    behavior).
+
+    RESIDUAL (R5 *command-half*, still TODO): a shell command is tiered by
+    backend, not parsed, so a contained-T2 ``terminal`` can still reach the
+    ``/opt/data`` bind-mount (secrets/config) via raw ``rm``/redirection — the
+    file-write classifier only covers the file *tools*. So "contained" here means
+    contained to the *container*, NOT to ``/opt/data``. The legacy
+    DANGEROUS_PATTERNS + tirith layer remains the compensating control for
+    destructive shell verbs until the R5 command-half lands; the adversarial pass
+    must clear this before the enforce flip.
+    """
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        return bool(cfg_get(read_raw_config(), "autonomy",
+                            "local_exec_is_contained", default=False))
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # R5 — path-aware write classification (AC-019). Realpath/symlink-resolved.
 # ---------------------------------------------------------------------------
@@ -298,9 +323,17 @@ def classify(tool: str, args: Optional[Dict[str, Any]] = None,
         scripts_dir = _resolve(_hermes_home() / "scripts")
         return Tier.T2 if _under(target, scripts_dir) else Tier.T4
     if name in _EXEC_TOOLS:
-        # Contained only when running on the dedicated sandbox backend.
+        # Contained when (a) running on the dedicated sandbox backend, OR (b) the
+        # whole agent runs inside the PRD-033 locked container (the `local`
+        # backend IS the contained namespace then — no host route except the
+        # /opt/data bind-mount, which file-write classification guards as T4).
+        # Both are conservative: (b) is an explicit owner opt-in, default off.
         backend = (ctx or {}).get("backend") or _active_terminal_backend()
-        return Tier.T2 if backend == _SANDBOX_BACKEND else Tier.T4
+        if backend == _SANDBOX_BACKEND:
+            return Tier.T2
+        if backend == "local" and _local_exec_is_contained():
+            return Tier.T2
+        return Tier.T4
     if name in _WRITE_TOOLS:
         # R5/AC-019 — T2 only if resolved under an allowed write root.
         return _classify_write_path(args)

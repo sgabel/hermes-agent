@@ -1184,6 +1184,30 @@ def _get_cron_approval_mode() -> str:
         return "deny"
 
 
+def _local_exec_is_contained() -> bool:
+    """Owner-declared: the whole agent runs inside the PRD-033 locked container,
+    so ``local`` code execution is contained (no host route except the
+    ``/opt/data`` bind-mount). Mirrors capability_policy._local_exec_is_contained
+    (duplicated to avoid a circular import). Explicit opt-in via
+    ``autonomy.local_exec_is_contained``; default **False** (fail-closed)."""
+    try:
+        from hermes_cli.config import load_config
+        return bool(cfg_get(load_config(), "autonomy", "local_exec_is_contained", default=False))
+    except Exception:
+        return False
+
+
+# Dangerous-pattern descriptions that are *code execution*, not *destruction*.
+# When the agent is containerized (``_local_exec_is_contained``) these are
+# contained — a builder needs `python -c` / heredocs — so the cron-deny guard
+# allows them while destructive verbs (rm -rf, dd, mkfs, …) stay blocked, since
+# those can still wipe the ``/opt/data`` bind-mount (host secrets/config).
+_CONTAINED_OK_DESCRIPTIONS = frozenset({
+    "script execution via -e/-c flag",
+    "script execution via heredoc",
+})
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -1362,7 +1386,12 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
+            # Contained code-execution (python -c / heredoc) is allowed when the
+            # agent runs in the locked container; destructive verbs stay blocked.
+            _contained_ok = (
+                _local_exec_is_contained() and description in _CONTAINED_OK_DESCRIPTIONS
+            )
+            if _get_cron_approval_mode() == "deny" and not _contained_ok:
                 return {
                     "approved": False,
                     "message": (
@@ -1624,7 +1653,10 @@ def check_all_command_guards(command: str, env_type: str,
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
-                if is_dangerous:
+                _contained_ok = (
+                    _local_exec_is_contained() and description in _CONTAINED_OK_DESCRIPTIONS
+                )
+                if is_dangerous and not _contained_ok:
                     return {
                         "approved": False,
                         "message": (
@@ -1925,9 +1957,11 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    # Cron: no user is present to approve arbitrary code.
+    # Cron: no user is present to approve arbitrary code. When the agent runs in
+    # the locked container, execute_code is contained (no host route except the
+    # /opt/data bind-mount) → allow; otherwise it can reach the host → block.
     if env_var_enabled("HERMES_CRON_SESSION"):
-        if _get_cron_approval_mode() == "deny":
+        if _get_cron_approval_mode() == "deny" and not _local_exec_is_contained():
             return {
                 "approved": False,
                 "message": (
