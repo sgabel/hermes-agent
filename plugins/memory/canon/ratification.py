@@ -128,7 +128,8 @@ class RatificationResult:
 
 # ── 1. the adversary pass ───────────────────────────────────────────────────
 def _adversary_input(
-    candidate: Dict[str, Any], existing_canon: List[Dict[str, Any]]
+    candidate: Dict[str, Any], existing_canon: List[Dict[str, Any]],
+    evidence: str = "",
 ) -> Dict[str, Any]:
     """Build the adversary's view of a candidate — **interpretation excluded**.
 
@@ -138,8 +139,14 @@ def _adversary_input(
     of existing canon for the contradiction/redundancy checks. The candidate's
     ``interpretation`` (its meaning) is never placed in this dict, so no verdict
     can be grounded in it. Do NOT add ``interpretation`` here.
+
+    ``evidence`` is OPTIONAL verifiable SOURCE MATERIAL — e.g. the actual journal
+    turns from the date a legacy entry was formed (provenance recovery, Phase 5).
+    It is *fact*, not meaning, so it strengthens the provenance/verifiability
+    checks without touching the F-03 boundary: it gives the adversary something
+    real to verify the claim against instead of the claim citing only itself.
     """
-    return {
+    view = {
         "statement": candidate.get("statement", ""),
         "facet": candidate.get("facet", ""),
         "tier": candidate.get("tier", ""),
@@ -154,6 +161,9 @@ def _adversary_input(
             for c in existing_canon
         ],
     }
+    if evidence:
+        view["source_material"] = evidence
+    return view
 
 
 def _blank_verdict(model: str, now_iso: str, *, verdict: str = _DEFAULT_VERDICT,
@@ -179,10 +189,17 @@ factually supported and internally consistent — you do NOT judge whether its \
 meaning or takeaway is "right". Meaning is out of your jurisdiction entirely; \
 you are given only the verifiable surface, never the candidate's interpretation.
 
+If a ``source_material`` field is present, it is the VERIFIABLE SOURCE (e.g. the \
+actual journal turns from when this was recorded). Verify the source_event.claim \
+against it: a claim that is supported by the source_material has good provenance \
+(affirm-eligible); only a claim CONTRADICTED by, or absent-and-implausible given, \
+the source_material fails provenance. Do not refute merely because wording differs.
+
 Run these SIX checks, defaulting to REFUTE unless the source_event is supported:
-1. provenance      — is the source_event.claim actually supported by its \
-provenance_refs? An unsupported claim (e.g. "the tool was broken for 70 nights") \
-is a confabulation → refute.
+1. provenance      — is the source_event.claim supported by its provenance_refs / \
+source_material? An unsupported, self-contradicted claim (e.g. "the tool was \
+broken for 70 nights") is a confabulation → refute. A curated archive claim that \
+the source_material corroborates has good provenance → affirm-eligible.
 2. contradiction   — does the statement/source_event contradict an existing \
 canon entry? Severity scales with the conflicting entry's tier.
 3. verifiability   — are the checkable world/system facts in the source_event \
@@ -272,6 +289,7 @@ def run_adversary(
     model: Optional[str] = None,
     now_iso: Optional[str] = None,
     client: Optional[Any] = None,
+    evidence: str = "",
     timeout: int = 180,
 ) -> Dict[str, Any]:
     """Run the six-check adversary on one candidate → a verdict dict (AC-005).
@@ -279,9 +297,11 @@ def run_adversary(
     Fail-closed: any model/parse failure yields a ``refute`` verdict (never a
     silent affirm). Injecting ``client``/``model`` keeps tests hermetic; in
     production the neutral adversary aux-client is resolved from config.
+    ``evidence`` is optional verifiable source material (e.g. recovered journal
+    turns) handed to the provenance/verifiability checks — fact, not meaning.
     """
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
-    payload = _adversary_input(candidate, existing_canon)
+    payload = _adversary_input(candidate, existing_canon, evidence=evidence)
 
     if client is None:
         try:
