@@ -39,6 +39,10 @@ services:
       - HERMES_GID=${HERMES_GID:-10000}
       - HERMES_CONTAINERIZED=1     # NF-3: positive containment probe — local_exec_is_contained
                                    # (T2 re-tier) is honored ONLY when this is set / inside a container
+      - MEM0_TELEMETRY=False       # PRD-036: silence mem0ai PostHog telemetry. Read at module-import
+                                   # time, so it must be in the base env (not .env, which the app loads
+                                   # later via dotenv). Egress-blocked by the discord-proxy regardless;
+                                   # this kills the retry noise + is defense-in-depth (no outbound).
       - API_SERVER_HOST=0.0.0.0    # host exposure stays loopback-only via the publish below
       # Discord egress through the allowlist proxy. Targeted + standard proxy vars; deps
       # and loopback bypass the proxy so the agent talks to LLM/embed/Qdrant directly.
