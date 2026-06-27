@@ -595,6 +595,38 @@ _MUST_ESCALATE_COMPILED = [
     for pattern, description in _MUST_ESCALATE_PATTERNS
 ]
 
+# PRD-015 FR-1b (extended after the live AC-004a matrix): existing PRD-032
+# dangerous-pattern DESCRIPTIONS that must FORCE-ESCALATE rather than be handed to
+# the advisory aux LLM. The live 35B guardian auto-approved `>> ~/.ssh/authorized_keys`
+# (credential write) and `sed -i`/`truncate` of `/opt/data/config.yaml` (tamper that
+# turns enforce OFF) — exactly the AC-004b hard-stops. Reuse the upstream patterns
+# (one source of truth) and make the decision deterministic for these classes.
+_FORCE_ESCALATE_DESCRIPTIONS = frozenset({
+    "access to host secret/config/autonomy path",
+    "overwrite system file via redirection",
+    "overwrite system file via tee",
+    "copy/move file into sensitive credential/SSH/shell-rc path",
+    "in-place edit of sensitive credential/SSH/shell-rc path",
+    "in-place edit of sensitive credential/SSH/shell-rc path (long flag)",
+    "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)",
+    "in-place edit of Hermes config/env",
+    "in-place edit of Hermes config/env (long flag)",
+    "in-place edit of Hermes config/env (perl/ruby)",
+    "in-place edit of system config",
+    "in-place edit of system config (long flag)",
+    "copy/move file into system config path",
+    "overwrite system config",
+})
+
+# Fail LOUDLY at import if an upstream rename drops one of these descriptions —
+# otherwise the force-escalate intersection silently empties and the guardian
+# re-adjudicates a hard-stop class (the exact silent-coupling failure mode).
+_missing_force_escalate = _FORCE_ESCALATE_DESCRIPTIONS - {d for _, d in DANGEROUS_PATTERNS}
+assert not _missing_force_escalate, (
+    "PRD-015 force-escalate descriptions missing from DANGEROUS_PATTERNS "
+    f"(upstream rename?): {sorted(_missing_force_escalate)}"
+)
+
 
 def _legacy_pattern_key(pattern: str) -> str:
     """Reproduce the old regex-derived approval key for backwards compatibility."""
@@ -762,7 +794,11 @@ def _must_escalate(command: str) -> bool:
     the smart-approve block forces an `escalate` verdict (human prompt attended;
     the cron_mode floor already blocks these unattended)."""
     norm = _normalize_command_for_detection(command).lower()
-    return any(rx.search(norm) for rx, _ in _MUST_ESCALATE_COMPILED)
+    if any(rx.search(norm) for rx, _ in _MUST_ESCALATE_COMPILED):
+        return True
+    # Reuse the existing PRD-032 credential / secret / config descriptions so the
+    # guardian never adjudicates a host-secret / credential-write / config-tamper.
+    return bool(_all_dangerous_descriptions(command) & _FORCE_ESCALATE_DESCRIPTIONS)
 
 
 # =========================================================================
