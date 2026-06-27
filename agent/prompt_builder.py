@@ -1638,11 +1638,17 @@ def _truncate_content(
 
 
 def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
-    """Load SOUL.md from HERMES_HOME and return its content, or None.
+    """Load the agent identity self-brief for the system prompt (slot #1).
 
-    Used as the agent identity (slot #1 in the system prompt).  When this
-    returns content, ``build_context_files_prompt`` should be called with
-    ``skip_soul=True`` so SOUL.md isn't injected twice.
+    PRD-029: returns the SOUL.md bedrock **plus** the assembled first-person
+    canon self-brief when ``sylva_canon`` is populated, else SOUL.md-only. The
+    brief is *assembled, never generated* — :func:`plugins.memory.canon.render_self_brief`
+    does an unordered scroll + deterministic Python sort + budget truncation, so
+    identity never enters the runtime semantic-retrieval path. With ``sylva_canon``
+    empty (pre-seeding) the brief IS SOUL.md, so this is a no-op until canon is
+    populated. Degrades to a legacy SOUL.md-only read if the canon module is
+    unavailable. When this returns content, ``build_context_files_prompt`` should
+    be called with ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
     try:
         from hermes_cli.config import ensure_hermes_home
@@ -1651,12 +1657,29 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
     soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
-        return None
+
+    # Assembled SOUL.md-bedrock + ratified-canon brief (PRD-029 Phase 2).
+    content: Optional[str] = None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        from plugins.memory.canon import render_self_brief
+        content = render_self_brief()
+    except Exception as e:
+        logger.debug("Canon self-brief unavailable; SOUL.md-only fallback: %s", e)
+        content = None
+
+    # Legacy fallback: the canon module failed to import — read SOUL.md directly.
+    if content is None:
+        if not soul_path.exists():
+            return None
+        try:
+            content = soul_path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+            return None
         if not content:
             return None
+
+    try:
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
@@ -1664,7 +1687,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         )
         return content
     except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
+        logger.debug("Could not process SOUL.md self-brief: %s", e)
         return None
 
 
