@@ -1158,6 +1158,17 @@ def init_agent(
         skip_provider_memory = skip_memory
     agent._memory_passive_enabled = bool(memory_passive_enabled)
     mem_config = _agent_cfg.get("memory", {})
+    # PRD-029 AC-014 (keystone): a dedicated dial to force the ambient episodic
+    # PREFETCH (read side) OFF even on the interactive path, WITHOUT touching the
+    # broader passive-memory write/lifecycle lever (_memory_passive_enabled also
+    # gates per-turn sync_all, on_session_end extraction, and the compression
+    # hooks — out of AC-014's scope). When memory.ambient_prefetch_enabled is
+    # false, the two ambient-prefetch sites (turn_context.py on_turn_start +
+    # prefetch_all) are skipped, so no turn auto-injects identity-saturated
+    # chronicle content; episodic recall becomes explicit-only (chronicle_search).
+    # Default True preserves prior behavior. Write-side governance is AC-017
+    # (nudge off) + the fork's already-disabled per-turn sync, not this flag.
+    agent._ambient_prefetch_enabled = bool(mem_config.get("ambient_prefetch_enabled", True))
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
