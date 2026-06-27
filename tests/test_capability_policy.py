@@ -121,8 +121,25 @@ def test_deny_result_is_json_error(cp):
 # --- R5: path-aware write classification ---
 
 def test_memory_writes_are_t2(cp):
-    assert cp.classify("mem0_conclude") == cp.Tier.T2
+    # Managed memory files (MEMORY.md/USER.md) stay T2 (contained own-store write).
     assert cp.classify("memory") == cp.Tier.T2
+
+
+def test_mem0_reads_are_t0(cp):
+    # PRD-029 (mem0 v3 port): mem0_profile was renamed to mem0_list.
+    assert cp.classify("mem0_search") == cp.Tier.T0
+    assert cp.classify("mem0_list") == cp.Tier.T0
+
+
+def test_mem0_writes_are_t4(cp):
+    # PRD-029: mem0_conclude is gone. Its successor mem0_add and the new
+    # destructive mem0_update/mem0_delete verbs are NOT in _MEMORY_WRITE_TOOLS,
+    # so they fall through to default-deny T4 — governed pipeline only, no
+    # unattended autosave. (mem0_conclude itself, now an unknown tool, is T4.)
+    assert cp.classify("mem0_add") == cp.Tier.T4
+    assert cp.classify("mem0_update") == cp.Tier.T4
+    assert cp.classify("mem0_delete") == cp.Tier.T4
+    assert cp.classify("mem0_conclude") == cp.Tier.T4
 
 
 def test_write_under_allowed_root_is_t2(cp, monkeypatch, tmp_path):

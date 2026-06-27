@@ -1152,7 +1152,8 @@ def init_agent(
     # 3) Stash the passive-memory flag: when False (cron), post-turn auto-extraction
     #    (sync_all/queue_prefetch_all), prefetch read, and provider lifecycle hooks
     #    are suppressed so cron scaffolding is never ingested — explicit tool writes
-    #    (mem0_conclude) still work because they bypass this flag.
+    #    (mem0_add; PRD-029 successor to mem0_conclude) bypass this flag, though
+    #    they remain subject to the capability policy (mem0_add is T4).
     if skip_memory is not None:
         skip_file_memory = skip_memory
         skip_provider_memory = skip_memory

@@ -14,8 +14,9 @@ Two layers:
      patched (no live Qdrant / no disk) and assert `_memory_store`,
      `_memory_manager`, and `_memory_passive_enabled` across every mode.
 
-The end-to-end "cron agent actually persists via mem0_conclude" path is covered
-by the live smoke test in the PRD (AC-010/011), not here.
+The end-to-end "cron agent actually persists via mem0_add" path is covered
+by the live smoke test in the PRD (AC-010/011), not here. (PRD-029 renamed the
+mem0 write verb mem0_conclude -> mem0_add and reclassified it T4.)
 """
 import inspect
 from unittest.mock import MagicMock, patch

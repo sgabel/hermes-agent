@@ -58,7 +58,7 @@ _T0_TOOLS = frozenset({
     "read_file", "read_many_files", "list_directory", "list_dir", "glob",
     "grep", "search_file_content", "ripgrep", "find_files", "search_files",
     "session_search", "chronicle_search", "todo", "read_terminal", "clarify",
-    "get_diff", "git_status", "mem0_search", "mem0_profile",
+    "get_diff", "git_status", "mem0_search", "mem0_list",
     "skills_list", "skill_view", "kanban_show", "kanban_list",
 })
 
@@ -80,9 +80,16 @@ _T3_TOOLS = frozenset({
 
 # T2 — contained writes to Sylva's OWN datastore/memory (local Qdrant + the
 # managed MEMORY.md/USER.md files). Not host-fs mutation of arbitrary paths, not
-# egress, not FedPulse — so allowed unattended. The nightly reflection +
-# memory-cleanup cron jobs depend on these.
-_MEMORY_WRITE_TOOLS = frozenset({"mem0_conclude", "memory"})
+# egress, not FedPulse — so allowed unattended.
+#
+# PRD-029 (mem0 v3 port): the legacy `mem0_conclude` verb is gone. Its successor
+# `mem0_add` is intentionally NOT listed here, so it falls through to the
+# default-deny T4 tier (gated when attended, blocked when unattended). This is
+# deliberate: under PRD-029 durable identity/memory writes route through the
+# governed consolidation→candidate→ratify pipeline, not an unattended autosave.
+# The new `mem0_update`/`mem0_delete` verbs are destructive and likewise stay
+# T4 by default. `memory` (managed MEMORY.md/USER.md) remains T2.
+_MEMORY_WRITE_TOOLS = frozenset({"memory"})
 
 # File-mutation tools — tier is path-dependent (R5/AC-019): a write resolved
 # under an allowed workspace root is T2; anywhere else on the host (or under a
