@@ -1423,6 +1423,20 @@ DEFAULT_CONFIG = {
         # single-shape tool returns DB content directly). The old
         # ``auxiliary.session_search.*`` block was removed here. Existing
         # values in user config.yaml files are harmless leftovers and ignored.
+        # PRD-029 Phase 3: the neutral derivation model for the governed identity
+        # consolidation pass. Empty model = inherit the main provider/model (the
+        # local 35B in the isolated container) — neutral by design, never the
+        # tiny Qwen3-4b and never Sylva-on-herself. Set model to
+        # ``model.second_opinion_model`` (Sonnet) once the PRD-026 egress
+        # allowlist makes api.anthropic.com reachable from the container.
+        "canon_consolidation": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,        # seconds — one batch derivation call per run
+            "extra_body": {},
+        },
         "skills_hub": {
             "provider": "auto",
             "model": "",
