@@ -560,10 +560,39 @@ DANGEROUS_PATTERNS = [
 ]
 
 
+# PRD-015 FR-1b — privileged / persistence / cloud-destructive / credential-egress
+# commands that tirith + the base DANGEROUS_PATTERNS miss (confirmed unflagged in
+# adversarial review). They are (a) appended to the dangerous set so smart mode
+# FLAGS them instead of auto-running them as "clean", and (b) force-escalated in
+# the smart-approve block (see _must_escalate) so the advisory aux approval LLM can
+# never silently auto-approve them — they always reach a human (attended) or hit the
+# cron_mode floor (unattended). Patterns match the lowercased, normalized command.
+_MUST_ESCALATE_PATTERNS = [
+    (r'\bsudo\s+(-[^\s]+\s+)*(useradd|usermod|userdel|groupadd|groupmod|passwd)\b', "privileged user/group modification"),
+    (r'\bchmod\s+(-[^\s]*\s+)*[ugoa]*\+s\b', "setuid/setgid bit set"),
+    (r'\bcrontab\s+(?!-l\b)\S', "crontab install/replace"),
+    (r'\|\s*crontab\b', "crontab install via pipe"),
+    (r'\bgh\s+auth\s+token\b', "github auth token read"),
+    (r'\bgh\s+pr\s+merge\b[^\n]*--admin\b', "github admin pr merge"),
+    (r'\bkubectl\s+delete\b', "kubectl delete resource"),
+    (r'\baws\s+s3\s+r[bm]\b[^\n]*--recursive\b', "recursive s3 deletion"),
+    (r'(?:cat|less|more|head|tail|cp|mv|base64|xxd|od|strings)\s+[^\n|]*(?:\.\./)+[^\n|]*(?:\.(?:env|pem|key)\b|auth\.json|credentials)', "relative-path secret-file read"),
+]
+
+# Appended to the dangerous set so detection flags them (one source of truth).
+DANGEROUS_PATTERNS = DANGEROUS_PATTERNS + _MUST_ESCALATE_PATTERNS
+
+
 # Pre-compiled variant (same rationale as HARDLINE_PATTERNS_COMPILED above).
 DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
+]
+
+# Compiled subset for the force-escalate check (FR-1b).
+_MUST_ESCALATE_COMPILED = [
+    (re.compile(pattern, _RE_FLAGS), description)
+    for pattern, description in _MUST_ESCALATE_PATTERNS
 ]
 
 
@@ -724,6 +753,16 @@ def _is_contained_ok(command: str) -> bool:
         return False
     matches = _all_dangerous_descriptions(command)
     return bool(matches) and matches <= _CONTAINED_OK_DESCRIPTIONS
+
+
+def _must_escalate(command: str) -> bool:
+    """True if the command is in the PRD-015 FR-1b force-escalate set —
+    privileged / persistence / cloud-destructive / credential-egress operations
+    the advisory aux approval LLM must never silently auto-approve. When True,
+    the smart-approve block forces an `escalate` verdict (human prompt attended;
+    the cron_mode floor already blocks these unattended)."""
+    norm = _normalize_command_for_detection(command).lower()
+    return any(rx.search(norm) for rx, _ in _MUST_ESCALATE_COMPILED)
 
 
 # =========================================================================
@@ -1438,12 +1477,17 @@ def check_dangerous_command(command: str, env_type: str,
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
-    is_cli = env_var_enabled("HERMES_INTERACTIVE")
-    is_gateway = _is_gateway_approval_context()
+    # Cron/autonomous absolute override (PRD-015 FR-1a / STOP-1): the in-process
+    # scheduler inherits the gateway/CLI attended flags, so force them False under
+    # HERMES_CRON_SESSION / HERMES_AUTONOMOUS to guarantee unattended work reaches
+    # the cron_mode floor.
+    _unattended = env_var_enabled("HERMES_CRON_SESSION") or env_var_enabled("HERMES_AUTONOMOUS")
+    is_cli = env_var_enabled("HERMES_INTERACTIVE") and not _unattended
+    is_gateway = _is_gateway_approval_context() and not _unattended
 
     if not is_cli and not is_gateway:
-        # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        # Cron / autonomous: respect cron_mode config (no human present to approve)
+        if _unattended:
             # Contained code-execution (python -c / heredoc) is allowed when the
             # agent runs in the locked container; destructive verbs AND secret/
             # config/ledger access stay blocked (all-match, NF-1).
@@ -1698,15 +1742,25 @@ def check_all_command_guards(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    is_cli = env_var_enabled("HERMES_INTERACTIVE")
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    # Cron/autonomous runs are NEVER attended, even though the in-process scheduler
+    # thread inherits the gateway/CLI attended flags: the gateway sets
+    # HERMES_EXEC_ASK=1 at module import and cli.py sets HERMES_INTERACTIVE=1, and
+    # the cron thread runs in that same process. Force all three attended flags
+    # False under HERMES_CRON_SESSION / HERMES_AUTONOMOUS so unattended work ALWAYS
+    # reaches the cron_mode floor + capability-policy enforce gate instead of leaking
+    # into the smart-approve / human-prompt paths (PRD-015 FR-1a / STOP-1). This also
+    # keeps the smart-approval guardian LLM strictly attended-only, so it never
+    # contends for the single llama.cpp lane during a --parallel 1 automation run.
+    _unattended = env_var_enabled("HERMES_CRON_SESSION") or env_var_enabled("HERMES_AUTONOMOUS")
+    is_cli = env_var_enabled("HERMES_INTERACTIVE") and not _unattended
+    is_gateway = _is_gateway_approval_context() and not _unattended
+    is_ask = env_var_enabled("HERMES_EXEC_ASK") and not _unattended
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
-        # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
+        # Cron / autonomous: respect cron_mode config (no human present to approve)
+        if _unattended:
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
@@ -1778,12 +1832,24 @@ def check_all_command_guards(command: str, env_type: str,
     # (openai/codex#13860).
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
-        verdict = _smart_approve(command, combined_desc_for_llm)
+        # FR-1b force-escalate: a fixed set of privileged/persistence/cloud/
+        # credential-egress commands must always reach a human — the aux LLM is
+        # advisory and may not be trusted to refuse them. Skip the aux call and
+        # fall through to the manual prompt.
+        if _must_escalate(command):
+            logger.warning(
+                "Smart approval: forcing human escalation for must-escalate "
+                "command (FR-1b): %s", command[:120])
+            verdict = "escalate"
+        else:
+            verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
-            # Auto-approve and grant session-level approval for these patterns
-            for key, _, _ in warnings:
-                approve_session(session_key, key)
-            logger.debug("Smart approval: auto-approved '%s' (%s)",
+            # One-shot: allow THIS invocation only. Do NOT session-grant the
+            # pattern — a single aux approval would otherwise silence the whole
+            # pattern class for the session (≈ gateway lifetime), letting one
+            # lucky/injected approval become a durable bypass (FR-1a / SERIOUS-2).
+            # The aux LLM re-assesses every flagged invocation.
+            logger.debug("Smart approval: auto-approved (one-shot) '%s' (%s)",
                          command[:60], combined_desc_for_llm)
             return {"approved": True, "message": None,
                     "smart_approved": True,
