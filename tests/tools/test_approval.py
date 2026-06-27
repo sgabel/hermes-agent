@@ -511,15 +511,28 @@ class TestHermesConfigWriteProtection:
 
     def test_perl_eval_no_inplace_safe(self):
         # `perl -e` with no -i flag is code evaluation, not file mutation —
-        # the perl/ruby -i pattern must not fire on it.
+        # the perl/ruby -i pattern must not fire on it. Target a non-secret path
+        # so this isolates the -i detection (a ~/.hermes path would independently
+        # trip the PRD-032 host-secret read pattern below).
         dangerous, key, desc = detect_dangerous_command(
-            "perl -wne 'print' ~/.hermes/config.yaml"
+            "perl -wne 'print' /tmp/data.txt"
         )
         assert dangerous is False
 
-    def test_read_is_safe(self):
-        # Reading config is not a write — must not trip.
+    def test_read_of_hermes_secret_path_is_flagged(self):
+        # PRD-032 enforce-hardening closed the read-side gap: any reference to a
+        # host secret/config/autonomy path — including a plain read — is flagged
+        # so the gate can degrade-to-ask (unattended) / force-escalate (attended,
+        # PRD-015). Previously asserted safe; the read-side _HERMES_SECRET_REF now
+        # fires. (This flag is load-bearing for PRD-015's _FORCE_ESCALATE set.)
         dangerous, key, desc = detect_dangerous_command("cat ~/.hermes/config.yaml")
+        assert dangerous is True
+        assert "host secret" in desc.lower()
+
+    def test_read_of_benign_path_is_safe(self):
+        # A non-secret read must still NOT false-positive as dangerous — the
+        # secret-ref pattern is targeted, not a blanket "all reads are dangerous".
+        dangerous, key, desc = detect_dangerous_command("cat /tmp/scratch.txt")
         assert dangerous is False
 
     def test_normal_yaml_write_safe(self):
