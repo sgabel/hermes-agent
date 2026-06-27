@@ -2072,10 +2072,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_soul_identity=True,
             # PRD-022: split the old `skip_memory=True`. File memory stays OFF
             # (cron must never mutate MEMORY.md / USER.md). Provider memory is ON
-            # so the nightly reflection's explicit mem0_conclude writes persist.
-            # Passive memory is OFF so cron scaffolding is never auto-extracted —
-            # only explicit tool writes land. (Was: skip_memory=True, which made
-            # the reflection cron a silent no-op for 20+ nights.)
+            # so the provider loads and its read tools (mem0_search/mem0_list,
+            # chronicle_search) work for the reflection cron. Passive memory is
+            # OFF so cron scaffolding is never auto-extracted.
+            # PRD-029 (mem0 v3 port): the write verb is now `mem0_add` (was
+            # `mem0_conclude`) and is classified T4 — so under `capability_policy_mode:
+            # enforce` an unattended cron write is GATED, not silently persisted.
+            # Durable memory now routes through the governed consolidation pipeline,
+            # not the reflection cron's direct writes.
             skip_file_memory=True,
             skip_provider_memory=False,
             memory_passive_enabled=False,
