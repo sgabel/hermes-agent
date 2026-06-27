@@ -1898,6 +1898,10 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # PRD-029: token budget for the assembled identity self-brief
+        # (sylva_canon core/peripheral). 4096 ≈ 6.4% of the 64K Qwen slot
+        # (PRD-023) at rest; bedrock+core fit, peripheral overflows by design.
+        "canon_token_budget": 4096,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
