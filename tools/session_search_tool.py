@@ -37,7 +37,18 @@ from typing import Any, Dict, List, Optional, Union
 # Third-party integrations tag their sessions with HERMES_SESSION_SOURCE=tool;
 # delegate subagent runs are tagged "subagent" — neither belongs in the
 # user's session history.
-_HIDDEN_SESSION_SOURCES = ("subagent", "tool")
+#
+# "cron" is excluded structurally (PRD-029 AC-013): the governed consolidation
+# pass must read *user-facing* episodic turns only, never its own prior
+# reflection/cleanup runs — otherwise it re-derives and re-canonizes its own
+# confabulations (the observed "June 22 last interaction" / "tool broken 70
+# nights" echo-chamber loop). Making this a constant (vs. a prompt-passed
+# exclude_sources="cron" an LLM can omit) means the exclusion holds even if the
+# reflection prompt drifts. Scope note: this constant is local to the agent's
+# session_search tool; the dashboard/TUI/CLI session viewers call
+# list_sessions_rich() directly with their own excludes, so cron sessions stay
+# visible there.
+_HIDDEN_SESSION_SOURCES = ("subagent", "tool", "cron")
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
