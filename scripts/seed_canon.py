@@ -211,6 +211,63 @@ def _extract_json(raw: str) -> dict | None:
     return None
 
 
+# ── Scott-QA decision resolution (PRD-029 Phase 5, cockpit Ratify tab) ──────────
+# The cockpit writes a `qa_decision` field onto each seed candidate. From that
+# point the DECISION is authoritative: the adversary advises, Scott decides, and
+# preview/ratify execute Scott's decision. Both stages resolve a candidate the
+# same way through `_effective_entry`, so the preview is faithful to what ratify
+# actually writes.
+def _scroll_all(qdrant_url: str, collection: str) -> list[tuple[str, dict]]:
+    """Scroll every point in a collection (all statuses) → [(id, payload)]."""
+    out: list[tuple[str, dict]] = []
+    offset = None
+    while True:
+        body: dict = {"limit": 256, "with_payload": True, "with_vector": False}
+        if offset is not None:
+            body["offset"] = offset
+        r = requests.post(f"{qdrant_url}/collections/{collection}/points/scroll",
+                          json=body, timeout=20)
+        r.raise_for_status()
+        res = r.json().get("result", {})
+        pts = res.get("points", [])
+        out.extend((p["id"], p.get("payload", {})) for p in pts)
+        offset = res.get("next_page_offset")
+        if offset is None:
+            break
+    return out
+
+
+def _effective_entry(payload: dict) -> dict | None:
+    """Resolve a seed candidate's Scott-QA decision into the effective ratification
+    intent, or None when it is undecided/rejected (→ not canonized).
+
+    Edit overrides (statement/facet/tier/interpretation) win; an un-overridden tier
+    is lowered to ``peripheral`` when Sonnet's verdict was ``demote`` (matching the
+    route_verdict demote semantic). A QA edit can never mint a ``bedrock`` row
+    (bedrock lives in SOUL.md) — it is clamped to ``core``. The Sonnet verdict is
+    carried through so its reasons/model are recorded on the ratified canon entry."""
+    qa = payload.get("qa_decision") or {}
+    decision = qa.get("decision")
+    if decision not in ("approve", "edit"):
+        return None
+    ov = qa.get("overrides") or {}
+    sonnet = dict(payload.get("adversary_verdict_sonnet") or payload.get("adversary_verdict") or {})
+    statement = (ov.get("statement") or payload.get("statement") or "").strip()
+    facet = ov.get("facet") or payload.get("facet") or "selffact"
+    interp = ov.get("interpretation")
+    interpretation = interp if interp is not None else payload.get("interpretation", "")
+    if ov.get("tier"):
+        tier = ov["tier"]
+    elif sonnet.get("verdict") == "demote":
+        tier = "peripheral"
+    else:
+        tier = payload.get("tier") or "core"
+    if tier == "bedrock":
+        tier = "core"
+    return {"decision": decision, "statement": statement, "facet": facet,
+            "tier": tier, "interpretation": interpretation, "sonnet": sonnet}
+
+
 # ── SOUL.md bedrock as adversary context (closes Phase-4 NF-2) ─────────────────
 def load_soul_bedrock_rows() -> list[dict]:
     """Parse SOUL.md into pseudo-canon `tier:bedrock` context rows so the adversary
@@ -359,41 +416,147 @@ def stage_review(live: bool, tag: str = "") -> int:
     return 0
 
 
+# ── canon-target resolution (source seed coll ≠ canon target) ──────────────────
+def _canon_target(live: bool, from_coll: str) -> str:
+    """The canon collection ratify writes into. ``--live`` → the real ``sylva_canon``;
+    otherwise a sandbox canon derived from the source seed collection name."""
+    if live:
+        from plugins.memory.canon.schema import CANON_COLLECTION
+        return CANON_COLLECTION
+    return from_coll.replace("seed_candidates", "seed_canon")
+
+
+# ── stage: preview (goal-state self-brief — SOUL.md + would-be canon) ───────────
+def stage_preview(from_coll: str, as_json: bool) -> int:
+    """Assemble the GOAL-STATE self-brief from the current Scott-QA decisions —
+    exactly what the runtime brief WOULD load after ratify + restart: SOUL.md
+    bedrock + the canon entries Scott approved/edited (demotes re-tiered, rejects/
+    undecided excluded). Read-only; writes nothing. ``--json`` emits a machine
+    payload for the cockpit Ratify tab."""
+    from plugins.memory.canon.render import _read_soul_md, assemble_brief, _canon_token_budget
+
+    store = CanonStore.from_config()
+    pts = _scroll_all(store._qdrant_url, from_coll)
+    soul = _read_soul_md()
+
+    entries: list[tuple[str, dict]] = []
+    invalid: list[str] = []
+    stats = {"approve": 0, "edit": 0, "reject": 0, "undecided": 0, "invalid": 0}
+    by_tier: dict[str, int] = {}
+    for cid, payload in pts:
+        decision = (payload.get("qa_decision") or {}).get("decision")
+        if decision == "reject":
+            stats["reject"] += 1
+            continue
+        eff = _effective_entry(payload)
+        if not eff:
+            stats["undecided"] += 1
+            continue
+        cp = make_payload(
+            statement=eff["statement"], facet=eff["facet"], tier=eff["tier"],
+            source_event=payload.get("source_event") or make_source_event("", []),
+            interpretation=eff["interpretation"], status="canon",
+            render_order=payload.get("render_order"),
+        )
+        try:
+            validate_payload(cp)  # ratify would reject these too — keep preview faithful
+        except Exception:
+            invalid.append(cid)
+            stats["invalid"] += 1
+            continue
+        stats[eff["decision"]] += 1
+        by_tier[eff["tier"]] = by_tier.get(eff["tier"], 0) + 1
+        entries.append((cid, cp))
+
+    brief = assemble_brief(soul, entries, _canon_token_budget())
+
+    if as_json:
+        print(json.dumps({
+            "brief": brief or "",
+            "soul_present": bool(soul),
+            "soul_chars": len(soul or ""),
+            "canon_token_budget": _canon_token_budget(),
+            "canon_entry_count": len(entries),
+            "stats": stats,
+            "by_tier": by_tier,
+            "invalid_ids": invalid,
+            "entries": [
+                {"id": i, "statement": p["statement"], "tier": p["tier"], "facet": p["facet"]}
+                for i, p in entries
+            ],
+        }, ensure_ascii=False))
+    else:
+        print(f"=== GOAL-STATE SELF-BRIEF ({from_coll}) ===")
+        print(f"SOUL.md: {'present' if soul else 'MISSING'} ({len(soul or '')} chars) | "
+              f"canon entries: {len(entries)} | by tier: {by_tier} | stats: {stats}")
+        print("-" * 72)
+        print(brief or "(empty brief)")
+    return 0
+
+
 # ── stage: ratify (owner-gated cutover-enabling step) ──────────────────────────
-def stage_ratify(live: bool, approve: bool) -> int:
+def stage_ratify(live: bool, approve: bool, from_coll: str) -> int:
+    """Decision-driven ratification: each candidate's Scott-QA ``qa_decision`` is
+    authoritative. approve/edit → canonized (edit overrides applied; Sonnet demote
+    re-tiers to peripheral); reject → rejected; undecided → skipped. Routed through
+    the sanctioned ``route_verdict`` spine, so redaction + ``validate_payload`` +
+    the PRD-028 audit ledger + the sole-writer invariant all hold. The recorded
+    ``adversary_verdict`` is Sonnet's (the locked primary judge)."""
     if not approve:
-        print("ratify is owner-gated: re-run with --approve to flip the batch candidate→canon "
-              "(ratified_by:{sylva, scott_qa@seed}). Review with `review` first.")
+        print("ratify is owner-gated: re-run with --approve to write the Scott-approved set → canon "
+              "(ratified_by:{sylva, scott_qa@seed}). Preview with `preview` first.")
         return 2
-    store, cand_coll, canon_coll = _store(live)
+    store = CanonStore.from_config()
+    canon_coll = _canon_target(live, from_coll)
     store.ensure_collections((canon_coll,))
-    cands = store.get_canon(status="candidate", collection=cand_coll, limit=1000)
     existing = store.get_canon(status="canon", collection=canon_coll, limit=1000)
+    pts = _scroll_all(store._qdrant_url, from_coll)
     now = datetime.now(timezone.utc).isoformat()
 
     def scott_qa_ratify(candidate, verdict, now_iso):
-        # the seed batch-QA stamp — Scott has approved the whole reviewed set
         return {"sylva": now_iso, "scott_qa@seed": now_iso}
 
-    n = {"canonized": 0, "rejected": 0, "tension": 0, "demoted": 0, "merged": 0}
-    for cid, payload in cands:
-        verdict = payload.get("adversary_verdict")
-        if not verdict:
-            print(f"  SKIP {cid[:8]}: no adversary verdict (run adversary first)"); continue
-        rec = route_verdict(cid, payload, verdict, store, now_iso=now,
-                            ratify_fn=scott_qa_ratify,
-                            candidates_collection=cand_coll, canon_collection=canon_coll,
-                            existing_canon=existing)
-        n[rec.action] = n.get(rec.action, 0) + 1
-    print(f"ratify (Scott-QA@seed): {n}")
-    print("Canon is now populated → the runtime brief will assemble SOUL.md + canon on the next "
-          "gateway session (the cutover flip). Rebuild image + restart gateway to apply.")
+    n: dict = {"canonized": 0, "demoted": 0, "rejected": 0, "tension": 0,
+               "merged": 0, "skipped": 0, "errored": 0}
+    for cid, payload in pts:
+        decision = (payload.get("qa_decision") or {}).get("decision")
+        sonnet = dict(payload.get("adversary_verdict_sonnet") or payload.get("adversary_verdict") or {})
+        try:
+            if decision == "reject":
+                verdict = {**sonnet, "verdict": "refute",
+                           "reasons": ["Scott QA: rejected"] + list(sonnet.get("reasons", []))[:3]}
+                route_verdict(cid, payload, verdict, store, now_iso=now,
+                              ratify_fn=scott_qa_ratify, candidates_collection=from_coll,
+                              canon_collection=canon_coll, existing_canon=existing)
+                n["rejected"] += 1
+                continue
+            eff = _effective_entry(payload)
+            if not eff:
+                n["skipped"] += 1
+                continue
+            cand = dict(payload)
+            cand.update(statement=eff["statement"], facet=eff["facet"],
+                        tier=eff["tier"], interpretation=eff["interpretation"])
+            # Route as affirm at the resolved tier; carry Sonnet's reasons/model so
+            # the ratified canon entry records the real (primary-judge) verdict.
+            verdict = {**sonnet, "verdict": "affirm"}
+            rec = route_verdict(cid, cand, verdict, store, now_iso=now,
+                                ratify_fn=scott_qa_ratify, candidates_collection=from_coll,
+                                canon_collection=canon_coll, existing_canon=existing)
+            n[rec.action] = n.get(rec.action, 0) + 1
+        except Exception as e:
+            print(f"  ERROR {cid[:8]}: {type(e).__name__}: {e}")
+            n["errored"] += 1
+    print(f"ratify (Scott-QA@seed → {canon_coll}): {n}")
+    if live:
+        print("Live canon populated → rebuild image + restart gateway to apply (the cutover flip): "
+              "the next session's self-brief assembles SOUL.md + canon.")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="PRD-029 Phase 5 canon seeding")
-    ap.add_argument("stage", choices=["rewrite", "adversary", "review", "ratify"])
+    ap.add_argument("stage", choices=["rewrite", "adversary", "review", "preview", "ratify"])
     ap.add_argument("--manifest", type=Path,
                     default=Path("../docs/working/identity-canon-governance/migration_manifest.json"))
     ap.add_argument("--snapshot", type=Path,
@@ -405,6 +568,9 @@ def main() -> int:
     ap.add_argument("--tag", default="", help="namespace the sandbox collections (e.g. 'gemma') to compare runs")
     ap.add_argument("--categories", default="",
                     help="comma-separated category filter for rewrite (e.g. 'anchor,personality' to skip kernels)")
+    ap.add_argument("--from", dest="from_coll", default="sylva_lab_seed_candidates_gemma",
+                    help="preview/ratify: source seed-candidate collection (decoupled from the canon target)")
+    ap.add_argument("--json", action="store_true", help="preview stage only: emit a JSON payload (for the cockpit)")
     args = ap.parse_args()
     cats = {c.strip() for c in args.categories.split(",") if c.strip()} or None
 
@@ -415,8 +581,10 @@ def main() -> int:
         return stage_adversary(args.live, args.limit, tag=args.tag)
     if args.stage == "review":
         return stage_review(args.live, tag=args.tag)
+    if args.stage == "preview":
+        return stage_preview(args.from_coll, args.json)
     if args.stage == "ratify":
-        return stage_ratify(args.live, args.approve)
+        return stage_ratify(args.live, args.approve, args.from_coll)
     return 1
 
 
