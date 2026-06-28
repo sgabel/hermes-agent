@@ -179,12 +179,13 @@ Rules: 'statement' is Sylva speaking as herself. 'core' = central to who she is;
 'peripheral' = true but minor. Never output 'bedrock'. JSON only."""
 
 
-def _store(live: bool) -> tuple[CanonStore, str, str]:
+def _store(live: bool, tag: str = "") -> tuple[CanonStore, str, str]:
     store = CanonStore.from_config()
     if live:
         from plugins.memory.canon.schema import CANDIDATES_COLLECTION, CANON_COLLECTION
         return store, CANDIDATES_COLLECTION, CANON_COLLECTION
-    return store, _SANDBOX_CAND, _SANDBOX_CANON
+    suffix = f"_{tag}" if tag else ""
+    return store, f"{_SANDBOX_CAND}{suffix}", f"{_SANDBOX_CANON}{suffix}"
 
 
 def _aux_client():
@@ -250,11 +251,15 @@ def _full_text_by_id(snapshot_path: Path | None) -> dict:
 
 
 def stage_rewrite(manifest_path: Path, live: bool, limit: int | None,
-                  snapshot_path: Path | None) -> int:
-    store, cand_coll, _ = _store(live)
+                  snapshot_path: Path | None, tag: str = "",
+                  categories: set[str] | None = None) -> int:
+    store, cand_coll, _ = _store(live, tag)
     store.ensure_collections((cand_coll,))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     cands = [e for e in manifest["entries"] if e["disposition"] == "canon-candidate"]
+    if categories:
+        cands = [e for e in cands if e.get("category") in categories]
+        print(f"category filter {sorted(categories)}: {len(cands)} entries")
     if limit:
         cands = cands[:limit]
     full_text = _full_text_by_id(snapshot_path)
@@ -318,8 +323,8 @@ def stage_rewrite(manifest_path: Path, live: bool, limit: int | None,
 
 
 # ── stage: adversary ───────────────────────────────────────────────────────────
-def stage_adversary(live: bool, limit: int | None) -> int:
-    store, cand_coll, _ = _store(live)
+def stage_adversary(live: bool, limit: int | None, tag: str = "") -> int:
+    store, cand_coll, _ = _store(live, tag)
     cands = store.get_canon(status="candidate", collection=cand_coll, limit=limit or 1000)
     bedrock = load_soul_bedrock_rows()
     qdrant = _qdrant_url()
@@ -341,8 +346,8 @@ def stage_adversary(live: bool, limit: int | None) -> int:
 
 
 # ── stage: review (Scott batch-QA surface) ─────────────────────────────────────
-def stage_review(live: bool) -> int:
-    store, cand_coll, _ = _store(live)
+def stage_review(live: bool, tag: str = "") -> int:
+    store, cand_coll, _ = _store(live, tag)
     cands = store.get_canon(status="candidate", collection=cand_coll, limit=1000)
     from collections import Counter
     verdicts = Counter((p.get("adversary_verdict") or {}).get("verdict", "(none)") for _, p in cands)
@@ -397,14 +402,19 @@ def main() -> int:
     ap.add_argument("--live", action="store_true", help="target real sylva_candidates/sylva_canon (default: sandbox)")
     ap.add_argument("--approve", action="store_true", help="ratify stage only: confirm the batch-QA flip")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--tag", default="", help="namespace the sandbox collections (e.g. 'gemma') to compare runs")
+    ap.add_argument("--categories", default="",
+                    help="comma-separated category filter for rewrite (e.g. 'anchor,personality' to skip kernels)")
     args = ap.parse_args()
+    cats = {c.strip() for c in args.categories.split(",") if c.strip()} or None
 
     if args.stage == "rewrite":
-        return stage_rewrite(args.manifest, args.live, args.limit, args.snapshot)
+        return stage_rewrite(args.manifest, args.live, args.limit, args.snapshot,
+                             tag=args.tag, categories=cats)
     if args.stage == "adversary":
-        return stage_adversary(args.live, args.limit)
+        return stage_adversary(args.live, args.limit, tag=args.tag)
     if args.stage == "review":
-        return stage_review(args.live)
+        return stage_review(args.live, tag=args.tag)
     if args.stage == "ratify":
         return stage_ratify(args.live, args.approve)
     return 1

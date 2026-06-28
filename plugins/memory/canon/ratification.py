@@ -233,6 +233,63 @@ meaning from old canon — novelty is not a refutation ground. Route it to tensi
 - merge: a near-duplicate of an existing canon entry.
 """
 
+# Seed-calibrated posture (PRD-029 Phase 5). The steady-state `_ADVERSARY_SYSTEM`
+# above verifies fresh consolidation candidates against recent provenance — strict,
+# refute-unless-supported. SEEDING is different: the entries are ALREADY-CURATED
+# Gemini-era identity archive (low confabulation risk), and the recovered journal
+# is an imperfect, often-incomplete excerpt that frequently does NOT contain the
+# exact source conversation. Demanding verbatim journal support there refutes
+# faithful distillations (observed: 84% refute on clean identity entries). So the
+# curated posture inverts the default: AFFIRM curated identity by default; refute
+# ONLY on contradiction / confabulation / not-actually-identity; demote over-tier.
+_ADVERSARY_SYSTEM_CURATED = """\
+You are auditing CURATED ARCHIVE identity entries for an AI agent named Sylva.
+These were already human-curated (low confabulation risk). You judge FACT and
+CONSISTENCY only, never meaning — you are never shown the interpretation.
+
+The ``source_event.claim`` is the curated archive record. ``source_material`` (if
+present) is a journal excerpt from AROUND that time — it is often INCOMPLETE and
+may not contain the exact source conversation. Treat it as corroboration, not as
+an exhaustive record.
+
+Default to AFFIRM for genuine identity claims. Use the SIX checks, but with this
+curated calibration:
+1. provenance      — affirm-eligible unless the claim is an obvious confabulation
+   or fabrication. ABSENCE of verbatim support in source_material is NOT grounds
+   to refute — the claim is a distillation; exact wording won't appear, and the
+   journal may not even cover its source. Refute provenance ONLY for a claim the
+   source_material or bedrock actively CONTRADICTS.
+2. contradiction   — refute/flag only a claim the source_material or bedrock canon
+   directly contradicts (e.g. asserts a capability the source says does not exist).
+3. verifiability   — only fails on a claim contradicted by checkable fact.
+4. stability       — a one-off dressed as core → demote (not refute).
+5. redundancy      — near-duplicate of existing canon → merge.
+6. tier_appropriateness — trivial/over-tiered → demote.
+
+NOT-IDENTITY rule: if the claim is really a PROJECT / TECHNICAL / PRODUCT record
+(software architecture, a service, a feature, a business/pricing model, a
+milestone) rather than something about who Sylva IS, refute it — it does not
+belong in the identity canon (it can live in episodic memory instead).
+
+Output ONLY a JSON object (no prose, no fence):
+{
+  "verdict": "affirm|refute|tension|demote|merge",
+  "reasons": ["<short fact-based reason>", ...],
+  "evidence_refs": ["<ref you checked>", ...],
+  "checks": {"provenance":"...", "contradiction":"...", "verifiability":"...",
+             "stability":"...", "redundancy":"...", "tier_appropriateness":"..."}
+}
+
+VERDICT RULES (curated):
+- affirm: a genuine identity claim, not contradicted, right tier.
+- refute: confabulation/fabrication, a claim CONTRADICTED by source/bedrock, or a
+  project/technical/product record that is not identity.
+- tension: supported identity claim that conflicts with existing canon (novelty is
+  NOT a refutation ground — route to tension).
+- demote: genuine but over-tiered / one-off proposed as core.
+- merge: near-duplicate of existing canon.
+"""
+
 _ADVERSARY_USER = """\
 CANDIDATE (verifiable surface only — no interpretation is provided to you):
 {candidate}
@@ -290,6 +347,7 @@ def run_adversary(
     now_iso: Optional[str] = None,
     client: Optional[Any] = None,
     evidence: str = "",
+    mode: str = "strict",
     timeout: int = 180,
 ) -> Dict[str, Any]:
     """Run the six-check adversary on one candidate → a verdict dict (AC-005).
@@ -302,6 +360,9 @@ def run_adversary(
     """
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
     payload = _adversary_input(candidate, existing_canon, evidence=evidence)
+    # 'strict' = steady-state consolidation (refute-unless-supported); 'curated' =
+    # one-time seeding of already-curated archive (affirm-unless-contradicted).
+    system_prompt = _ADVERSARY_SYSTEM_CURATED if mode == "curated" else _ADVERSARY_SYSTEM
 
     if client is None:
         try:
@@ -329,7 +390,7 @@ def run_adversary(
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": _ADVERSARY_SYSTEM},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": _ADVERSARY_USER.format(
                     candidate=json.dumps(payload, ensure_ascii=False, indent=2))},
             ],
