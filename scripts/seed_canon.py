@@ -495,13 +495,22 @@ def stage_preview(from_coll: str, as_json: bool) -> int:
 
 
 # ── stage: ratify (owner-gated cutover-enabling step) ──────────────────────────
-def stage_ratify(live: bool, approve: bool, from_coll: str) -> int:
+def stage_ratify(live: bool, approve: bool, from_coll: str, reconcile: bool = False) -> int:
     """Decision-driven ratification: each candidate's Scott-QA ``qa_decision`` is
     authoritative. approve/edit → canonized (edit overrides applied; Sonnet demote
     re-tiers to peripheral); reject → rejected; undecided → skipped. Routed through
     the sanctioned ``route_verdict`` spine, so redaction + ``validate_payload`` +
     the PRD-028 audit ledger + the sole-writer invariant all hold. The recorded
-    ``adversary_verdict`` is Sonnet's (the locked primary judge)."""
+    ``adversary_verdict`` is Sonnet's (the locked primary judge).
+
+    ``reconcile``: after routing, RETIRE (status→retired, tombstone — never hard
+    delete, per evolve-by-supersession) any live-canon entry that came from this
+    source collection but is no longer approved. Makes the canon EXACTLY the
+    approved set — needed for a consolidation re-ratify, where merged-away/dropped
+    entries are already live from a prior ratify and ``route_verdict`` (which only
+    upserts) would otherwise leave them orphaned. Only touches canon entries whose
+    id is a candidate in ``from_coll`` AND not approved — entries from other sources
+    or still approved are never retired."""
     if not approve:
         print("ratify is owner-gated: re-run with --approve to write the Scott-approved set → canon "
               "(ratified_by:{sylva, scott_qa@seed}). Preview with `preview` first.")
@@ -516,9 +525,12 @@ def stage_ratify(live: bool, approve: bool, from_coll: str) -> int:
     def scott_qa_ratify(candidate, verdict, now_iso):
         return {"sylva": now_iso, "scott_qa@seed": now_iso}
 
+    approved_ids: set[str] = set()
+    source_ids: set[str] = set()
     n: dict = {"canonized": 0, "demoted": 0, "rejected": 0, "tension": 0,
-               "merged": 0, "skipped": 0, "errored": 0}
+               "merged": 0, "skipped": 0, "errored": 0, "retired": 0}
     for cid, payload in pts:
+        source_ids.add(cid)
         decision = (payload.get("qa_decision") or {}).get("decision")
         sonnet = dict(payload.get("adversary_verdict_sonnet") or payload.get("adversary_verdict") or {})
         try:
@@ -543,11 +555,29 @@ def stage_ratify(live: bool, approve: bool, from_coll: str) -> int:
             rec = route_verdict(cid, cand, verdict, store, now_iso=now,
                                 ratify_fn=scott_qa_ratify, candidates_collection=from_coll,
                                 canon_collection=canon_coll, existing_canon=existing)
+            approved_ids.add(cid)
             n[rec.action] = n.get(rec.action, 0) + 1
         except Exception as e:
             print(f"  ERROR {cid[:8]}: {type(e).__name__}: {e}")
             n["errored"] += 1
-    print(f"ratify (Scott-QA@seed → {canon_coll}): {n}")
+
+    if reconcile:
+        # Retire live-canon entries from THIS source that are no longer approved.
+        for canon_id, cpayload in store.get_canon(status="canon", collection=canon_coll, limit=1000):
+            if canon_id in source_ids and canon_id not in approved_ids:
+                store.set_payload(canon_coll, canon_id,
+                                  {"status": "retired", "retired_at": now})
+                try:
+                    from autonomy import audit
+                    audit.record(tier="T2", surface="cron",
+                                 action=f"canon reconcile: retired {canon_id} (no longer approved)",
+                                 rationale="consolidation re-ratify", authority="scott_qa@seed",
+                                 outcome="ok")
+                except Exception:
+                    pass
+                n["retired"] += 1
+
+    print(f"ratify (Scott-QA@seed → {canon_coll}){' +reconcile' if reconcile else ''}: {n}")
     if live:
         print("Live canon populated → rebuild image + restart gateway to apply (the cutover flip): "
               "the next session's self-brief assembles SOUL.md + canon.")
@@ -571,6 +601,9 @@ def main() -> int:
     ap.add_argument("--from", dest="from_coll", default="sylva_lab_seed_candidates_gemma",
                     help="preview/ratify: source seed-candidate collection (decoupled from the canon target)")
     ap.add_argument("--json", action="store_true", help="preview stage only: emit a JSON payload (for the cockpit)")
+    ap.add_argument("--reconcile", action="store_true",
+                    help="ratify stage only: retire live-canon entries from this source no longer approved "
+                         "(makes canon exactly the approved set — for consolidation re-ratify)")
     args = ap.parse_args()
     cats = {c.strip() for c in args.categories.split(",") if c.strip()} or None
 
@@ -584,7 +617,7 @@ def main() -> int:
     if args.stage == "preview":
         return stage_preview(args.from_coll, args.json)
     if args.stage == "ratify":
-        return stage_ratify(args.live, args.approve, args.from_coll)
+        return stage_ratify(args.live, args.approve, args.from_coll, reconcile=args.reconcile)
     return 1
 
 
