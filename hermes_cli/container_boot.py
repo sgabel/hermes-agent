@@ -432,10 +432,21 @@ def main() -> int:
     # actively harmful: when the gateway and dashboard containers share a
     # bind-mounted HERMES_HOME, both race to flock() the same s6-log lock
     # files under logs/gateways/<profile>/lock, producing "Resource busy"
-    # failures and a restart storm. Detect the role from PID 1 argv and
-    # skip reconciliation in the dashboard container. No operator flag:
-    # the role is a fact about the container's command, and a flag can be
-    # forgotten in a hand-written manifest, reintroducing the storm.
+    # failures and a restart storm (also: a second full gateway → duplicate
+    # Discord login + doubled cron/nudge cycles).
+    #
+    # EXPLICIT ROLE GATE (primary). The original PID-1-argv detection below
+    # silently breaks under s6-overlay: PID 1 is ``s6-svscan``, not the
+    # container CMD (which runs later as a child of main-wrapper.sh), so
+    # ``_is_dashboard_container`` always returns False and the dashboard
+    # container wrongly starts a gateway. There is no stable cont-init-time
+    # path to the not-yet-exec'd main-program argv under s6, so the role is
+    # declared explicitly via env (set on the dashboard service in compose).
+    # The argv check is kept as a best-effort fallback (e.g. legacy tini PID 1).
+    if os.environ.get("HERMES_ROLE", "").strip().lower() == "dashboard" or \
+            os.environ.get("HERMES_DISABLE_GATEWAY", "").strip().lower() in ("1", "true", "yes"):
+        print("reconcile: skipping (HERMES_ROLE=dashboard — gateway lives in the gateway container)")
+        return 0
     if _is_dashboard_container(_read_container_argv()):
         print(
             "reconcile: skipping (dashboard container — does not need "
