@@ -39,8 +39,22 @@ class FakeBackend:
         return {"result": "Memory deleted.", "memory_id": memory_id}
 
 
-class TestMem0V3Tools:
-    """Test v3 tool names and response handling."""
+# The five mem0_* tools retired in the PRD-029 decommission (2026-06-28).
+# They are no longer advertised in get_tool_schemas() and any call to
+# handle_tool_call() with these names falls through to "Unknown tool".
+RETIRED_MEM0_TOOLS = ["mem0_list", "mem0_search", "mem0_add", "mem0_update", "mem0_delete"]
+
+
+class TestMem0RetiredTools:
+    """PRD-029 decommission (2026-06-28): the five mem0_* tools (list/search/
+    add/update/delete) are RETIRED.
+
+    Replaces the old behavioral handler tests (TestMem0V3Tools /
+    TestMem0UpdateDelete and the tool-driven circuit-breaker tests in
+    TestMem0ErrorHandling). The handlers no longer exist; the contract is now:
+      (a) each retired name is ABSENT from get_tool_schemas(), and
+      (b) dispatching it via handle_tool_call() returns an "Unknown tool" error.
+    """
 
     def _make_provider(self, monkeypatch, backend):
         provider = Mem0MemoryProvider()
@@ -50,204 +64,32 @@ class TestMem0V3Tools:
         provider._backend = backend
         return provider
 
-    def test_list_returns_paginated_with_ids(self, monkeypatch):
-        backend = FakeBackend(all_results={
-            "count": 2,
-            "results": [
-                {"id": "mem-1", "memory": "alpha"},
-                {"id": "mem-2", "memory": "beta"},
-            ]
-        })
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_list", {}))
-        assert result["count"] == 2
-        assert result["results"][0]["id"] == "mem-1"
-        assert result["results"][0]["memory"] == "alpha"
-
-    def test_list_pagination_params(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        provider.handle_tool_call("mem0_list", {"page": 2, "page_size": 50})
-        assert backend.captured[0][1]["page"] == 2
-        assert backend.captured[0][1]["page_size"] == 50
-
-    def test_list_empty(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_list", {}))
-        assert result["result"] == "No memories stored yet."
-
-    def test_search_returns_ids(self, monkeypatch):
-        backend = FakeBackend(search_results=[{"id": "mem-1", "memory": "foo", "score": 0.9}])
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_search", {"query": "test"}))
-        assert result["results"][0]["id"] == "mem-1"
-
-    def test_search_uses_filters(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        provider.handle_tool_call("mem0_search", {"query": "hello", "top_k": 3})
-        assert backend.captured[0][2]["filters"] == {"user_id": "u123"}
-        assert backend.captured[0][2]["top_k"] == 3
-
-    def test_search_rerank_default_true(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        provider.handle_tool_call("mem0_search", {"query": "test"})
-        assert backend.captured[0][2]["rerank"] is True
-
-    def test_search_rerank_override_false(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        provider.handle_tool_call("mem0_search", {"query": "test", "rerank": False})
-        assert backend.captured[0][2]["rerank"] is False
-
-    def test_add_uses_content_param(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_add", {"content": "user likes dark mode"}))
-        assert len(backend.captured) == 1
-        call = backend.captured[0]
-        assert call[2]["infer"] is False
-        assert call[2]["user_id"] == "u123"
-        assert call[2]["agent_id"] == "hermes"
-        assert "event_id" in result
-
-    def test_add_returns_event_id(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_add", {"content": "test"}))
-        assert result["event_id"] == "evt-test-123"
-
-    def test_add_missing_content(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_add", {}))
-        assert "error" in result
-
-    def test_old_tool_names_return_unknown(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_profile", {}))
-        assert "error" in result
-        result = json.loads(provider.handle_tool_call("mem0_conclude", {}))
-        assert "error" in result
-
-
-class TestMem0UpdateDelete:
-
-    def _make_provider(self, monkeypatch, backend):
+    @pytest.mark.parametrize("tool_name", RETIRED_MEM0_TOOLS)
+    def test_retired_tool_absent_from_schemas(self, tool_name):
         provider = Mem0MemoryProvider()
-        provider.initialize("test-session")
-        provider._user_id = "u123"
-        provider._agent_id = "hermes"
-        provider._backend = backend
-        return provider
+        names = [s["name"] for s in provider.get_tool_schemas()]
+        assert tool_name not in names
 
-    def test_update_calls_sdk(self, monkeypatch):
+    @pytest.mark.parametrize("tool_name", RETIRED_MEM0_TOOLS)
+    def test_retired_tool_dispatch_returns_unknown(self, monkeypatch, tool_name):
         backend = FakeBackend()
         provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_update", {"memory_id": "mem-1", "text": "updated fact"}
-        ))
-        assert backend.captured[0][1] == "mem-1"
-        assert backend.captured[0][2] == "updated fact"
-        assert result["result"] == "Memory updated."
-        assert result["memory_id"] == "mem-1"
-
-    def test_update_missing_memory_id(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_update", {"text": "no id"}))
+        result = json.loads(provider.handle_tool_call(tool_name, {}))
         assert "error" in result
+        assert "Unknown tool" in result["error"]
+        # The retired handlers are gone — nothing reaches the backend.
+        assert backend.captured == []
 
-    def test_update_missing_text(self, monkeypatch):
+    def test_retired_dispatch_does_not_trip_circuit_breaker(self, monkeypatch):
+        """An unknown (retired) tool name is a no-op dispatch error, not a
+        backend failure — it must not move the circuit breaker."""
         backend = FakeBackend()
         provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_update", {"memory_id": "mem-1"}))
-        assert "error" in result
-
-    def test_delete_calls_sdk(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_delete", {"memory_id": "mem-1"}
-        ))
-        assert backend.captured[0][1] == "mem-1"
-        assert result["result"] == "Memory deleted."
-
-    def test_delete_missing_memory_id(self, monkeypatch):
-        backend = FakeBackend()
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call("mem0_delete", {}))
-        assert "error" in result
-
-
-class TestMem0ErrorHandling:
-
-    def _make_provider(self, monkeypatch, backend):
-        provider = Mem0MemoryProvider()
-        provider.initialize("test-session")
-        provider._user_id = "u123"
-        provider._agent_id = "hermes"
-        provider._backend = backend
-        return provider
-
-    def test_update_404_no_circuit_breaker(self, monkeypatch):
-        backend = FakeBackend()
-        backend.update = lambda mid, text: (_ for _ in ()).throw(Exception("404 Not Found"))
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_update", {"memory_id": "bad-id", "text": "x"}
-        ))
-        assert "error" in result
+        for tool_name in RETIRED_MEM0_TOOLS:
+            provider.handle_tool_call(tool_name, {"content": "x", "query": "x",
+                                                  "memory_id": "x", "text": "x"})
         assert provider._consecutive_failures == 0
-
-    def test_delete_404_no_circuit_breaker(self, monkeypatch):
-        backend = FakeBackend()
-        backend.delete = lambda mid: (_ for _ in ()).throw(Exception("404 not found"))
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_delete", {"memory_id": "bad-id"}
-        ))
-        assert "error" in result
-        assert provider._consecutive_failures == 0
-
-    def test_update_validation_error_no_circuit_breaker(self, monkeypatch):
-        """ValidationError (bad UUID format) should not trip circuit breaker."""
-        class ValidationError(Exception):
-            pass
-        backend = FakeBackend()
-        backend.update = lambda mid, text: (_ for _ in ()).throw(
-            ValidationError('{"error":"memory_id should be a valid UUID"}')
-        )
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_update", {"memory_id": "not-a-uuid", "text": "x"}
-        ))
-        assert "error" in result
-        assert provider._consecutive_failures == 0
-
-    def test_delete_validation_error_no_circuit_breaker(self, monkeypatch):
-        class ValidationError(Exception):
-            pass
-        backend = FakeBackend()
-        backend.delete = lambda mid: (_ for _ in ()).throw(
-            ValidationError('{"error":"memory_id should be a valid UUID"}')
-        )
-        provider = self._make_provider(monkeypatch, backend)
-        result = json.loads(provider.handle_tool_call(
-            "mem0_delete", {"memory_id": "not-a-uuid"}
-        ))
-        assert "error" in result
-        assert provider._consecutive_failures == 0
-
-    def test_update_5xx_trips_circuit_breaker(self, monkeypatch):
-        backend = FakeBackend()
-        backend.update = lambda mid, text: (_ for _ in ()).throw(Exception("500 Internal Server Error"))
-        provider = self._make_provider(monkeypatch, backend)
-        provider.handle_tool_call("mem0_update", {"memory_id": "mem-1", "text": "x"})
-        assert provider._consecutive_failures == 1
+        assert backend.captured == []
 
 
 class TestMem0V3Internal:
@@ -292,50 +134,70 @@ class TestMem0V3Internal:
 class TestMem0V3Config:
 
     def test_tool_schemas_v3_tools_present(self):
+        """Post-decommission: the five mem0_* tools are ABSENT; chronicle_search
+        is the sole advertised tool."""
         provider = Mem0MemoryProvider()
         schemas = provider.get_tool_schemas()
         names = [s["name"] for s in schemas]
-        # The five v3 mem0 tools, plus the fork-local chronicle_search.
-        assert names[:5] == ["mem0_list", "mem0_search", "mem0_add", "mem0_update", "mem0_delete"]
         assert "chronicle_search" in names
+        for retired in RETIRED_MEM0_TOOLS:
+            assert retired not in names
         assert "mem0_profile" not in names
         assert "mem0_conclude" not in names
 
     def test_system_prompt_new_tool_names(self):
+        """The system prompt block advertises chronicle_search only — none of the
+        retired mem0_* tools, and no mode/user-id leakage."""
         provider = Mem0MemoryProvider()
         provider._user_id = "test"
+        provider._chronicle = object()  # non-empty -> block is rendered
         block = provider.system_prompt_block()
-        assert "mem0_search" in block
-        assert "mem0_add" in block
-        assert "mem0_list" in block
-        assert "mem0_update" in block
-        assert "mem0_delete" in block
+        assert "chronicle_search" in block
+        for retired in RETIRED_MEM0_TOOLS:
+            assert retired not in block
         assert "mem0_profile" not in block
         assert "mem0_conclude" not in block
+        assert "Mode:" not in block
 
-    def test_system_prompt_shows_platform_mode(self):
+    def test_system_prompt_empty_without_chronicle(self):
+        """If the chronicle searcher is unavailable, the block is empty."""
+        provider = Mem0MemoryProvider()
+        provider._user_id = "test"
+        provider._chronicle = None
+        assert provider.system_prompt_block() == ""
+
+    def test_system_prompt_no_mode_leak_platform(self):
+        """No 'platform' / 'OSS' / 'Mode:' mode string — mode is no longer surfaced."""
         provider = Mem0MemoryProvider()
         provider._user_id = "test"
         provider._mode = "platform"
+        provider._chronicle = object()
         block = provider.system_prompt_block()
-        assert "platform" in block
-        assert "Rerank" in block
+        assert "chronicle_search" in block
+        assert "platform" not in block
+        assert "Mode:" not in block
 
-    def test_system_prompt_shows_oss_mode(self):
+    def test_system_prompt_no_mode_leak_oss(self):
         provider = Mem0MemoryProvider()
         provider._user_id = "test"
         provider._mode = "oss"
+        provider._chronicle = object()
         block = provider.system_prompt_block()
-        assert "OSS" in block
-        assert "Rerank" not in block
+        assert "chronicle_search" in block
+        assert "OSS" not in block
+        assert "Mode:" not in block
 
-    def test_search_schema_has_rerank(self):
-        """rerank property available in SEARCH_SCHEMA for platform mode."""
+    def test_search_schema_constant_still_has_rerank(self):
+        """The SEARCH_SCHEMA module constant is retained (unadvertised) so the
+        tool is a one-line re-enable. It must still carry the rerank property —
+        but it is NOT advertised via get_tool_schemas()."""
+        from plugins.memory.mem0 import SEARCH_SCHEMA
+        assert "rerank" in SEARCH_SCHEMA["parameters"]["properties"]
+        assert SEARCH_SCHEMA["parameters"]["properties"]["rerank"]["type"] == "boolean"
+        # ...but search is no longer advertised.
         provider = Mem0MemoryProvider()
-        schemas = provider.get_tool_schemas()
-        search = next(s for s in schemas if s["name"] == "mem0_search")
-        assert "rerank" in search["parameters"]["properties"]
-        assert search["parameters"]["properties"]["rerank"]["type"] == "boolean"
+        names = [s["name"] for s in provider.get_tool_schemas()]
+        assert "mem0_search" not in names
 
 
 class TestMem0ModeSwitch:
@@ -379,21 +241,27 @@ class TestMem0ModeSwitch:
         assert provider.is_available() is False
 
     def test_tool_schemas_stable(self):
+        """Post-decommission stable surface: chronicle_search only."""
         provider = Mem0MemoryProvider()
         schemas = provider.get_tool_schemas()
         names = [s["name"] for s in schemas]
-        # Fork ships the five v3 mem0 tools + chronicle_search (always advertised).
-        assert names == ["mem0_list", "mem0_search", "mem0_add", "mem0_update",
-                         "mem0_delete", "chronicle_search"]
+        assert names == ["chronicle_search"]
 
-    def test_system_prompt_includes_mode(self):
+    def test_system_prompt_independent_of_mode(self):
+        """The prompt block no longer surfaces the backend mode at all — the
+        same chronicle-only block renders regardless of platform/oss mode."""
         provider = Mem0MemoryProvider()
         provider._user_id = "test"
+        provider._chronicle = object()
         provider._mode = "oss"
-        block = provider.system_prompt_block()
-        assert "mem0_search" in block
-        assert "mem0_list" in block
-        assert "OSS" in block
+        oss_block = provider.system_prompt_block()
+        provider._mode = "platform"
+        platform_block = provider.system_prompt_block()
+        assert oss_block == platform_block
+        assert "chronicle_search" in oss_block
+        assert "OSS" not in oss_block
+        assert "platform" not in platform_block
+        assert "mem0_search" not in oss_block
 
 
 class TestMem0UserIdResolution:
@@ -461,11 +329,15 @@ class TestMem0WriteMetadata:
         provider._backend = FakeBackend()
         return provider
 
-    def test_add_tool_passes_channel_metadata(self):
+    def test_add_tool_retired_writes_nothing(self):
+        """mem0_add is retired — dispatching it is an unknown-tool no-op that
+        reaches no backend write, regardless of channel. (The channel-metadata
+        path it used to exercise is gone with the write tools.)"""
         provider = self._make_provider("telegram")
-        provider.handle_tool_call("mem0_add", {"content": "user likes dark mode"})
-        call = provider._backend.captured[-1]
-        assert call[2]["metadata"] == {"channel": "telegram"}
+        result = json.loads(provider.handle_tool_call("mem0_add", {"content": "user likes dark mode"}))
+        assert "error" in result
+        assert "Unknown tool" in result["error"]
+        assert provider._backend.captured == []
 
     def test_sync_turn_writes_nothing(self):
         """Fork invariant (PRD-029): sync_turn never writes (no passive extraction).
@@ -533,6 +405,104 @@ class TestMem0Security:
         assert cfg["mode"] == "oss"
         assert "vector_store" not in cfg  # no top-level leak
         assert cfg["oss"]["vector_store"]["config"]["collection_name"] == "mem0"
+
+
+class FakeChronicle:
+    """Records chronicle.search() calls for prefetch routing tests."""
+
+    def __init__(self, results=None):
+        self._results = results or []
+        self.calls = []
+
+    def search(self, query, *, speaker="any", date_from="", date_to="", top_k=5):
+        self.calls.append((query, top_k))
+        return self._results
+
+
+class TestMem0PrefetchDecommission:
+    """PRD-029 decommission (2026-06-28): prefetch is chronicle-only.
+
+    The old 'stable_knowledge' route searched the retired sylva_memories store
+    on every non-trivial turn; it is now an intentional no-op. Only the
+    'historical_memory' route warms the chronicle.
+    """
+
+    def _make_provider(self, backend, chronicle):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session")
+        provider._user_id = "u123"
+        provider._agent_id = "hermes"
+        provider._backend = backend
+        provider._chronicle = chronicle
+        # Previous turn had no tool activity -> intent gate uses pattern check
+        # only, and a substantive question still passes through.
+        provider._had_tool_calls = False
+        return provider
+
+    def test_stable_knowledge_route_is_noop(self):
+        """A non-historical query must NOT hit the mem0 backend search, and must
+        NOT warm the chronicle — the stable route is a deliberate no-op."""
+        backend = FakeBackend(search_results=[{"id": "x", "memory": "y"}])
+        chronicle = FakeChronicle(results=[{"date": "2026-01-01", "speaker": "scott", "data": "hi"}])
+        provider = self._make_provider(backend, chronicle)
+
+        provider.queue_prefetch("what is my favorite programming language")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        # The retired stable route must never call backend.search.
+        assert not any(c[0] == "search" for c in backend.captured)
+        # Stable knowledge does not route to the chronicle either.
+        assert chronicle.calls == []
+
+    def test_historical_route_hits_chronicle_only(self):
+        """A historical query routes to the chronicle searcher — never the mem0
+        backend."""
+        backend = FakeBackend(search_results=[{"id": "x", "memory": "y"}])
+        chronicle = FakeChronicle(
+            results=[{"date": "2026-01-01", "speaker": "scott", "data": "we discussed X"}]
+        )
+        provider = self._make_provider(backend, chronicle)
+
+        provider.queue_prefetch("remember what we talked about last week")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        # Chronicle was searched; the mem0 backend was not.
+        assert len(chronicle.calls) == 1
+        assert not any(c[0] == "search" for c in backend.captured)
+
+    def test_prefetch_noop_without_chronicle(self):
+        """No chronicle -> queue_prefetch is an immediate no-op (no thread, no
+        backend search)."""
+        backend = FakeBackend(search_results=[{"id": "x", "memory": "y"}])
+        provider = self._make_provider(backend, None)
+        provider.queue_prefetch("remember last week")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        assert not any(c[0] == "search" for c in backend.captured)
+
+
+class TestMem0ChronicleSearchAdvertised:
+    """chronicle_search remains the sole advertised + dispatchable tool."""
+
+    def test_chronicle_search_advertised(self):
+        provider = Mem0MemoryProvider()
+        names = [s["name"] for s in provider.get_tool_schemas()]
+        assert "chronicle_search" in names
+
+    def test_chronicle_search_dispatchable(self):
+        """chronicle_search dispatches to the chronicle searcher (not the
+        unknown-tool fallthrough)."""
+        provider = Mem0MemoryProvider()
+        provider._chronicle = FakeChronicle(
+            results=[{"date": "2026-01-01", "speaker": "scott", "data": "we shipped it"}]
+        )
+        result = json.loads(provider.handle_tool_call("chronicle_search", {"query": "ship"}))
+        assert "error" not in result
+        assert result["count"] == 1
+        assert result["results"][0]["data"] == "we shipped it"
+        assert provider._chronicle.calls == [("ship", 5)]
 
 
 class TestOSSBackendSafety:
