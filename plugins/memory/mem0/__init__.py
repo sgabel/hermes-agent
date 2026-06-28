@@ -9,10 +9,14 @@ Fork-local (Sylva / PRD-029):
   * Chronicle searcher (sylva_chronicle) + orchestrated prefetch
     (IntentGate / QueryModeRouter / ContextBudget / Deduplicator).
   * No per-turn passive fact extraction — sync_turn() is intentionally a
-    no-op for writes (it only caches orchestration state). Durable writes
-    happen exclusively through explicit agent tool calls (mem0_add) and the
-    governed consolidation pipeline. Re-enabling infer=True per-turn would
-    reopen the ungoverned-autosave loop PRD-029 exists to close.
+    no-op for writes (it only caches orchestration state). Re-enabling
+    infer=True per-turn would reopen the ungoverned-autosave loop PRD-029
+    exists to close.
+  * Decommission (2026-06-28): the mem0_* tools (list/search/add/update/
+    delete) are RETIRED and the every-turn "stable_knowledge" prefetch route
+    is dropped. Curated identity is the canon self-brief (plugins/memory/
+    canon, seed_canon.py governed pipeline — NOT mem0_add); episodic recall
+    is chronicle_search. This provider is now chronicle-centric.
 
 Configuration
 -------------
@@ -435,20 +439,16 @@ class Mem0MemoryProvider(MemoryProvider):
         return {"channel": self._channel} if self._channel else {}
 
     def system_prompt_block(self) -> str:
-        mode_label = "platform (cloud API)" if self._mode == "platform" else "OSS (self-hosted)"
-        rerank_note = " Rerank is available on search." if self._mode == "platform" else ""
-        lines = [
-            "# Mem0 Memory",
-            f"Active. Mode: {mode_label}. User: {self._user_id}.",
-            "Use mem0_search to find memories, mem0_add to store facts, "
-            f"mem0_list for a full overview, mem0_update and mem0_delete to manage by ID.{rerank_note}",
-        ]
-        if self._chronicle:
-            lines.append(
-                "Use chronicle_search to recall past conversations by topic, "
-                "speaker, or date range."
-            )
-        return "\n".join(lines)
+        # PRD-029 decommission (2026-06-28): the mem0_* tools are retired. Curated
+        # identity is injected separately via the canon self-brief; this provider
+        # now exposes only chronicle_search for on-demand episodic recall.
+        if not self._chronicle:
+            return ""
+        return (
+            "# Memory Recall\n"
+            "Use chronicle_search to recall past conversations by topic, "
+            "speaker, or date range."
+        )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -470,24 +470,28 @@ class Mem0MemoryProvider(MemoryProvider):
         return "## Mem0 Memory\n" + "\n".join(filtered)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        if self._backend is None or self._is_breaker_open():
+        # PRD-029 decommission (2026-06-28): prefetch is now CHRONICLE-ONLY and no
+        # longer depends on the mem0 backend. The old "stable_knowledge" route
+        # searched the retired sylva_memories store on EVERY non-trivial turn;
+        # adversarial review confirmed that repointing it at the chronicle would
+        # inject raw journal fragments into nearly every turn. Curated identity
+        # comes from the canon self-brief at session start, so the stable route is
+        # intentionally a no-op. The historical_memory route still warms the
+        # chronicle; on-demand recall is the chronicle_search tool.
+        if self._chronicle is None:
             return
 
         def _run():
-            backend = self._backend
-            if backend is None:
-                return
             # Intent gate — skip retrieval for social/confirmation messages.
             if not IntentGate.should_retrieve(query, self._had_tool_calls):
                 logger.debug("Mem0 prefetch skipped by intent gate: %r", query[:60])
                 return
 
             mode = QueryModeRouter.classify(query)
-            facts: list[str] = []
             chronicle_results: list[str] = []
 
             try:
-                if mode == "historical_memory" and self._chronicle:
+                if mode == "historical_memory":
                     # Route to the chronicle collection (direct Qdrant + TEI).
                     try:
                         results = self._chronicle.search(query, top_k=5)
@@ -496,19 +500,12 @@ class Mem0MemoryProvider(MemoryProvider):
                             for r in results if r.get("data")
                         ]
                     except Exception as e:
-                        logger.debug("Chronicle prefetch failed, falling back: %s", e)
-                        # Fall through to stable_knowledge on failure.
+                        logger.debug("Chronicle prefetch failed: %s", e)
+                # stable_knowledge route: intentional no-op (see method docstring).
 
-                # Always search stable knowledge (curated facts).
-                mem_results = backend.search(
-                    query, filters=self._read_filters(), top_k=10, rerank=self._rerank,
-                )
-                if mem_results:
-                    facts = [r.get("memory", "") for r in mem_results if r.get("memory")]
-
-                # Assemble within budget.
+                # Assemble within budget. facts is always empty post-decommission.
                 assembled = ContextBudget.assemble(
-                    facts=facts, chronicle=chronicle_results,
+                    facts=[], chronicle=chronicle_results,
                 )
                 if assembled:
                     with self._prefetch_lock:
@@ -528,27 +525,34 @@ class Mem0MemoryProvider(MemoryProvider):
         on purpose. Upstream v3's sync_turn calls ``backend.add(..., infer=True)``
         every turn, which re-opens the ungoverned-autosave loop that floods the
         store with low-signal, unattributed, ungated confabulations. Durable
-        memory writes happen ONLY through explicit agent tool calls (mem0_add)
-        and the governed consolidation pipeline. Do NOT reintroduce a per-turn
-        ``backend.add`` here — that is the single regression PRD-029 exists to
-        prevent. The orchestration state below feeds the intent gate and the
-        deduplicator only; it performs no writes.
+        identity writes happen ONLY through the governed canon consolidation
+        pipeline (seed_canon.py); the mem0_* write tools were retired in the
+        2026-06-28 decommission. Do NOT reintroduce a per-turn ``backend.add``
+        here — that is the single regression PRD-029 exists to prevent. The
+        orchestration state below feeds the intent gate and the deduplicator
+        only; it performs no writes.
         """
         self._last_assistant_content = (assistant_content or "")[:2000]
         # Length proxy: substantive responses (>200 chars) likely involved tool use.
         self._had_tool_calls = len(assistant_content) > 200 if assistant_content else False
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        # Always advertise chronicle_search regardless of self._chronicle state.
-        # The memory_manager builds its _tool_to_provider routing map by calling
-        # get_tool_schemas() at add_provider() time — which runs BEFORE
-        # initialize() populates self._chronicle. Gating schema advertisement on
-        # self._chronicle there caused chronicle_search to never enter the
-        # routing map, producing "Unknown tool: chronicle_search" at dispatch.
-        # The dispatch handler below still checks self._chronicle and returns a
-        # graceful "Chronicle not available." when the backend isn't ready.
-        return [LIST_SCHEMA, SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA,
-                CHRONICLE_SEARCH_SCHEMA]
+        # PRD-029 decommission (2026-06-28): the mem0_* tools (list/search/add/
+        # update/delete) are RETIRED. They bound to the old sylva_memories store,
+        # and the write tools (add/update/delete) reintroduced a second durable
+        # fact store outside the curated canon — the exact anti-pattern PRD-029
+        # set out to kill (confirmed by adversarial review). Curated identity now
+        # comes from the canon self-brief at session start; on-demand recall is
+        # chronicle_search. The LIST_/SEARCH_/ADD_/UPDATE_/DELETE_SCHEMA constants
+        # are retained (unadvertised) so re-enable is a one-line change if ever
+        # needed.
+        #
+        # chronicle_search is advertised regardless of self._chronicle state: the
+        # memory_manager builds its _tool_to_provider routing map at
+        # add_provider() time, BEFORE initialize() populates self._chronicle.
+        # Gating here caused "Unknown tool: chronicle_search" at dispatch. The
+        # handler below checks self._chronicle and degrades gracefully.
+        return [CHRONICLE_SEARCH_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         # Chronicle uses its own backend (direct Qdrant + TEI) — handled ahead of
@@ -574,119 +578,10 @@ class Mem0MemoryProvider(MemoryProvider):
             except Exception as e:
                 return json.dumps({"error": f"Chronicle search failed: {e}"})
 
-        if self._backend is None:
-            err = getattr(self, "_init_error", "unknown error")
-            hint = ""
-            if self._mode == "oss":
-                vs = (self._config or {}).get("oss", {}).get("vector_store", {})
-                provider = vs.get("provider", "vector store")
-                hint = f" Check that {provider} is running and reachable."
-            return json.dumps({"error": f"Mem0 backend not initialized: {err}.{hint}"})
-
-        if self._is_breaker_open():
-            msg = "Mem0 temporarily unavailable (multiple consecutive failures). Will retry automatically."
-            if self._mode == "oss":
-                vs = (self._config or {}).get("oss", {}).get("vector_store", {})
-                msg += f" Check that your {vs.get('provider', 'vector store')} is running."
-            return json.dumps({"error": msg})
-
-        if tool_name == "mem0_list":
-            try:
-                page = max(1, int(args.get("page", 1)))
-                page_size = min(max(1, int(args.get("page_size", 100))), 200)
-                response = self._backend.get_all(
-                    filters=self._read_filters(), page=page, page_size=page_size,
-                )
-                self._record_success()
-                results = response.get("results", [])
-                if not results:
-                    return json.dumps({"result": "No memories stored yet."})
-                items = [{"id": m.get("id"), "memory": m.get("memory", "")}
-                         for m in results]
-                return json.dumps({
-                    "results": items,
-                    "count": response.get("count", len(items)),
-                    "page": page, "page_size": page_size,
-                })
-            except Exception as e:
-                if not _is_client_error(e):
-                    self._record_failure()
-                return tool_error(self._format_error("Failed to list memories", e))
-
-        elif tool_name == "mem0_search":
-            query = args.get("query", "")
-            if not query:
-                return tool_error("Missing required parameter: query")
-            try:
-                top_k = max(1, min(int(args.get("top_k", 10)), 50))
-                rerank_raw = args.get("rerank", True)
-                if isinstance(rerank_raw, str):
-                    rerank = rerank_raw.lower() not in ("false", "0", "no")
-                else:
-                    rerank = bool(rerank_raw)
-                results = self._backend.search(query, filters=self._read_filters(), top_k=top_k, rerank=rerank)
-                self._record_success()
-                if not results:
-                    return json.dumps({"result": "No relevant memories found."})
-                items = [{"id": r.get("id"), "memory": r.get("memory", ""),
-                          "score": r.get("score", 0)} for r in results]
-                return json.dumps({"results": items, "count": len(items)})
-            except Exception as e:
-                if not _is_client_error(e):
-                    self._record_failure()
-                return tool_error(self._format_error("Search failed", e))
-
-        elif tool_name == "mem0_add":
-            content = args.get("content", "")
-            if not content:
-                return tool_error("Missing required parameter: content")
-            try:
-                result = self._backend.add(
-                    [{"role": "user", "content": content}],
-                    user_id=self._user_id,
-                    agent_id=self._agent_id,
-                    infer=False,
-                    metadata=self._write_metadata(),
-                )
-                self._record_success()
-                event_id = result.get("event_id") if isinstance(result, dict) else None
-                msg = "Fact stored." if self._mode == "oss" else "Fact queued for storage."
-                return json.dumps({"result": msg, "event_id": event_id})
-            except Exception as e:
-                self._record_failure()
-                return tool_error(self._format_error("Failed to store", e))
-
-        elif tool_name == "mem0_update":
-            memory_id = args.get("memory_id", "")
-            text = args.get("text", "")
-            if not memory_id:
-                return tool_error("Missing required parameter: memory_id")
-            if not text:
-                return tool_error("Missing required parameter: text")
-            try:
-                result = self._backend.update(memory_id, text)
-                self._record_success()
-                return json.dumps(result)
-            except Exception as e:
-                if _is_client_error(e):
-                    return tool_error(f"Memory not found: {memory_id}")
-                self._record_failure()
-                return tool_error(self._format_error("Update failed", e))
-
-        elif tool_name == "mem0_delete":
-            memory_id = args.get("memory_id", "")
-            if not memory_id:
-                return tool_error("Missing required parameter: memory_id")
-            try:
-                result = self._backend.delete(memory_id)
-                self._record_success()
-                return json.dumps(result)
-            except Exception as e:
-                if _is_client_error(e):
-                    return tool_error(f"Memory not found: {memory_id}")
-                self._record_failure()
-                return tool_error(self._format_error("Delete failed", e))
-
+        # PRD-029 decommission (2026-06-28): the mem0_* tool handlers (list/
+        # search/add/update/delete) are removed — they bound to the retired
+        # sylva_memories store. chronicle_search (handled above) is the sole
+        # recall tool. Anything else is unknown.
         return tool_error(f"Unknown tool: {tool_name}")
 
     def _shutdown_backend(self):

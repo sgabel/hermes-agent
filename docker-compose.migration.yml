@@ -75,6 +75,11 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      # Role gate: skip per-profile gateway reconciliation at boot. Without this
+      # the dashboard container starts a SECOND full gateway (the PID-1-argv
+      # role detection is broken under s6-overlay), causing duplicate Discord
+      # logins + doubled cron/nudge cycles against the shared /opt/data.
+      - HERMES_ROLE=dashboard
     # Internal-only (no host publish here); host ingress 127.0.0.1:9119 via host-ingress.
     # Bind 0.0.0.0 INSIDE so the forwarder can reach it; --insecure required to bind
     # non-localhost; safe because the only host exposure is the loopback forwarder.
