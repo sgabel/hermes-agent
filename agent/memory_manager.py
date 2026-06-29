@@ -485,6 +485,35 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
+    def take_recall_assist_display(self):
+        """Return & clear the FR-1 ambient-recall display payload (PRD-042).
+
+        Delegates to whichever provider exposes ``take_recall_assist_display``
+        (currently only mem0). Returns the first non-None
+        ``{"query", "hits"}`` payload, or None. Display-only metadata for the
+        glass cockpit — never a memory write. Must be called AFTER
+        ``prefetch_all`` on the same turn (it consumes what prefetch surfaced).
+
+        First-non-None is exact while mem0 is the sole recall-exposing provider;
+        if a second one is ever added, revisit whether to merge their payloads
+        (the turn_context gate keys off the combined ``prefetch_all`` result).
+        """
+        for provider in self._providers:
+            take = getattr(provider, "take_recall_assist_display", None)
+            if not callable(take):
+                continue
+            try:
+                payload = take()
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' recall-assist display failed (non-fatal): %s",
+                    provider.name, e,
+                )
+                continue
+            if payload:
+                return payload
+        return None
+
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn.
 

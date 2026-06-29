@@ -323,6 +323,15 @@ class Mem0MemoryProvider(MemoryProvider):
         # turn has since queued, so a same-turn read never picks up a stale recall
         # result from a prior turn's question.
         self._prefetch_gen = 0
+        # PRD-042: structured display payload for the FR-1 ambient recall assist,
+        # exposed in parallel to the injected string so the glass cockpit can show
+        # what auto-recall retrieved. _recall_assist_display holds the candidate
+        # {query, hits} for the warming turn (under the gen-guard); prefetch()
+        # promotes it to _recall_assist_display_ready ONLY when the recall was
+        # actually injected (survived dedup), so a deduped-away recall persists no
+        # display record. This is display-only metadata — NOT a memory write.
+        self._recall_assist_display = None
+        self._recall_assist_display_ready = None
         self._sync_thread = None
         # Circuit breaker state
         self._consecutive_failures = 0
@@ -507,6 +516,10 @@ class Mem0MemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # PRD-042: a fresh prefetch supersedes any prior turn's un-consumed
+        # display payload — reset the ready slot up front so a stale recall can
+        # never be persisted against the current turn.
+        self._recall_assist_display_ready = None
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         # If the thread still hasn't finished, leave the result for the next call.
@@ -515,6 +528,9 @@ class Mem0MemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+            # PRD-042: pop the structured display candidate alongside the string.
+            display = self._recall_assist_display
+            self._recall_assist_display = None
         if not result:
             return ""
         # Deduplicate against current user message + last assistant response.
@@ -523,7 +539,24 @@ class Mem0MemoryProvider(MemoryProvider):
         filtered = Deduplicator.deduplicate(lines, dedup_context)
         if not filtered:
             return ""
+        # PRD-042: the recall survived dedup and is being injected this turn —
+        # expose the structured payload so the cockpit-visibility sidecar can be
+        # persisted by the agent-side turn code (the plugin never writes state.db).
+        self._recall_assist_display_ready = display
         return "## Mem0 Memory\n" + "\n".join(filtered)
+
+    def take_recall_assist_display(self):
+        """Return & clear the FR-1 ambient-recall display payload (PRD-042).
+
+        Returns ``{"query": str, "hits": [{"date","speaker","data"}, ...]}`` when
+        the most recent ``prefetch()`` actually injected a recall hit this turn,
+        else ``None``. Consumed once per turn by the agent-side persist path
+        (``agent/turn_context.py``), which writes the cockpit-visibility sidecar
+        row. Display-only metadata — this method performs no memory or DB write.
+        """
+        display = self._recall_assist_display_ready
+        self._recall_assist_display_ready = None
+        return display
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # PRD-029 decommission (2026-06-28): prefetch is CHRONICLE-ONLY and no
@@ -564,6 +597,8 @@ class Mem0MemoryProvider(MemoryProvider):
             # The stable_knowledge route stays the PRD-029 no-op either way.
             is_recall = RecallAssistRouter.is_recall_query(query)
             chronicle_results: list[str] = []
+            # PRD-042: structured form of the same hits, for cockpit display only.
+            display_hits: list[dict] = []
 
             try:
                 if is_recall:
@@ -576,6 +611,14 @@ class Mem0MemoryProvider(MemoryProvider):
                         )
                         chronicle_results = [
                             f"[{r['date']} {r['speaker']}] {r['data']}"
+                            for r in results if r.get("data")
+                        ]
+                        display_hits = [
+                            {
+                                "date": r.get("date", ""),
+                                "speaker": r.get("speaker", ""),
+                                "data": r.get("data", ""),
+                            }
                             for r in results if r.get("data")
                         ]
                     except Exception as e:
@@ -595,6 +638,13 @@ class Mem0MemoryProvider(MemoryProvider):
                         # write so the current turn never reads a stale recall.
                         if my_gen == self._prefetch_gen:
                             self._prefetch_result = assembled
+                            # PRD-042: stash the structured display candidate under
+                            # the same gen-guard. prefetch() decides whether it is
+                            # actually surfaced (post-dedup) before persistence.
+                            self._recall_assist_display = {
+                                "query": query,
+                                "hits": display_hits,
+                            }
                 self._record_success()
             except Exception as e:
                 self._record_failure()

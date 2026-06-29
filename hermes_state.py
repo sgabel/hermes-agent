@@ -14,6 +14,7 @@ Key design decisions:
 - Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
 """
 
+import hashlib
 import json
 import logging
 import random
@@ -591,12 +592,31 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- PRD-042: cockpit-visibility sidecar for the PRD-041 FR-1 ambient recall
+-- assist.  DISPLAY-ONLY METADATA, deliberately NOT in the `messages` table:
+-- keeping it out of `messages` means it is structurally invisible to every
+-- agent-facing consumer (context compression, session_search, conversation
+-- replay, on_session_end ingestion) — so it can never leak into the model or
+-- a memory store (AC-004 / no-behavior-change, made structural not filtered).
+-- Read ONLY by the glass cockpit.  dedup_key (session + anchor turn + content
+-- hash) makes the per-turn write idempotent across API retries/tool loops.
+CREATE TABLE IF NOT EXISTS recall_assist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    anchor_turn INTEGER,
+    query TEXT,
+    hits_json TEXT,
+    timestamp REAL NOT NULL,
+    dedup_key TEXT NOT NULL UNIQUE
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_recall_assist_session ON recall_assist(session_id, timestamp);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2594,6 +2614,99 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def append_recall_assist(
+        self,
+        session_id: str,
+        query: str,
+        hits: Any,
+        anchor_turn: Optional[int] = None,
+        timestamp: Any = None,
+    ) -> int:
+        """Append a DISPLAY-ONLY ambient-recall record (PRD-042).
+
+        This is the cockpit-visibility sidecar for the PRD-041 FR-1 ambient
+        recall assist.  It is **not** a message and **not** a memory write: it
+        lives in the dedicated ``recall_assist`` table (never in ``messages``),
+        so it is structurally invisible to every agent-facing consumer
+        (compression, session_search, replay, on_session_end).  The cockpit is
+        the only reader.
+
+        ``hits`` is the structured chronicle payload (a list of
+        ``{"date","speaker","data"}`` dicts) and is stored JSON-encoded.
+        ``anchor_turn`` is the per-session user-turn number (monotonic) the
+        assist fired on; the cockpit orders the record by ``timestamp`` (it
+        lands between the user message and the assistant reply naturally), and
+        ``anchor_turn`` discriminates the dedup key so the same recall question
+        asked on two different turns is not collapsed.
+
+        The write is idempotent per user turn: ``dedup_key`` =
+        ``md5(session_id:anchor_turn:query:hits)``, so an API-call retry, a
+        multi-iteration tool loop, or a fallback re-send that re-enters the turn
+        cannot produce a duplicate record.  Returns the row id, or the existing
+        row id when the record was already persisted.
+        """
+        hits_json = json.dumps(hits, ensure_ascii=False) if hits is not None else None
+        dedup_basis = f"{session_id}:{anchor_turn}:{query or ''}:{hits_json or ''}"
+        dedup_key = hashlib.md5(dedup_basis.encode("utf-8")).hexdigest()
+
+        record_timestamp = time.time()
+        if timestamp is not None:
+            try:
+                if hasattr(timestamp, "timestamp"):
+                    record_timestamp = float(timestamp.timestamp())
+                else:
+                    record_timestamp = float(timestamp)
+            except (TypeError, ValueError):
+                logger.debug("Ignoring invalid recall_assist timestamp: %r", timestamp)
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO recall_assist
+                   (session_id, anchor_turn, query, hits_json, timestamp, dedup_key)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, anchor_turn, query, hits_json, record_timestamp, dedup_key),
+            )
+            if cursor.rowcount:
+                return cursor.lastrowid
+            # Already present (idempotent no-op) — return the existing row id.
+            row = conn.execute(
+                "SELECT id FROM recall_assist WHERE dedup_key = ?", (dedup_key,)
+            ).fetchone()
+            return row[0] if row else -1
+
+        return self._execute_write(_do)
+
+    def get_recall_assist(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return the ambient-recall display records for *session_id* (PRD-042).
+
+        Cockpit-only read path.  Returns rows ordered by timestamp with
+        ``hits`` already JSON-decoded into a list of
+        ``{"date","speaker","data"}`` dicts.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, session_id, anchor_turn, query, hits_json, timestamp
+                   FROM recall_assist WHERE session_id = ? ORDER BY timestamp ASC, id ASC""",
+                (session_id,),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                hits = json.loads(r["hits_json"]) if r["hits_json"] else []
+            except (json.JSONDecodeError, TypeError):
+                hits = []
+            out.append(
+                {
+                    "id": r["id"],
+                    "session_id": r["session_id"],
+                    "anchor_turn": r["anchor_turn"],
+                    "query": r["query"],
+                    "hits": hits,
+                    "timestamp": r["timestamp"],
+                }
+            )
+        return out
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.

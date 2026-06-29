@@ -408,6 +408,35 @@ def build_turn_context(
         except Exception:
             pass
 
+    # PRD-042: persist the FR-1 ambient recall assist for cockpit visibility.
+    # Fires ONCE per user turn (here at the turn boundary, NOT inside the
+    # per-API-call loop in conversation_loop — so retries/tool iterations/
+    # fallback re-sends can't duplicate it; the DB dedup_key is a second guard).
+    # Only when the recall actually injected this turn (ext_prefetch_cache
+    # non-empty AND the assist flag is on). The record is DISPLAY-ONLY metadata
+    # written to the dedicated recall_assist sidecar table — never `messages`,
+    # never a memory store (AC-004 / no-behavior-change). Best-effort: a failure
+    # here must never break the turn.
+    if (ext_prefetch_cache
+            and agent._memory_manager
+            and getattr(agent, "_historical_recall_assist_enabled", False)):
+        try:
+            _display = agent._memory_manager.take_recall_assist_display()
+            if _display and _display.get("hits"):
+                _db = agent._get_session_db_for_recall()
+                if _db is not None and agent.session_id:
+                    _db.append_recall_assist(
+                        agent.session_id,
+                        _display.get("query", ""),
+                        _display.get("hits", []),
+                        anchor_turn=getattr(agent, "_user_turn_count", None),
+                    )
+        except Exception:
+            logger.debug(
+                "PRD-042 recall-assist display persistence failed (non-fatal)",
+                exc_info=True,
+            )
+
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
