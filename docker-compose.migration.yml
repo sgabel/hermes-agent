@@ -80,6 +80,14 @@ services:
       # role detection is broken under s6-overlay), causing duplicate Discord
       # logins + doubled cron/nudge cycles against the shared /opt/data.
       - HERMES_ROLE=dashboard
+      # Cross-container gateway liveness/state: the dashboard runs in a SEPARATE
+      # container, so the shared gateway_state.json PID is meaningless in this
+      # namespace (reported gateway "stopped" even when healthy). Point the
+      # dashboard at the gateway's HTTP health endpoint on the internal net so its
+      # liveness probe-fallback works (web_server.py _probe_gateway_health).
+      # PRD-033 fast-follow. (Restart-from-dashboard still no-ops by design — use
+      # `docker exec hermes hermes gateway restart`.)
+      - GATEWAY_HEALTH_URL=http://hermes:8642
     # Internal-only (no host publish here); host ingress 127.0.0.1:9119 via host-ingress.
     # Bind 0.0.0.0 INSIDE so the forwarder can reach it; --insecure required to bind
     # non-localhost; safe because the only host exposure is the loopback forwarder.
