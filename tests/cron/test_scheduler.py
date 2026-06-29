@@ -1115,8 +1115,18 @@ class TestRunJobSessionPersistence:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert set(kwargs["disabled_toolsets"]) >= {
-            "cronjob", "messaging", "clarify", "terminal", "file",
+            "cronjob", "messaging", "clarify", "memory", "terminal", "file",
         }
+
+    def test_cron_baseline_disables_memory_toolset(self):
+        """PRD-037: the built-in `memory` (MEMORY.md/USER.md) toolset is
+        unusable in cron (skip_file_memory=True -> _memory_store None), so it
+        is in the protected baseline. chronicle_search is unaffected (it comes
+        from the memory provider injection path, not the `memory` toolset)."""
+        from cron.scheduler import _resolve_cron_disabled_toolsets
+
+        baseline = _resolve_cron_disabled_toolsets({})
+        assert set(baseline) == {"cronjob", "messaging", "clarify", "memory"}
 
     def test_run_job_enabled_toolsets_resolves_from_platform_config_when_not_set(self, tmp_path):
         """When a job has no explicit enabled_toolsets, the scheduler now

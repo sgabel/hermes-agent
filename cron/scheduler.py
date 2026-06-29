@@ -115,17 +115,26 @@ class CronPromptInjectionBlocked(Exception):
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Three protected toolsets are always disabled in cron context:
+    Four protected toolsets are always disabled in cron context:
       - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
+      - ``memory`` — the built-in file-memory (MEMORY.md/USER.md) tool. Cron
+        constructs the agent with ``skip_file_memory=True`` so ``_memory_store``
+        is None; the tool is advertised but returns "Memory is not available"
+        if called (PRD-037: cron is memory-write-excluded by design — MEMORY.md/
+        USER.md upkeep belongs to the interactive ``builtin_nudge_interval``
+        review, and episodic capture is the session-boundary chronicle writer,
+        not cron). Disabling it stops a cron agent from wasting a turn on a
+        guaranteed-unavailable tool. ``chronicle_search`` is unaffected — it is
+        injected by the memory *provider* path, not the ``memory`` toolset.
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify"]
+    disabled = ["cronjob", "messaging", "clarify", "memory"]
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
