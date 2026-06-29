@@ -456,8 +456,8 @@ class TestMem0PrefetchDecommission:
         assert chronicle.calls == []
 
     def test_historical_route_hits_chronicle_only(self):
-        """A historical query routes to the chronicle searcher — never the mem0
-        backend."""
+        """A recall query routes to the chronicle searcher — never the mem0
+        backend — and is bounded to top_k=2 (PRD-041 FR-1)."""
         backend = FakeBackend(search_results=[{"id": "x", "memory": "y"}])
         chronicle = FakeChronicle(
             results=[{"date": "2026-01-01", "speaker": "scott", "data": "we discussed X"}]
@@ -470,6 +470,8 @@ class TestMem0PrefetchDecommission:
 
         # Chronicle was searched; the mem0 backend was not.
         assert len(chronicle.calls) == 1
+        # PRD-041 FR-1: bounded to top-2, not the legacy top-5.
+        assert chronicle.calls[0][1] == 2
         assert not any(c[0] == "search" for c in backend.captured)
 
     def test_prefetch_noop_without_chronicle(self):
@@ -481,6 +483,135 @@ class TestMem0PrefetchDecommission:
         if provider._prefetch_thread:
             provider._prefetch_thread.join(timeout=5.0)
         assert not any(c[0] == "search" for c in backend.captured)
+
+
+class TestRecallAssistOnTurnStart:
+    """PRD-041 FR-1 (D4): same-turn warming via on_turn_start, bounded injection."""
+
+    def _make_provider(self, chronicle):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session")
+        provider._user_id = "u123"
+        provider._agent_id = "hermes"
+        provider._backend = FakeBackend()
+        provider._chronicle = chronicle
+        provider._had_tool_calls = False
+        return provider
+
+    def test_on_turn_start_warms_same_turn(self):
+        """on_turn_start fires queue_prefetch with the CURRENT message so the
+        same-turn prefetch() read injects the recall hit (AC-001). Without this
+        override the warm would land one turn late."""
+        chronicle = FakeChronicle(
+            results=[{"date": "2026-06-12", "speaker": "sylva",
+                      "data": "I guessed Scott was 37; he is older."}]
+        )
+        provider = self._make_provider(chronicle)
+
+        provider.on_turn_start(1, "do you remember when you guessed my age?")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+
+        # The current-turn recall question warmed the chronicle (top-2).
+        assert len(chronicle.calls) == 1
+        assert chronicle.calls[0][1] == 2
+        injected = provider.prefetch("do you remember when you guessed my age?")
+        assert "guessed" in injected
+
+    def test_on_turn_start_noop_on_non_recall(self):
+        """A non-recall message warms nothing — precision holds (AC-002)."""
+        chronicle = FakeChronicle(
+            results=[{"date": "2026-06-12", "speaker": "scott", "data": "x"}]
+        )
+        provider = self._make_provider(chronicle)
+        provider.on_turn_start(1, "write me a function to parse CSV")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        assert chronicle.calls == []
+
+    def test_supersede_clears_stale_result(self):
+        """A newer queue_prefetch bumps the generation and clears any prior
+        result, so a stale recall hit can't survive into a later turn."""
+        chronicle = FakeChronicle(
+            results=[{"date": "2026-06-01", "speaker": "scott", "data": "old hit"}]
+        )
+        provider = self._make_provider(chronicle)
+        # Turn 1: a recall query populates the result.
+        provider.queue_prefetch("remember when we set up the cron jobs?")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        assert provider._prefetch_result  # warmed
+        # Turn 2: a non-recall query supersedes — bump+clear, no new write.
+        provider.queue_prefetch("write me a function")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        assert provider._prefetch_result == ""  # stale recall cleared
+
+    def test_recall_assist_char_cap(self):
+        """The injection is bounded well below the legacy 8000-char budget."""
+        big = "x" * 4000
+        chronicle = FakeChronicle(results=[
+            {"date": "2026-06-01", "speaker": "scott", "data": big},
+            {"date": "2026-06-02", "speaker": "sylva", "data": big},
+        ])
+        provider = self._make_provider(chronicle)
+        provider.queue_prefetch("remember when we discussed the budget?")
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        injected = provider.prefetch("remember when we discussed the budget?")
+        # ~1200-char cap (+ small header/labels) — far below 8000.
+        assert len(injected) < 2000
+
+
+class TestRecallAssistRouter:
+    """PRD-041 FR-1 (D2): precision-first recall classifier."""
+
+    POSITIVE = [
+        "do you remember when you first tried to guess my age?",
+        "remember when we set up the cron jobs?",
+        "earlier you said the pin was 64000, right?",   # weak cue + anchor
+        "when did we decide to use Qdrant?",
+        "last time we talked about the dashboard",
+        "what was in our last conversation?",
+        "can you check the chronicle for that?",
+        "remind me what we decided about the proxy",
+        "have we discussed the egress allowlist before?",
+        "back when we first met, what did I say?",
+    ]
+
+    NEGATIVE = [
+        "write me a function",
+        "hey",
+        "show me the git history",
+        "before you edit the file, run tests",
+        "remember to run the formatter",
+        "what happened in June for federal grants?",
+        "what is my favorite programming language",
+        "earlier today the build failed",     # anchor alone, no recall cue
+        "previously this was broken",
+        "go ahead",
+        # review NEEDS-FIX 1: "do you remember TO …" is a task reminder.
+        "do you remember to lock the door",
+        "did you remember to save the file?",
+        # review NEEDS-FIX 2: unanchored second-person refers to THIS session.
+        "you wrote this function wrong",
+        "you said to use a dict here",
+        "you called it with bad args",
+    ]
+
+    def test_positives(self):
+        from plugins.memory.mem0.orchestrator import RecallAssistRouter
+        for m in self.POSITIVE:
+            assert RecallAssistRouter.is_recall_query(m), f"should match: {m!r}"
+
+    def test_negatives(self):
+        from plugins.memory.mem0.orchestrator import RecallAssistRouter
+        for m in self.NEGATIVE:
+            assert not RecallAssistRouter.is_recall_query(m), f"should NOT match: {m!r}"
+
+    def test_empty(self):
+        from plugins.memory.mem0.orchestrator import RecallAssistRouter
+        assert RecallAssistRouter.is_recall_query("") is False
 
 
 class TestMem0ChronicleSearchAdvertised:

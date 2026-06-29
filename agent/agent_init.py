@@ -1170,6 +1170,15 @@ def init_agent(
     # Default True preserves prior behavior. Write-side governance is AC-017
     # (nudge off) + the fork's already-disabled per-turn sync, not this flag.
     agent._ambient_prefetch_enabled = bool(mem_config.get("ambient_prefetch_enabled", True))
+    # PRD-041 FR-1: the bounded HISTORICAL-RECALL assist. Distinct from (and
+    # additive to) ambient_prefetch_enabled — that PRD-029 lever stays OFF; this
+    # one re-opens the read path ONLY for explicit recall questions (mem0's
+    # RecallAssistRouter + on_turn_start same-turn warm). The two gate sites in
+    # turn_context (on_turn_start + prefetch_all) fire when EITHER flag is set.
+    # Code default False (off unless config opts in); config.yaml sets it true.
+    agent._historical_recall_assist_enabled = bool(
+        mem_config.get("historical_recall_assist_enabled", False)
+    )
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None

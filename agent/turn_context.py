@@ -382,9 +382,14 @@ def build_turn_context(
     # ambient_prefetch_enabled is false — this gates on_turn_start (which queues
     # the background prefetch) and prefetch_all (the injection) without touching
     # the passive WRITE/lifecycle hooks that _memory_passive_enabled also covers.
+    # PRD-041 FR-1: also fire when the historical-recall assist is enabled — mem0's
+    # on_turn_start override warms the chronicle for the CURRENT turn so the read
+    # below injects it same-turn (AC-001). ambient_prefetch_enabled stays the
+    # separate PRD-029 lever; EITHER flag opens the read path.
     if (agent._memory_manager
             and getattr(agent, "_memory_passive_enabled", True)
-            and getattr(agent, "_ambient_prefetch_enabled", True)):
+            and (getattr(agent, "_ambient_prefetch_enabled", True)
+                 or getattr(agent, "_historical_recall_assist_enabled", False))):
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -395,7 +400,8 @@ def build_turn_context(
     ext_prefetch_cache = ""
     if (agent._memory_manager
             and getattr(agent, "_memory_passive_enabled", True)
-            and getattr(agent, "_ambient_prefetch_enabled", True)):
+            and (getattr(agent, "_ambient_prefetch_enabled", True)
+                 or getattr(agent, "_historical_recall_assist_enabled", False))):
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""

@@ -65,9 +65,16 @@ from .orchestrator import (
     Deduplicator,
     IntentGate,
     QueryModeRouter,
+    RecallAssistRouter,
 )
 
 logger = logging.getLogger(__name__)
+
+# PRD-041 FR-1: the bounded historical-recall assist injects at most this many
+# chronicle entries, within this char cap. Deliberately tiny vs the legacy
+# ContextBudget.MAX_CHARS (8000) — a same-turn top-2 nudge, not a context dump.
+_RECALL_ASSIST_TOP_K = 2
+_RECALL_ASSIST_MAX_CHARS = 1200
 
 # Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
@@ -311,6 +318,11 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
+        # PRD-041 FR-1: monotonic generation guard. Each queue_prefetch bumps it;
+        # a slow/orphaned worker from an earlier turn discards its write if a newer
+        # turn has since queued, so a same-turn read never picks up a stale recall
+        # result from a prior turn's question.
+        self._prefetch_gen = 0
         self._sync_thread = None
         # Circuit breaker state
         self._consecutive_failures = 0
@@ -514,16 +526,30 @@ class Mem0MemoryProvider(MemoryProvider):
         return "## Mem0 Memory\n" + "\n".join(filtered)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        # PRD-029 decommission (2026-06-28): prefetch is now CHRONICLE-ONLY and no
+        # PRD-029 decommission (2026-06-28): prefetch is CHRONICLE-ONLY and no
         # longer depends on the mem0 backend. The old "stable_knowledge" route
         # searched the retired sylva_memories store on EVERY non-trivial turn;
         # adversarial review confirmed that repointing it at the chronicle would
         # inject raw journal fragments into nearly every turn. Curated identity
-        # comes from the canon self-brief at session start, so the stable route is
-        # intentionally a no-op. The historical_memory route still warms the
-        # chronicle; on-demand recall is the chronicle_search tool.
+        # comes from the canon self-brief at session start, so the non-recall
+        # route is intentionally a no-op.
+        #
+        # PRD-041 FR-1 (2026-06-29): re-enabled ONLY for explicit recall questions
+        # about the shared past, via RecallAssistRouter (a precision-first
+        # classifier, NOT QueryModeRouter). Bounded to top-2 + a small char cap.
+        # Same-turn warming is driven by on_turn_start (below) so the result is
+        # available on the turn the question is asked (AC-001), gated at the agent
+        # level by memory.historical_recall_assist_enabled. Writes never happen
+        # here (sync_turn stays a no-op).
         if self._chronicle is None:
             return
+
+        # Claim a generation for this warm and clear any stale leftover so a slow
+        # orphaned worker from an earlier turn can't be read on the current turn.
+        with self._prefetch_lock:
+            self._prefetch_gen += 1
+            my_gen = self._prefetch_gen
+            self._prefetch_result = ""
 
         def _run():
             # Intent gate — skip retrieval for social/confirmation messages.
@@ -531,29 +557,44 @@ class Mem0MemoryProvider(MemoryProvider):
                 logger.debug("Mem0 prefetch skipped by intent gate: %r", query[:60])
                 return
 
-            mode = QueryModeRouter.classify(query)
+            # PRD-041 FR-1 (D2): the assist fires only on an explicit recall
+            # question about the shared past — a precision-first classifier, NOT
+            # the broad QueryModeRouter.historical_memory signal (which false-
+            # positives on "git history" / "before you edit" / "remember to…").
+            # The stable_knowledge route stays the PRD-029 no-op either way.
+            is_recall = RecallAssistRouter.is_recall_query(query)
             chronicle_results: list[str] = []
 
             try:
-                if mode == "historical_memory":
+                if is_recall:
                     # Route to the chronicle collection (direct Qdrant + TEI).
+                    # top_k=2 + a small char cap keep this a bounded same-turn
+                    # nudge, never an every-turn context dump.
                     try:
-                        results = self._chronicle.search(query, top_k=5)
+                        results = self._chronicle.search(
+                            query, top_k=_RECALL_ASSIST_TOP_K
+                        )
                         chronicle_results = [
                             f"[{r['date']} {r['speaker']}] {r['data']}"
                             for r in results if r.get("data")
                         ]
                     except Exception as e:
                         logger.debug("Chronicle prefetch failed: %s", e)
-                # stable_knowledge route: intentional no-op (see method docstring).
+                # non-recall route: intentional no-op (see method docstring).
 
-                # Assemble within budget. facts is always empty post-decommission.
+                # Assemble within the small recall-assist budget. facts is always
+                # empty post-decommission.
                 assembled = ContextBudget.assemble(
                     facts=[], chronicle=chronicle_results,
+                    max_chars=_RECALL_ASSIST_MAX_CHARS,
                 )
                 if assembled:
                     with self._prefetch_lock:
-                        self._prefetch_result = assembled
+                        # Only the latest queued warm may publish — a slow worker
+                        # from an earlier turn (superseded since) discards its
+                        # write so the current turn never reads a stale recall.
+                        if my_gen == self._prefetch_gen:
+                            self._prefetch_result = assembled
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -561,6 +602,29 @@ class Mem0MemoryProvider(MemoryProvider):
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="mem0-prefetch")
         self._prefetch_thread.start()
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """Warm the recall assist for the CURRENT turn (PRD-041 FR-1, D4).
+
+        The base provider's ``on_turn_start`` is a no-op and the post-turn
+        ``queue_prefetch_all`` warms for the *next* turn — so a gate-only change
+        would inject one turn late and silently fail AC-001 (the recall question
+        is answered before its own chronicle hit lands). Overriding here re-queues
+        the prefetch with the current turn's message at turn start; the same-turn
+        ``prefetch_all`` read (agent/turn_context.py) then joins this thread and
+        injects the result on the turn the question is asked.
+
+        Cheap on non-recall turns: ``queue_prefetch`` runs only the IntentGate +
+        RecallAssistRouter regexes on a daemon thread — no Qdrant/TEI I/O unless
+        the message is an explicit recall query. Agent-level gating
+        (``_historical_recall_assist_enabled``) decides whether this is called.
+        """
+        if self._chronicle is None:
+            return
+        try:
+            self.queue_prefetch(message, session_id=kwargs.get("session_id", "") or "")
+        except Exception as e:
+            logger.debug("Mem0 on_turn_start prefetch warm failed: %s", e)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Cache turn state for orchestration but skip per-turn fact extraction.
