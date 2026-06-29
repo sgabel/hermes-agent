@@ -32,14 +32,26 @@ logger = logging.getLogger(__name__)
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
 _MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
-    "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "Review the conversation above and update the built-in memory files ONLY if "
+    "something durable emerged. Two files, two distinct purposes:\n\n"
+    "• USER.md (target='user') — WHO THE USER IS. Durable facts and preferences about "
+    "the user. It has labeled sections; put each addition under the right one:\n"
+    "    '## Factual' — identity, role, family, interests.\n"
+    "    '## Behavioural' — how he works and how he wants you to engage him.\n"
+    "    '## Directives' — standing operating rules (e.g. 'no pip without permission').\n"
+    "• MEMORY.md (target='memory') — the current STATE OF YOUR OPERATIONS (projects, "
+    "paths, system topology). NOT facts about the user.\n\n"
+    "Rules:\n"
+    "1. Save a durable USER fact only when the user genuinely revealed something new and "
+    "lasting about themselves. Episodic/dated events, one-off task narratives, and test "
+    "prompts ('remember this number') are NOT durable — leave them out.\n"
+    "2. PRESERVE the '## Directives' section. Do NOT invent, reword, reorder, or 'tidy' "
+    "standing rules on your own — directives are human-curated. Touch '## Directives' ONLY "
+    "if the user EXPLICITLY stated a new standing rule this session; otherwise leave that "
+    "section exactly as-is.\n"
+    "3. Do NOT save security rules (credentials, 'never git push') — those are enforced by "
+    "the system, not by a memory note.\n\n"
+    "If nothing durable emerged, just say 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -149,10 +161,14 @@ _SKILL_REVIEW_PROMPT = (
 
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
-    "**Memory**: who the user is. Did the user reveal persona, "
-    "desires, preferences, personal details, or expectations about "
-    "how you should behave? Save facts about the user and durable "
-    "preferences with the memory tool.\n\n"
+    "**Memory**: who the user is. Save a durable fact only if the user genuinely "
+    "revealed something new and lasting about themselves. USER.md (target='user') "
+    "holds it under labeled sections — '## Factual' (identity/role/family/interests), "
+    "'## Behavioural' (how he works / wants you to engage), '## Directives' (standing "
+    "operating rules); MEMORY.md (target='memory') is the state of YOUR operations, not "
+    "user facts. PRESERVE the '## Directives' section — do NOT invent or reword standing "
+    "rules; touch it only if the user explicitly stated a new one. Skip episodic/one-off "
+    "details and security rules (credentials, never-push — those are enforced elsewhere).\n\n"
     "**Skills**: how to do this class of task. Be ACTIVE — most "
     "sessions produce at least one skill update. A pass that does "
     "nothing is a missed learning opportunity, not a neutral outcome.\n\n"

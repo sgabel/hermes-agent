@@ -161,6 +161,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # ── Seam between 1st-person canon identity and 2nd-person operating
+    # guidance (PRD-039 FR-2).  SOUL.md already opens with ``# Sylva`` and ends
+    # with ``## Coding orchestration`` (a canon sub-header), so without a seam
+    # the Hermes guidance below reads as if it were still part of the identity
+    # block — the "identity nested under a coding header" artifact.  This single
+    # H1 marks the register shift (identity → instructions addressed TO Sylva)
+    # and gives the cockpit a stable anchor to collapse the built-in guidance
+    # under.  Assembly-site only: SOUL.md and the assembled brief are untouched.
+    stable_parts.append("# Operating guidance (Hermes built-in)")
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
