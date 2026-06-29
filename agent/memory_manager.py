@@ -38,6 +38,20 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+def _on_session_end_accepts_final(fn: Any) -> bool:
+    """True if ``fn`` (a provider's on_session_end) accepts the PRD-037 ``final``
+    keyword — either named explicitly or via ``**kwargs``. Lets the manager
+    forward ``final`` to new-style providers while calling legacy
+    ``(self, messages)`` overrides unchanged (no per-provider edits needed)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "final" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
 # How long shutdown_all() waits for in-flight background sync/prefetch work
 # to drain before abandoning it. A wedged provider must never block process
 # teardown indefinitely — the worker threads are daemon, so anything still
@@ -715,11 +729,22 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Notify all providers of session end."""
+    def on_session_end(self, messages: List[Dict[str, Any]], *, final: bool = True) -> None:
+        """Notify all providers of session end.
+
+        ``final`` (PRD-037) marks a TRUE logical-session boundary (CLI exit /
+        gateway-or-TUI close / ``/new`` / ``/reset`` / ``/clear``) vs a mid-
+        conversation rotation (``final=False`` — context compaction /
+        ``/compress``, same conversation continues). It is forwarded only to
+        provider overrides that accept it (via signature introspection), so
+        providers still on the legacy ``(self, messages)`` signature keep
+        working unchanged."""
         for provider in self._providers:
             try:
-                provider.on_session_end(messages)
+                if _on_session_end_accepts_final(provider.on_session_end):
+                    provider.on_session_end(messages, final=final)
+                else:
+                    provider.on_session_end(messages)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' on_session_end failed: %s",

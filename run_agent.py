@@ -3064,16 +3064,24 @@ class AIAgent:
             except Exception:
                 pass
 
-    def commit_memory_session(self, messages: list = None) -> None:
+    def commit_memory_session(self, messages: list = None, *, final: bool = True) -> None:
         """Trigger end-of-session extraction without tearing providers down.
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
-        session_id — they just flush pending extraction now."""
+        session_id — they just flush pending extraction now.
+
+        ``final`` (PRD-037) marks whether this rotation is a TRUE logical-session
+        boundary (``/new`` / ``/reset`` / ``/clear`` / TUI close → ``final=True``,
+        the default) or a mid-conversation compaction (``/compress`` / automatic
+        → ``final=False``). It is forwarded to the memory manager so once-per-
+        session episodic writers (mem0 chronicle ingest) fire on real boundaries
+        but NOT on every compaction. The compacted-away turns are retained in
+        ``state.db`` (FTS-searchable) regardless."""
         # PRD-022: end-of-session extraction is passive memory; suppress when
         # passive memory is off (cron). No-op-safe for mem0.
         if self._memory_manager and getattr(self, "_memory_passive_enabled", True):
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(messages or [], final=final)
             except Exception:
                 pass
         # Notify context engine of session end too — same lifecycle moment as
@@ -3150,10 +3158,15 @@ class AIAgent:
                 response_text,
                 **sync_kwargs,
             )
-            self._memory_manager.queue_prefetch_all(
-                user_text,
-                session_id=self.session_id or "",
-            )
+            # FR-4 (PRD-037): skip the prefetch warmup when ambient prefetch is
+            # off — the result is never consumed (turn_context's read sites gate
+            # on the same flag), so warming it is wasted background work. Mirrors
+            # the on_turn_start gating at agent/turn_context.py:387.
+            if getattr(self, "_ambient_prefetch_enabled", True):
+                self._memory_manager.queue_prefetch_all(
+                    user_text,
+                    session_id=self.session_id or "",
+                )
         except Exception:
             pass
 

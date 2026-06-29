@@ -447,6 +447,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    allowed_toolsets: Optional[List[str]] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -600,10 +601,19 @@ def _run_review_in_thread(
                 clear_thread_tool_whitelist,
             )
 
+            # PRD-037 FR-3: scope the runtime tool whitelist to the toolsets the
+            # FIRED triggers actually need. A memory-only upkeep review
+            # (builtin_nudge_interval) gets ["memory"] → skills/skill_manage and
+            # everything else are denied at dispatch (AC-007); a skills-only
+            # review gets ["skills"]; a combined review gets both. Falls back to
+            # both when the caller doesn't specify (back-compat). This narrows
+            # only the runtime whitelist, NOT the request tools[] (built above
+            # from the parent's config for prefix-cache parity).
+            _review_toolsets = allowed_toolsets or ["memory", "skills"]
             review_whitelist = {
                 t["function"]["name"]
                 for t in get_tool_definitions(
-                    enabled_toolsets=["memory", "skills"],
+                    enabled_toolsets=_review_toolsets,
                     quiet_mode=True,
                 )
             }
@@ -719,15 +729,21 @@ def spawn_background_review_thread(
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
     # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).
+    # PRD-037 FR-3: derive the allowed toolsets from the fired triggers so the
+    # review fork's runtime whitelist matches its purpose (memory-only upkeep
+    # cannot reach into skills/skill_manage, and vice-versa).
     if review_memory and review_skills:
         prompt = getattr(agent, "_COMBINED_REVIEW_PROMPT", _COMBINED_REVIEW_PROMPT)
+        allowed_toolsets = ["memory", "skills"]
     elif review_memory:
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
+        allowed_toolsets = ["memory"]
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
+        allowed_toolsets = ["skills"]
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, messages_snapshot, prompt, allowed_toolsets)
 
     return _target, prompt
 

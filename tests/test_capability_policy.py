@@ -125,10 +125,15 @@ def test_memory_writes_are_t2(cp):
     assert cp.classify("memory") == cp.Tier.T2
 
 
-def test_mem0_reads_are_t0(cp):
-    # PRD-029 (mem0 v3 port): mem0_profile was renamed to mem0_list.
-    assert cp.classify("mem0_search") == cp.Tier.T0
-    assert cp.classify("mem0_list") == cp.Tier.T0
+def test_mem0_reads_removed_from_t0(cp):
+    # PRD-037 FR-4 / AC-008: the mem0_* read tools (mem0_search/mem0_list) were
+    # retired in the PRD-029 decommission — the provider advertises only
+    # chronicle_search now. Their stale T0 entries were removed, so they fall
+    # through to default-deny T4 (a removed tool must never stay allow-broadly).
+    assert cp.classify("mem0_search") == cp.Tier.T4
+    assert cp.classify("mem0_list") == cp.Tier.T4
+    # chronicle_search — the live recall tool — remains the T0 read.
+    assert cp.classify("chronicle_search") == cp.Tier.T0
 
 
 def test_mem0_writes_are_t4(cp):

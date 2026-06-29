@@ -525,7 +525,12 @@ def compress_context(
             # transcript is rewritten (runs in BOTH modes — the logical
             # conversation's pre-compaction turns are about to be summarized
             # away regardless of whether the id rotates).
-            agent.commit_memory_session(messages)
+            # PRD-037: final=False — this is a mid-conversation compaction, NOT a
+            # true session boundary. Per-boundary extractors (Honcho) still run;
+            # the once-per-session chronicle episodic writer (mem0) defers to the
+            # real end so it doesn't write overlapping near-dup summaries on the
+            # turn's hot path. Compacted turns stay FTS-searchable in state.db.
+            agent.commit_memory_session(messages, final=False)
 
             if in_place:
                 # ── In-place compaction: keep the same session_id ──────────

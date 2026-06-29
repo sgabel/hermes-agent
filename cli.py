@@ -6244,7 +6244,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
             # Trigger memory extraction on the old session before session_id rotates.
-            self.agent.commit_memory_session(self.conversation_history)
+            # PRD-037: final=True — /new, /reset, /clear are TRUE session
+            # boundaries, so the chronicle episodic writer captures this session
+            # before we start fresh (the next session can then recall it).
+            self.agent.commit_memory_session(self.conversation_history, final=True)
             self._notify_session_boundary("on_session_finalize")
         elif self.agent:
             # First session or empty history — still finalize the old session

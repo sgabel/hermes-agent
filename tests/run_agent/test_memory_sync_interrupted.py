@@ -91,6 +91,34 @@ class TestSyncExternalMemoryForTurn:
             session_id="test_session_001",
         )
 
+    # --- FR-4 (PRD-037): warmup gated on ambient prefetch ---------------
+
+    def test_warmup_skipped_when_ambient_prefetch_disabled(self):
+        """PRD-037 FR-4 / AC-008: when memory.ambient_prefetch_enabled is
+        false, the post-turn ``queue_prefetch_all`` warmup must NOT run — its
+        result is never consumed (the read sites gate on the same flag), so
+        warming it is wasted background work. ``sync_all`` still runs."""
+        agent = _bare_agent()
+        agent._ambient_prefetch_enabled = False
+        agent._sync_external_memory_for_turn(
+            original_user_message="What's the weather in Paris?",
+            final_response="It's sunny and 22°C.",
+            interrupted=False,
+        )
+        agent._memory_manager.sync_all.assert_called_once()
+        agent._memory_manager.queue_prefetch_all.assert_not_called()
+
+    def test_warmup_runs_when_ambient_prefetch_enabled(self):
+        """Positive path: with the flag on, the warmup still fires."""
+        agent = _bare_agent()
+        agent._ambient_prefetch_enabled = True
+        agent._sync_external_memory_for_turn(
+            original_user_message="What's the weather in Paris?",
+            final_response="It's sunny and 22°C.",
+            interrupted=False,
+        )
+        agent._memory_manager.queue_prefetch_all.assert_called_once()
+
     def test_completed_turn_syncs_messages_when_present(self):
         agent = _bare_agent()
         messages = [

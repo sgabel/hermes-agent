@@ -40,7 +40,7 @@ def test_commit_memory_session_notifies_context_engine():
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     agent.commit_memory_session(msgs)
 
-    mm.on_session_end.assert_called_once_with(msgs)
+    mm.on_session_end.assert_called_once_with(msgs, final=True)
     ctx.on_session_end.assert_called_once_with("sess-42", msgs)
 
 
@@ -52,7 +52,7 @@ def test_commit_memory_session_with_no_messages_passes_empty_list():
 
     agent.commit_memory_session(None)
 
-    mm.on_session_end.assert_called_once_with([])
+    mm.on_session_end.assert_called_once_with([], final=True)
     ctx.on_session_end.assert_called_once_with("sess-7", [])
 
 
@@ -73,7 +73,7 @@ def test_commit_memory_session_no_context_engine_still_notifies_memory_manager()
 
     agent.commit_memory_session([{"role": "user", "content": "x"}])
 
-    mm.on_session_end.assert_called_once_with([{"role": "user", "content": "x"}])
+    mm.on_session_end.assert_called_once_with([{"role": "user", "content": "x"}], final=True)
 
 
 def test_commit_memory_session_tolerates_memory_manager_failure():

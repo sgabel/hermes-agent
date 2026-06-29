@@ -58,7 +58,10 @@ _T0_TOOLS = frozenset({
     "read_file", "read_many_files", "list_directory", "list_dir", "glob",
     "grep", "search_file_content", "ripgrep", "find_files", "search_files",
     "session_search", "chronicle_search", "todo", "read_terminal", "clarify",
-    "get_diff", "git_status", "mem0_search", "mem0_list",
+    "get_diff", "git_status",
+    # mem0_search/mem0_list removed (PRD-037 FR-4): the mem0 provider no longer
+    # advertises them post-PRD-029 decommission — chronicle_search is the sole
+    # recall tool. Dead T0 entries would only mislead a future reader.
     "skills_list", "skill_view", "kanban_show", "kanban_list",
 })
 

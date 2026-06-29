@@ -163,7 +163,7 @@ class MemoryProvider(ABC):
         Providers use what they need; extras are ignored.
         """
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, messages: List[Dict[str, Any]], *, final: bool = True) -> None:
         """Called when a session ends (explicit exit or timeout).
 
         Use for end-of-session fact extraction, summarization, etc.
@@ -171,6 +171,16 @@ class MemoryProvider(ABC):
 
         NOT called after every turn — only at actual session boundaries
         (CLI exit, /reset, gateway session expiry).
+
+        ``final`` (PRD-037) distinguishes a TRUE logical-session boundary
+        (``final=True`` — CLI exit / gateway-or-TUI close / ``/new`` / ``/reset``
+        / ``/clear``) from a mid-conversation rotation (``final=False`` —
+        automatic compaction / ``/compress``, where the same conversation
+        continues). Providers that write a once-per-session episodic record
+        should skip when ``final=False``; providers that extract on every
+        boundary may ignore it. Defaults True for backward compatibility.
+        Overrides that don't accept it are still called with the legacy
+        signature by ``MemoryManager`` (see its forwarding logic).
         """
 
     def on_session_switch(

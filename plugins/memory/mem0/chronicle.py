@@ -29,9 +29,53 @@ class ChronicleSearcher:
         tei_url: str = _DEFAULT_TEI_URL,
         collection: str = _DEFAULT_COLLECTION,
     ):
+        # Host fallback (FR-2, mirrors CanonStore.from_config at
+        # plugins/memory/canon/store.py:92): mem0.json carries *container* DNS
+        # (``http://qdrant:6333`` / ``http://tei-bge-m3:80``) which is
+        # unreachable from a host process (tests, host-side cockpit/voice). A
+        # configured URL that does not answer is transparently swapped for the
+        # localhost default so the one code path — search AND on_session_end
+        # writes — works both in-container and on the host without env juggling.
+        qdrant_url, tei_url = self._resolve_endpoints(qdrant_url, tei_url)
         self._qdrant_url = qdrant_url.rstrip("/")
         self._tei_url = tei_url.rstrip("/")
         self._collection = collection
+
+    @staticmethod
+    def _reachable(qdrant_url: str) -> bool:
+        try:
+            return requests.get(
+                f"{qdrant_url.rstrip('/')}/collections", timeout=2
+            ).status_code == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def _tei_reachable(tei_url: str) -> bool:
+        try:
+            return requests.get(
+                f"{tei_url.rstrip('/')}/info", timeout=2
+            ).status_code == 200
+        except Exception:
+            return False
+
+    @classmethod
+    def _resolve_endpoints(cls, qdrant_url: str, tei_url: str) -> tuple[str, str]:
+        """Resolve each endpoint INDEPENDENTLY: a configured (container-DNS) URL
+        that doesn't answer from this process falls back to its localhost
+        default. Probing them separately (vs CanonStore's single-Qdrant-probe-
+        swaps-both) covers the case where Qdrant is reachable but TEI is still a
+        container URL — otherwise embeds would fail while search/scroll worked.
+        The localhost default is left untouched (skip the probe)."""
+        q = qdrant_url or _DEFAULT_QDRANT_URL
+        t = tei_url or _DEFAULT_TEI_URL
+        if q != _DEFAULT_QDRANT_URL and not cls._reachable(q):
+            logger.debug("Chronicle Qdrant %s unreachable; falling back to %s", q, _DEFAULT_QDRANT_URL)
+            q = _DEFAULT_QDRANT_URL
+        if t != _DEFAULT_TEI_URL and not cls._tei_reachable(t):
+            logger.debug("Chronicle TEI %s unreachable; falling back to %s", t, _DEFAULT_TEI_URL)
+            t = _DEFAULT_TEI_URL
+        return q, t
 
     def embed(self, text: str) -> List[float]:
         """Get embedding from TEI (bge-m3, 1024-dim)."""

@@ -1923,6 +1923,14 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
+        # PRD-037 FR-3: turn cadence for the BUILT-IN MEMORY.md/USER.md upkeep
+        # review only — DISTINCT from the legacy ``nudge_interval`` (which gates
+        # the broader mem0/skills background review and stays 0 post-PRD-029).
+        # When >0 the background review fires every N user turns scoped to the
+        # ``memory`` toolset only (no skills, no external-provider writes), so
+        # built-in memory self-refreshes without re-enabling the old ambient/
+        # autosave posture. Falls back to ``nudge_interval`` when unset.
+        "builtin_nudge_interval": 10,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # PRD-029: token budget for the assembled identity self-brief

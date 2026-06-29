@@ -1182,7 +1182,18 @@ def init_agent(
         try:
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
-            agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            # PRD-037 FR-3: the built-in MEMORY.md/USER.md upkeep cadence is the
+            # dedicated ``builtin_nudge_interval``, falling back to the legacy
+            # ``nudge_interval`` when unset. This lets upkeep stay on (e.g. 10)
+            # while ``nudge_interval`` stays 0 (the broad mem0/skills review the
+            # PRD-029 decommission disabled). The fired-trigger toolset scoping
+            # in background_review keeps this review memory-only.
+            agent._memory_nudge_interval = int(
+                mem_config.get(
+                    "builtin_nudge_interval",
+                    mem_config.get("nudge_interval", 10),
+                )
+            )
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(

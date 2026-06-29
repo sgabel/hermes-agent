@@ -85,14 +85,9 @@ def test_background_review_matches_parent_toolset_config():
     )
 
 
-def test_background_review_installs_thread_local_whitelist():
-    """The review fork must install a memory/skills-only thread-local whitelist.
-
-    The schema-level toolset narrowing was lifted (for prefix-cache parity),
-    so #15204's safety contract now relies on the runtime whitelist gate to
-    deny terminal/send_message/delegate_task at dispatch time. Verify the
-    whitelist is set with exactly the memory+skills tool names.
-    """
+def _capture_review_whitelist(agent_cls, *, review_memory, review_skills):
+    """Run _spawn_background_review with init stubbed, capturing the installed
+    thread-local whitelist (the runtime dispatch gate)."""
     import run_agent
     from hermes_cli import plugins as _plugins
 
@@ -100,15 +95,11 @@ def test_background_review_installs_thread_local_whitelist():
 
     def _capture_whitelist(whitelist, deny_msg_fmt=None):
         captured["whitelist"] = set(whitelist)
-        captured["deny_msg_fmt"] = deny_msg_fmt
-        # Stop here — we just want to see what gets installed.
         raise RuntimeError("stop after capturing whitelist")
 
-    agent = _make_agent_stub(run_agent.AIAgent)
+    agent = _make_agent_stub(agent_cls)
 
     def _no_init(self, *args, **kwargs):
-        # Don't crash AIAgent.__init__; let execution flow reach
-        # set_thread_tool_whitelist.
         return None
 
     with patch.object(run_agent.AIAgent, "__init__", _no_init), \
@@ -116,23 +107,60 @@ def test_background_review_installs_thread_local_whitelist():
          patch("threading.Thread", _SyncThread):
         agent._spawn_background_review(
             messages_snapshot=[],
-            review_memory=True,
-            review_skills=False,
+            review_memory=review_memory,
+            review_skills=review_skills,
         )
-
     assert "whitelist" in captured, "set_thread_tool_whitelist was not called"
-    whitelist = captured["whitelist"]
-    # memory + skills tools must be allowed
+    return captured["whitelist"]
+
+
+def test_memory_only_review_whitelist_denies_skills_and_mem0():
+    """PRD-037 FR-3 / AC-007: a memory-only upkeep review (builtin_nudge_interval
+    trigger) must whitelist ONLY the memory tool — skill_manage/skills and any
+    mem0 write/recall tool are denied at dispatch. This is the guarantee that
+    re-enabling MEMORY.md/USER.md upkeep does not reopen a skills or external-
+    provider write path."""
+    import run_agent
+
+    whitelist = _capture_review_whitelist(
+        run_agent.AIAgent, review_memory=True, review_skills=False
+    )
+    assert "memory" in whitelist
+    # skills are NOT in a memory-only review.
+    assert "skill_manage" not in whitelist
+    assert "skill_view" not in whitelist
+    assert "skills_list" not in whitelist
+    # no mem0 writes (the provider only advertises chronicle_search anyway).
+    assert "mem0_add" not in whitelist
+    assert "mem0_update" not in whitelist
+    assert "mem0_delete" not in whitelist
+    # dangerous tools never appear.
+    for t in ("terminal", "send_message", "delegate_task", "web_search", "execute_code"):
+        assert t not in whitelist
+
+
+def test_skills_only_review_whitelist_denies_memory():
+    """A skills-only review gets the skills toolset, not memory."""
+    import run_agent
+
+    whitelist = _capture_review_whitelist(
+        run_agent.AIAgent, review_memory=False, review_skills=True
+    )
+    assert "skill_manage" in whitelist
+    assert "memory" not in whitelist
+
+
+def test_combined_review_whitelist_has_both():
+    """A combined trigger keeps both toolsets (back-compat with the old behavior)."""
+    import run_agent
+
+    whitelist = _capture_review_whitelist(
+        run_agent.AIAgent, review_memory=True, review_skills=True
+    )
     assert "memory" in whitelist
     assert "skill_manage" in whitelist
-    assert "skill_view" in whitelist
-    assert "skills_list" in whitelist
-    # dangerous tools must NOT be in the whitelist
-    assert "terminal" not in whitelist
-    assert "send_message" not in whitelist
-    assert "delegate_task" not in whitelist
-    assert "web_search" not in whitelist
-    assert "execute_code" not in whitelist
+    for t in ("terminal", "send_message", "delegate_task", "execute_code"):
+        assert t not in whitelist
 
 
 def test_background_review_agent_tools_are_limited():

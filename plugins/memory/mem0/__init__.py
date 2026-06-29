@@ -44,12 +44,17 @@ home for these non-secret settings.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import os
 import threading
 import time
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List
+
+import requests
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -81,6 +86,40 @@ _DEFAULT_USER_ID = "hermes-user"
 # Chronicle config fallbacks — match plugins/memory/mem0/chronicle.py defaults.
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_TEI_URL = "http://localhost:8085"
+_CHRONICLE_COLLECTION = "sylva_chronicle"
+
+# ── PRD-037 FR-1: session-end episodic ingest governance bounds ──────────────
+# Stable namespace so re-running the same session produces identical point ids
+# (idempotent upsert; AC-003). Mirrors the migration script's deterministic-id
+# pattern (scripts/migrate_sylva_memories_to_chronicle.py).
+_INGEST_NS = uuid.UUID("6f29a1c4-0d2e-4e7a-9b13-abcdef012345")
+# Skip empty/trivial sessions: need at least this many user+assistant turns and
+# this many chars of substantive transcript before a session is worth ingesting.
+_INGEST_MIN_TURNS = 2
+_INGEST_MIN_SESSION_CHARS = 200
+# Bound the write: at most N episodic entries per session, each capped in size.
+_INGEST_MAX_ENTRIES = 8
+_INGEST_MAX_ENTRY_CHARS = 1000
+_INGEST_MIN_ENTRY_CHARS = 25
+# Cap how much transcript we feed the summarizer (last N turns) + its output.
+_INGEST_MAX_SUMMARY_TURNS = 40
+_INGEST_SUMMARY_MAX_TOKENS = 600
+_INGEST_SUMMARY_TIMEOUT = 60  # hard cap on the aux summarize call so teardown can't stall
+_INGEST_UPSERT_TIMEOUT = 60
+
+
+def _redact(text: str) -> str:
+    """Scrub secret-like patterns from ``text`` before it reaches the aux LLM or
+    the chronicle. force=True runs even when display redaction is globally off.
+    Best-effort: on import/scan failure, return the input unchanged (we prefer a
+    captured-but-unredacted memory over silently losing the session — the aux
+    endpoint here is the local container model, not external egress)."""
+    try:
+        from agent.redact import redact_sensitive_text
+        return redact_sensitive_text(text or "", force=True)
+    except Exception:
+        logger.debug("redact unavailable; passing episodic text through unredacted")
+        return text or ""
 
 
 def _is_client_error(exc: Exception) -> bool:
@@ -283,6 +322,10 @@ class Mem0MemoryProvider(MemoryProvider):
         self._had_tool_calls = False
         self._last_assistant_content = ""
         self._chronicle = None
+        # Current session id — captured at initialize() and refreshed on
+        # on_session_switch so on_session_end (PRD-037 FR-1) attributes the
+        # episodic record to the correct session (source=session:<id>).
+        self._session_id = ""
 
     @property
     def name(self) -> str:
@@ -382,6 +425,7 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
+        self._session_id = session_id or ""
         self._mode = self._config.get("mode", "platform")
         self._api_key = self._config.get("api_key", "")
         self._rerank = self._config.get("rerank", True)
@@ -535,6 +579,308 @@ class Mem0MemoryProvider(MemoryProvider):
         self._last_assistant_content = (assistant_content or "")[:2000]
         # Length proxy: substantive responses (>200 chars) likely involved tool use.
         self._had_tool_calls = len(assistant_content) > 200 if assistant_content else False
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Track the live session id so on_session_end attributes the episodic
+        record to the right session (source=session:<id>). The id rotates on
+        /resume, /branch, /reset, /new, and compression — this keeps FR-1's
+        attribution correct without re-running initialize()."""
+        if new_session_id:
+            self._session_id = new_session_id
+
+    def on_session_end(self, messages: List[Dict[str, Any]], *, final: bool = True) -> None:
+        """Governed session-end episodic ingest (PRD-037 FR-1, CENTERPIECE).
+
+        Summarize the just-ended conversation into 1–N concise episodic entries
+        and upsert them into ``sylva_chronicle`` so future sessions can recall
+        what happened. This is the *only* live writer to the chronicle — it
+        restores the working-memory write path PRD-029 left severed.
+
+        ``final`` distinguishes a TRUE logical-session boundary from a mid-
+        conversation rotation (see ``MemoryManager.on_session_end``):
+
+          * ``final=True``  — CLI exit / gateway-or-TUI session close / ``/new``
+            / ``/reset`` / ``/clear`` (``new_session``): the conversation is
+            ending, so we ingest one episodic record. This is the path that
+            guarantees the next session can recall this one.
+          * ``final=False`` — automatic context compaction / ``/compress`` /
+            ``/compact`` (``commit_memory_session`` from the compressor): the
+            SAME conversation continues, just compacted. We DO NOT ingest here —
+            (a) it would fire repeatedly mid-session on the turn's hot path, and
+            (b) the summarizer is non-deterministic, so each compaction would
+            write overlapping near-duplicate entries (the low-signal noise
+            PRD-029 removed). The compacted-away turns are NOT lost — they stay
+            in ``state.db`` (active=0, FTS-searchable via ``session_search``),
+            and the durable episodic summary is written when the session truly
+            ends.
+
+        Governance (security-sensitive subsystem — do NOT weaken):
+          * **Session-boundary only**, never per-turn — ``sync_turn`` stays a
+            write no-op (the PRD-029 confabulation-loop invariant). ``run_agent``
+            also suppresses this call entirely when ``_memory_passive_enabled``
+            is False (cron), so cron scaffolding is never ingested (AC-002).
+          * **Chronicle (episodic) only.** Never canon / SOUL.md / identity.
+          * **Redacted.** Transcript is secret-scrubbed before it reaches the
+            aux summarizer AND before any entry is persisted/embedded.
+          * **Bounded + idempotent.** Content-hash dedup + deterministic ids;
+            skip empty/trivial sessions; cap entry count + size (AC-003).
+          * **Audited.** Each ingest records a PRD-028 ledger entry.
+
+        Never raises — a memory-ingest failure must not break session teardown.
+        """
+        if not final:
+            # Mid-conversation rotation (compaction) — defer to the real
+            # boundary. See the docstring for why this is correct + lossless.
+            logger.debug("mem0 on_session_end(final=False): skipping ingest (compaction).")
+            return
+        try:
+            self._ingest_session_episodic(messages)
+        except Exception as e:
+            logger.warning(
+                "Mem0 on_session_end episodic ingest failed: %s", e, exc_info=True
+            )
+
+    # -- FR-1 episodic ingest internals -------------------------------------
+
+    @staticmethod
+    def _extract_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """Flatten the history to plain user/assistant text turns, dropping
+        system/tool turns, injected compaction markers, and multimodal/non-text
+        parts — the same shape scripts/session-handoff.py feeds its summarizer.
+
+        The compressor injects two marker prefixes into the live transcript —
+        ``[CONTEXT COMPACTION — REFERENCE ONLY]`` and ``[CONTEXT SUMMARY]``
+        (agent/conversation_compression.py) — plus a todo snapshot. We drop
+        anything under the ``[CONTEXT`` prefix so a true-end ingest of an
+        already-compacted transcript doesn't re-summarize prior summaries."""
+        turns: List[Dict[str, str]] = []
+        for msg in messages or []:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            text = content.strip()
+            if not text or text.startswith("[CONTEXT"):
+                continue
+            turns.append({"role": role, "text": text})
+        return turns
+
+    def _summarize_session(self, turns: List[Dict[str, str]]) -> str:
+        """Summarize the conversation into a concise episodic note via the
+        configured auxiliary LLM (the upstream ``compression`` aux client —
+        same resolution the context compressor uses). Returns "" if no aux
+        provider is available; we never fall back to storing the raw transcript
+        (raw fragments are the low-signal noise PRD-029 fought to remove)."""
+        try:
+            from agent.auxiliary_client import (
+                get_text_auxiliary_client,
+                is_local_qwen3_endpoint,
+            )
+        except Exception as e:
+            logger.debug("aux client import failed; skipping ingest summary: %s", e)
+            return ""
+
+        client, aux_model = get_text_auxiliary_client("compression")
+        if client is None or not aux_model:
+            logger.info(
+                "No auxiliary LLM for session-end summary — skipping episodic ingest."
+            )
+            return ""
+
+        recent = turns[-_INGEST_MAX_SUMMARY_TURNS:]
+        transcript = "\n\n".join(
+            f"[{t['role'].upper()}]: {t['text']}" for t in recent
+        )
+        # Secret-scrub the transcript BEFORE it reaches the aux summarizer.
+        # The aux ``compression`` provider can resolve to a remote endpoint, and
+        # the summary is persisted + embedded — so credentials in the raw turns
+        # must never leave the host or land in the chronicle. force=True scans
+        # even when display redaction is globally off (mirrors ask_claude /
+        # PRD-024). Best-effort: if the redactor can't load, we proceed on the
+        # raw text rather than silently dropping the session's memory.
+        transcript = _redact(transcript)
+        prompt = (
+            "You are Sylva, summarizing a conversation you (the AI assistant) just "
+            "had with Scott (the user), for your own future recall.\n\n"
+            "Write a concise episodic memory of this session as 3–8 short bullet "
+            "points. Each bullet: one concrete thing that happened, was decided, "
+            "or is pending — be specific (file paths, tool names, config values, "
+            "decisions). No preamble, no headers, no markdown emphasis — just '- ' "
+            "bullets. Record what occurred; do NOT invent facts or restate your "
+            "identity. Skip trivia and pleasantries.\n\n"
+            f"--- TRANSCRIPT (last {len(recent)} turns) ---\n"
+            f"{transcript}\n"
+            "--- END TRANSCRIPT ---\n\n"
+            "Episodic bullets:"
+        )
+
+        kwargs: Dict[str, Any] = {
+            "model": aux_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": _INGEST_SUMMARY_MAX_TOKENS,
+            "temperature": 0.3,
+            "stream": False,
+            # Hard timeout so a wedged aux endpoint can't stall session teardown.
+            "timeout": _INGEST_SUMMARY_TIMEOUT,
+        }
+        # Local Qwen3 thinking-mode returns empty content / huge latency; disable
+        # it the documented way (llama.cpp honors this Jinja kwarg).
+        try:
+            base_url = str(getattr(client, "base_url", "") or "")
+            if is_local_qwen3_endpoint(base_url, aux_model):
+                kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        except Exception:
+            pass
+
+        resp = client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
+
+    @staticmethod
+    def _summary_to_entries(summary: str) -> List[str]:
+        """Split the summary into individual, deduplicated episodic entries —
+        bounded count + size, markdown markers stripped, trivial lines dropped."""
+        entries: List[str] = []
+        seen: set[str] = set()
+        for raw in summary.split("\n"):
+            line = raw.strip().lstrip("-*•").strip()
+            # Drop markdown headers and short/empty fragments (e.g. "Format:").
+            if line.startswith("#"):
+                continue
+            if len(line) < _INGEST_MIN_ENTRY_CHARS:
+                continue
+            line = line[:_INGEST_MAX_ENTRY_CHARS]
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append(line)
+            if len(entries) >= _INGEST_MAX_ENTRIES:
+                break
+        return entries
+
+    def _existing_chronicle_hashes(self) -> set[str]:
+        """Pull every chronicle point's content hash for cross-session de-dupe
+        (idempotent re-runs + no double-insert). Mirrors the migration script."""
+        hashes: set[str] = set()
+        offset = None
+        qdrant = self._chronicle._qdrant_url
+        while True:
+            body: Dict[str, Any] = {
+                "limit": 1000,
+                "with_payload": ["data", "hash"],
+                "with_vector": False,
+            }
+            if offset is not None:
+                body["offset"] = offset
+            r = requests.post(
+                f"{qdrant}/collections/{_CHRONICLE_COLLECTION}/points/scroll",
+                json=body, timeout=30,
+            )
+            r.raise_for_status()
+            res = r.json()["result"]
+            for p in res.get("points", []):
+                pl = p.get("payload", {})
+                h = pl.get("hash") or hashlib.md5((pl.get("data") or "").encode()).hexdigest()
+                hashes.add(h)
+            offset = res.get("next_page_offset")
+            if offset is None:
+                break
+        return hashes
+
+    def _ingest_session_episodic(self, messages: List[Dict[str, Any]]) -> None:
+        if self._chronicle is None:
+            logger.info("Chronicle unavailable — skipping session-end episodic ingest.")
+            return
+
+        turns = self._extract_turns(messages)
+        total_chars = sum(len(t["text"]) for t in turns)
+        if len(turns) < _INGEST_MIN_TURNS or total_chars < _INGEST_MIN_SESSION_CHARS:
+            logger.info(
+                "Session too trivial for episodic ingest (turns=%d chars=%d) — skipping.",
+                len(turns), total_chars,
+            )
+            return
+
+        summary = self._summarize_session(turns)
+        if not summary:
+            return
+        entries = self._summary_to_entries(summary)
+        if not entries:
+            logger.info("Session summary produced no episodic entries — skipping.")
+            return
+
+        seen_hashes = self._existing_chronicle_hashes()
+        session_id = self._session_id or "unknown"
+        date = datetime.now().strftime("%Y-%m-%d")
+        source = f"session:{session_id}"
+
+        points: List[Dict[str, Any]] = []
+        for entry in entries:
+            # Belt-and-suspenders: redact again at persist time in case the
+            # summary echoed a secret the model copied from the transcript.
+            entry = _redact(entry)
+            h = hashlib.md5(entry.encode()).hexdigest()
+            if h in seen_hashes:
+                continue
+            seen_hashes.add(h)
+            det_id = str(uuid.uuid5(_INGEST_NS, f"{source}:{h}"))
+            payload = {
+                "data": entry,
+                "speaker": "sylva",
+                "date": date,
+                "source": source,
+                "category": "journal",
+                "user_id": self._user_id,
+                "role": "user",
+                "hash": h,
+            }
+            try:
+                vector = self._chronicle.embed(entry)
+            except Exception as e:
+                logger.debug("embed failed for episodic entry, skipping: %s", e)
+                continue
+            points.append({"id": det_id, "vector": vector, "payload": payload})
+
+        if not points:
+            logger.info("Episodic ingest: all entries already in chronicle (idempotent no-op).")
+            return
+
+        qdrant = self._chronicle._qdrant_url
+        r = requests.put(
+            f"{qdrant}/collections/{_CHRONICLE_COLLECTION}/points?wait=true",
+            json={"points": points}, timeout=_INGEST_UPSERT_TIMEOUT,
+        )
+        r.raise_for_status()
+        logger.info(
+            "Episodic ingest: wrote %d entries to sylva_chronicle (%s).",
+            len(points), source,
+        )
+        self._audit_ingest(source, len(points))
+
+    @staticmethod
+    def _audit_ingest(source: str, count: int) -> None:
+        """Record the episodic write to the PRD-028 audit ledger (best-effort)."""
+        try:
+            from autonomy import audit
+            audit.record(
+                tier="T2",
+                surface="memory",
+                action="chronicle_episodic_ingest",
+                rationale=f"{source} +{count} episodic entries",
+                outcome="ok",
+            )
+        except Exception as e:
+            logger.debug("audit.record for episodic ingest failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         # PRD-029 decommission (2026-06-28): the mem0_* tools (list/search/add/
