@@ -54,11 +54,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
     CANDIDATES_COLLECTION,
+    CANON_COLLECTION,
+    CONSOLIDATION_PROVENANCE,
     FACETS,
     LAYER_IDENTITY,
+    content_hash,
     make_payload,
     make_source_event,
-    validate_payload,
+    validate_consolidation_payload,
 )
 from .store import CanonStore
 
@@ -575,11 +578,18 @@ def _derive_candidates(
 
 # ── 4. write: validate + build payloads + direct-Qdrant upsert (sole writer) ────
 def _candidate_point(
-    proposal: Dict[str, Any], *, model: str, now_iso: str
+    proposal: Dict[str, Any], *, model: str, now_iso: str, run_id: str = ""
 ) -> Optional[Dict[str, Any]]:
     """Turn one raw LLM proposal into a validated candidate point, or None if it
     violates the schema (silently dropped — a bad proposal must never poison the
-    batch)."""
+    batch).
+
+    Stamps the PRD-038 M1 provenance contract onto the payload: ``run_id`` (the
+    per-run id threaded from :func:`run_consolidation`), ``content_hash`` (sha256
+    of the normalized statement — the cross-store dedup key + content identity),
+    alongside the existing ``source_event`` (claim + provenance_refs).
+    ``adversary_verdict`` is left absent — propose-time does not adversary-screen.
+    """
     statement = (proposal.get("statement") or "").strip()
     facet = (proposal.get("facet") or "").strip()
     tier = (proposal.get("tier") or "peripheral").strip()
@@ -603,6 +613,10 @@ def _candidate_point(
             logger.warning("consolidation: dropped candidate with secret-shaped content")
             return None
 
+    # run_id is normally threaded from run_consolidation (one per run). Guard the
+    # direct-call path so a candidate can never be minted without the M1 contract.
+    run_id = run_id or uuid.uuid4().hex
+    chash = content_hash(statement)
     payload = make_payload(
         statement=statement,
         facet=facet,
@@ -610,13 +624,16 @@ def _candidate_point(
         source_event=source_event,
         interpretation=interpretation,
         status="candidate",
-        provenance="consolidation",
+        provenance=CONSOLIDATION_PROVENANCE,
         derived_by=model or _NEUTRAL_AUX_TASK,
         created_at=now_iso,
         layer=LAYER_IDENTITY,
+        # PRD-038 M1 provenance contract (back-compatible — only consolidation
+        # payloads carry these; seed/ratification payloads remain unchanged).
+        extra={"run_id": run_id, "content_hash": chash},
     )
     try:
-        validate_payload(payload)
+        validate_consolidation_payload(payload)
     except Exception as e:
         logger.debug("consolidation: dropped invalid proposal (%s): %s", e, statement[:80])
         return None
@@ -625,6 +642,39 @@ def _candidate_point(
     seed = f"{statement}␟{source_event['claim']}␟{refs[0] if refs else ''}"
     point_id = str(uuid.uuid5(_CANDIDATE_NS, seed))
     return {"id": point_id, "payload": payload}
+
+
+def _existing_content_hashes(store: CanonStore) -> set:
+    """Cross-store dedup key set (PRD-038 M2): the content hashes already present
+    in live ``sylva_canon`` (status=canon) OR as open ``sylva_candidates``
+    (status=candidate). ``CanonStore.get_canon()`` does not enumerate both at once,
+    so it is called SEPARATELY per the FR-1 contract.
+
+    For each existing payload we prefer its stored ``content_hash`` (consolidation
+    payloads carry it); otherwise we derive it from the ``statement`` so legacy /
+    seed entries (which predate the M1 contract) still dedup correctly. Best-effort:
+    a read failure degrades to an empty set (dedup is a no-op, never a crash)."""
+    hashes: set = set()
+    for collection, status in (
+        (CANON_COLLECTION, "canon"),
+        (CANDIDATES_COLLECTION, "candidate"),
+    ):
+        try:
+            rows = store.get_canon(collection=collection, status=status)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("consolidation: dedup read of %s failed: %s", collection, e)
+            continue
+        for _pid, payload in rows:
+            if not isinstance(payload, dict):
+                continue
+            ch = payload.get("content_hash")
+            if isinstance(ch, str) and ch.strip():
+                hashes.add(ch)
+                continue
+            statement = payload.get("statement")
+            if isinstance(statement, str) and statement.strip():
+                hashes.add(content_hash(statement))
+    return hashes
 
 
 def run_consolidation(
@@ -654,6 +704,9 @@ def run_consolidation(
     # before any work — closes the --sandbox/target_collection escape hatch.
     _assert_writable_target(target_collection)
     now_iso = now_iso or datetime.now(timezone.utc).isoformat()
+    # One run_id per consolidation run (PRD-038 M1): threaded into every candidate
+    # payload so a ratified canon entry traces back to the run that produced it.
+    run_id = uuid.uuid4().hex
     own_db = False
     if db is None:
         db = _open_session_db()
@@ -669,7 +722,7 @@ def run_consolidation(
         points: List[Dict[str, Any]] = []
         seen_ids = set()
         for prop in raw_candidates:
-            pt = _candidate_point(prop, model=model, now_iso=now_iso)
+            pt = _candidate_point(prop, model=model, now_iso=now_iso, run_id=run_id)
             if pt and pt["id"] not in seen_ids:
                 seen_ids.add(pt["id"])
                 points.append(pt)
@@ -691,10 +744,42 @@ def run_consolidation(
             return result
 
         if dry_run:
+            # NOTE (PRD-038): dry-run intentionally reports the PRE-dedup count —
+            # it returns before the cross-store dedup below. Cadence/AC-008
+            # verification only needs "did a run produce candidates"; the real
+            # write count (post-dedup) is exercised by a live or --sandbox run.
             result.candidates_written = len(points)
             return result
 
         store = store or CanonStore.from_config()
+
+        # Cross-store dedup (PRD-038 M2): skip any proposal whose content already
+        # exists in live canon OR as an open candidate — no re-proposing already
+        # ratified / already-queued facts. The in-batch seen_ids dedup above stays;
+        # this ADDS the cross-store check. Runs only when a store is available.
+        existing = _existing_content_hashes(store)
+        if existing:
+            kept: List[Dict[str, Any]] = []
+            for pt in points:
+                ch = pt["payload"].get("content_hash")
+                if ch in existing:
+                    continue
+                kept.append(pt)
+            skipped = len(points) - len(kept)
+            if skipped:
+                logger.info(
+                    "consolidation: cross-store dedup skipped %d/%d candidate(s) "
+                    "already in canon or open candidates",
+                    skipped,
+                    len(points),
+                )
+            points = kept
+            result.candidate_ids = [p["id"] for p in points]
+
+        if not points:
+            result.skipped_reason = "all candidates already in canon or open queue"
+            return result
+
         store.ensure_collections((target_collection,))
         store.upsert(target_collection, points)
         result.candidates_written = len(points)

@@ -25,6 +25,8 @@ Invariants (PRD-029):
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any, Dict, List, Optional
 
 # ── Collections ────────────────────────────────────────────────────────────────
@@ -75,6 +77,74 @@ RENDER_ORDER_SENTINEL = 1 << 30
 
 class CanonSchemaError(ValueError):
     """Raised when a canon payload violates the schema contract."""
+
+
+# ── Provenance contract (PRD-038 M1) ────────────────────────────────────────────
+# The provenance marker the consolidation engine stamps onto every candidate it
+# proposes. The new required-field validation is SCOPED to this provenance so
+# pre-existing seed candidates / ratification payloads (which lack run_id /
+# content_hash) keep validating unchanged.
+CONSOLIDATION_PROVENANCE = "consolidation"
+
+_WS_RE = re.compile(r"\s+")
+
+
+def normalize_statement(statement: str) -> str:
+    """Normalize a statement for content-hash equality: lowercased, whitespace
+    collapsed to single spaces, stripped. Deterministic across runs/stores so the
+    cross-store dedup (M2) and the idempotent content hash agree on what "the same
+    fact" means."""
+    if not statement:
+        return ""
+    return _WS_RE.sub(" ", statement).strip().lower()
+
+
+def content_hash(statement: str) -> str:
+    """sha256 hex of the normalized statement — the content-identity of a candidate.
+
+    Used for the provenance contract (M1) and cross-store dedup (M2): two
+    proposals that normalize to the same text share a content_hash and are treated
+    as the same durable fact regardless of phrasing/casing/whitespace."""
+    return hashlib.sha256(normalize_statement(statement).encode("utf-8")).hexdigest()
+
+
+def validate_consolidation_payload(payload: Dict[str, Any]) -> None:
+    """Consolidation-scoped provenance validation (PRD-038 M1).
+
+    Runs the generic :func:`validate_payload` first, then — only for payloads
+    whose ``provenance == CONSOLIDATION_PROVENANCE`` — enforces the FR-3 provenance
+    contract: non-empty ``run_id`` and ``content_hash``, plus a non-empty
+    ``source_event.claim``. ``adversary_verdict`` is deliberately NOT required here
+    (the propose path does not adversary-screen — that happens at ratify).
+
+    Back-compat: this is a SUPERSET check. Callers building seed / ratification
+    payloads keep calling :func:`validate_payload`; only the consolidation writer
+    calls this stricter variant, so existing payloads that lack ``run_id`` /
+    ``content_hash`` are unaffected.
+    """
+    validate_payload(payload)
+
+    if payload.get("provenance") != CONSOLIDATION_PROVENANCE:
+        return  # not a consolidation candidate — no extra contract
+
+    run_id = payload.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise CanonSchemaError(
+            "consolidation candidate must carry a non-empty run_id"
+        )
+
+    ch = payload.get("content_hash")
+    if not isinstance(ch, str) or not ch.strip():
+        raise CanonSchemaError(
+            "consolidation candidate must carry a non-empty content_hash"
+        )
+
+    se = payload.get("source_event") or {}
+    claim = se.get("claim") if isinstance(se, dict) else None
+    if not isinstance(claim, str) or not claim.strip():
+        raise CanonSchemaError(
+            "consolidation candidate source_event.claim must be non-empty"
+        )
 
 
 def make_source_event(claim: str, provenance_refs: Optional[List[str]] = None) -> Dict[str, Any]:

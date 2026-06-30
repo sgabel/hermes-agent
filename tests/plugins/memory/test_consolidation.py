@@ -30,22 +30,32 @@ from plugins.memory.canon.consolidation import (
     _session_transcript,
     run_consolidation,
 )
-from plugins.memory.canon.schema import FACETS, VECTOR_DIM
+from plugins.memory.canon.schema import FACETS, VECTOR_DIM, content_hash
 
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
 class _FakeStore:
-    """Records upserts; asserts the writer's collection reach."""
+    """Records upserts; asserts the writer's collection reach.
 
-    def __init__(self):
+    ``existing`` maps a collection name → list of ``(point_id, payload)`` rows
+    that :meth:`get_canon` returns, so the PRD-038 cross-store dedup path (M2) can
+    be exercised hermetically. Default is empty (no dedup hits) — and a store with
+    no ``get_canon`` at all still works because the dedup helper is fail-soft.
+    """
+
+    def __init__(self, existing=None):
         self.upserts: List[tuple] = []
         self.ensured: List[tuple] = []
+        self._existing = existing or {}
 
     def ensure_collections(self, collections):
         self.ensured.append(tuple(collections))
 
     def upsert(self, collection, points):
         self.upserts.append((collection, points))
+
+    def get_canon(self, *, collection, status, **_kw):
+        return list(self._existing.get(collection, []))
 
 
 class _FakeDB:
@@ -297,6 +307,204 @@ def test_transcript_redacts_secrets_before_the_deriver():
     text = _session_transcript(db, "s1", 10000)
     assert secret not in text
     assert "REDACTED" in text
+
+
+# ── PRD-038 M1: provenance contract on consolidation candidates ─────────────────
+def test_candidate_carries_run_id_and_content_hash():
+    """M1/AC-001: every consolidation candidate carries a validated run_id +
+    content_hash + grounded source_event.claim."""
+    pt = _candidate_point(_proposal(statement="I value reversible changes."),
+                          model="m", now_iso="t", run_id="run-abc")
+    assert pt is not None
+    p = pt["payload"]
+    assert p["run_id"] == "run-abc"
+    assert p["content_hash"] == content_hash("I value reversible changes.")
+    assert p["source_event"]["claim"]  # non-empty
+    # adversary_verdict is NOT populated at propose time (set at ratify)
+    assert p.get("adversary_verdict") in (None, {})
+
+
+def test_run_threads_a_single_run_id_across_all_candidates():
+    """One run_id per run, stamped onto every candidate (FR-3 traceability)."""
+    store = _FakeStore()
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+
+    def derive(s, a):
+        return ([_proposal(statement="A durable fact."),
+                 _proposal(statement="Another durable fact.", refs=["session:def"])], "m")
+
+    run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+    _coll, points = store.upserts[0]
+    run_ids = {p["payload"]["run_id"] for p in points}
+    assert len(points) == 2
+    assert len(run_ids) == 1
+    assert next(iter(run_ids))  # non-empty
+
+
+def test_content_hash_normalizes_phrasing():
+    """Casing / whitespace differences collapse to the same content_hash so dedup
+    treats them as the same durable fact."""
+    assert content_hash("I Value  Reversible Changes.") == content_hash(
+        "i value reversible changes.")
+
+
+# ── PRD-038 M3 / AC-002 (propose-side): the gate must not silently pass all ─────
+def test_propose_gate_drops_secret_and_invalid_keeps_genuine():
+    """AC-002 (propose-time): a secret-bearing proposal AND a schema-invalid
+    proposal are dropped, while a genuine durable fact reaches the queue. This
+    FAILS if the propose-time gate silently passed everything."""
+    store = _FakeStore()
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+
+    secret_blob = "xqK9fL2mP7rT4vN8wZ3bY6cH1gD5jA0eU7sQ"   # high-entropy → redactor trips
+    genuine_stmt = "I value careful, reversible changes to our shared work."
+
+    def derive(s, a):
+        return (
+            [
+                _proposal(statement=f"My API key is {secret_blob}"),   # secret → dropped
+                _proposal(statement="  ", facet="value"),               # invalid (empty) → dropped
+                _proposal(statement="totally not a facet", facet="bogus"),  # invalid facet → dropped
+                _proposal(statement=genuine_stmt),                      # genuine → kept
+            ],
+            "m",
+        )
+
+    res = run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+
+    assert len(store.upserts) == 1
+    _coll, points = store.upserts[0]
+    written = [p["payload"]["statement"] for p in points]
+    # genuine present
+    assert genuine_stmt in written
+    assert res.candidates_written == 1
+    # secret + invalid absent
+    assert not any(secret_blob in s for s in written)
+    assert all(s.strip() for s in written)
+    assert all(p["payload"]["facet"] in FACETS for p in points)
+
+
+def test_propose_gate_negative_control_would_fail_if_silent_pass():
+    """Companion to the above: with NO bad proposals, all genuine facts pass —
+    proves the gate isn't dropping everything indiscriminately."""
+    store = _FakeStore()
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+
+    def derive(s, a):
+        return ([_proposal(statement="I value reversibility."),
+                 _proposal(statement="I value clear communication.", refs=["session:def"])], "m")
+
+    res = run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+    assert res.candidates_written == 2
+
+
+# ── PRD-038 M2 / AC-003: cross-store dedup vs live canon + open candidates ──────
+def _existing_row(statement, *, with_hash=True):
+    """Build a stored (point_id, payload) row as get_canon would return it."""
+    payload = {"statement": statement, "status": "canon"}
+    if with_hash:
+        payload["content_hash"] = content_hash(statement)
+    return ("pid-" + content_hash(statement)[:8], payload)
+
+
+def test_dedup_against_live_canon_skips_already_ratified():
+    """AC-003: a fact already in sylva_canon is NOT re-proposed."""
+    dup_stmt = "I value careful, reversible changes."
+    store = _FakeStore(existing={CANON_COLLECTION: [_existing_row(dup_stmt)]})
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+
+    def derive(s, a):
+        return ([_proposal(statement=dup_stmt),
+                 _proposal(statement="A brand new durable fact.", refs=["session:def"])], "m")
+
+    res = run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+    _coll, points = store.upserts[0]
+    written = [p["payload"]["statement"] for p in points]
+    assert dup_stmt not in written                       # deduped against canon
+    assert "A brand new durable fact." in written
+    assert res.candidates_written == 1
+
+
+def test_dedup_against_open_candidate_skips_already_queued():
+    """AC-003: a fact already an OPEN sylva_candidate is NOT re-proposed."""
+    dup_stmt = "I value careful, reversible changes."
+    store = _FakeStore(existing={CANDIDATES_COLLECTION: [_existing_row(dup_stmt)]})
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+
+    def derive(s, a):
+        return ([_proposal(statement=dup_stmt)], "m")
+
+    res = run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+    assert store.upserts == []                           # nothing left to write
+    assert res.candidates_written == 0
+    assert "already in canon or open queue" in res.skipped_reason
+
+
+def test_dedup_derives_hash_for_legacy_rows_without_content_hash():
+    """A pre-M1 canon row lacking content_hash still dedups (hash derived from
+    its statement) — so legacy seed canon isn't re-proposed."""
+    dup_stmt = "I value careful, reversible changes."
+    store = _FakeStore(
+        existing={CANON_COLLECTION: [_existing_row(dup_stmt, with_hash=False)]})
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+    res = run_consolidation(store=store, db=db,
+                            derive_fn=lambda s, a: ([_proposal(statement=dup_stmt)], "m"),
+                            now_iso="t")
+    assert res.candidates_written == 0
+
+
+# ── PRD-038 AC-005: idempotent re-run writes no new duplicate ───────────────────
+def test_idempotent_rerun_same_window_no_duplicate():
+    """AC-005: re-running over the same derive output dedups against the candidate
+    already queued from the first run (same content_hash → skipped)."""
+    db = _FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]})
+    derive = lambda s, a: ([_proposal(statement="I value reversibility.")], "m")
+
+    # first run: writes one candidate
+    store1 = _FakeStore()
+    r1 = run_consolidation(store=store1, db=db, derive_fn=derive, now_iso="t")
+    assert r1.candidates_written == 1
+    written_payload = store1.upserts[0][1][0]["payload"]
+    first_id = store1.upserts[0][1][0]["id"]
+
+    # second run: the candidate is now an open candidate in the store → deduped
+    store2 = _FakeStore(existing={
+        CANDIDATES_COLLECTION: [(first_id, written_payload)]})
+    r2 = run_consolidation(store=store2, db=db, derive_fn=derive, now_iso="t")
+    assert r2.candidates_written == 0
+    assert store2.upserts == []
+
+
+# ── PRD-038 AC-007: planted credential never appears in a written candidate ─────
+def test_credential_in_source_record_never_reaches_candidate(monkeypatch):
+    """AC-007: a credential planted in a source session is redacted before the
+    deriver, and even if a proposal echoes it, the secret screen drops the
+    candidate — the credential never lands in any written candidate payload."""
+    secret_blob = "xqK9fL2mP7rT4vN8wZ3bY6cH1gD5jA0eU7sQ"   # high-entropy
+
+    store = _FakeStore()
+    db = _FakeDB(
+        [{"id": "s1", "last_active": "x", "source": "discord"}],
+        {"s1": [{"role": "user", "content": f"here is my secret: {secret_blob}"}]},
+    )
+
+    # 1) the transcript fed to the deriver must already be redacted
+    transcript = _session_transcript(db, "s1", 10000)
+    assert secret_blob not in transcript
+
+    # 2) even an adversarial proposal echoing the secret is dropped at propose time
+    def derive(sessions, agency):
+        return ([_proposal(statement=f"My credential is {secret_blob}"),
+                 _proposal(statement="I value secure handling of credentials.",
+                           refs=["session:s1"])], "m")
+
+    res = run_consolidation(store=store, db=db, derive_fn=derive, now_iso="t")
+    _coll, points = store.upserts[0]
+    import json as _json
+    serialized = _json.dumps([p["payload"] for p in points])
+    assert secret_blob not in serialized                 # never in any candidate
+    assert res.candidates_written == 1                   # only the clean one
+    assert points[0]["payload"]["statement"] == "I value secure handling of credentials."
 
 
 # ── integration: real direct-Qdrant upsert (gated) ─────────────────────────────
