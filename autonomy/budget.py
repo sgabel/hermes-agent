@@ -88,7 +88,10 @@ def _record_unknown_kind_denial(surface: str, kind: str, op: str) -> None:
         _audit.record(
             tier="T3",
             surface=surface,
-            action=f"budget {op} denied: unregistered kind '{str(kind)[:80]}'",
+            # em dash, not a colon — "denied: <word>" pattern-matches the audit
+            # redactor's key:value opaque-env heuristic and gets mangled in the
+            # permanent ledger row
+            action=f"budget {op} denied — unregistered kind '{str(kind)[:80]}'",
             rationale="unknown budget kind — fail-closed (PRD-043 FR-1)",
             authority="auto-by-tier",
             outcome="denied_unknown_kind",
