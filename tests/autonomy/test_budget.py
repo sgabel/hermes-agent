@@ -145,6 +145,29 @@ def test_ac003_budget_kind_error_is_not_keyerror():
     assert not issubclass(budget.BudgetKindError, KeyError)
 
 
+def test_ac003_partial_registration_of_other_kind_does_not_poison_valid_debit(monkeypatch):
+    """Implemented-gate STOP (Codex 2026-07-05): a partial registration of a
+    NEW kind must not make check/debit of a VALID kind raise — debit's
+    return-path usage snapshot iterates all KINDS, and the raise (after the
+    counter mutation) would escape into capability_policy.guard's broad
+    ``except Exception: pass`` and fail OPEN at the dispatch gate."""
+    _set_caps(monkeypatch)
+    monkeypatch.setattr(budget, "KINDS", (*budget.KINDS, "halfkind"))
+
+    assert budget.check("actions", 1) is True          # own-kind check unaffected
+    r = budget.debit("cron", "actions", 1)             # must NOT raise
+    assert r["allowed"] is True and r["degrade"] is False
+    assert r["usage"]["totals"]["actions"] == 1
+    assert "usage_error" in r["usage"]                 # degraded snapshot stays loud
+    # unknown-kind denial path must also survive the cross-kind misconfiguration
+    d = budget.debit("cron", "no_such_kind", 1)
+    assert d["allowed"] is False
+
+    # the valid debit was recorded exactly once
+    monkeypatch.setattr(budget, "KINDS", ("actions", "second_opinion_calls", "tokens"))
+    assert budget.get_usage()["totals"]["actions"] == 1
+
+
 def test_parallel_debits_do_not_lose_updates(monkeypatch):
     """Code-review NEEDS-FIX: cron runs jobs in a ThreadPoolExecutor, so the
     debit read-modify-write must not lose updates (was 54/400 without a lock)."""

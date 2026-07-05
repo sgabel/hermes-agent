@@ -97,6 +97,28 @@ def _record_unknown_kind_denial(surface: str, kind: str, op: str) -> None:
         pass
 
 
+def _usage_best_effort() -> dict[str, Any]:
+    """``get_usage()`` that degrades instead of raising (PRD-043 FR-1 fix-up).
+
+    Used ONLY for the informational ``usage`` snapshot in ``debit()``'s return
+    value. A ``BudgetKindError`` here means some OTHER kind is partially
+    registered; the current operation is on a valid (or already-denied) kind
+    and must not be poisoned by it — the raise would escape ``debit()`` into
+    ``capability_policy.guard``'s broad ``except`` and fail OPEN at the
+    dispatch gate, the exact inversion this PRD removes. ``get_usage()``
+    itself still raises the defined error (AC-003) so ``hermes autonomy
+    status`` surfaces the misconfiguration loudly.
+    """
+    try:
+        return get_usage()
+    except BudgetKindError as exc:
+        logger.warning("budget usage snapshot degraded (partial kind registration): %s", exc)
+        data = _read_counters()
+        return {"day": data["day"], "totals": data["totals"], "caps": _load_caps(),
+                "remaining": {}, "by_surface": data.get("by_surface", {}),
+                "usage_error": str(exc)}
+
+
 def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
@@ -206,7 +228,7 @@ def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> di
         # Governance event: fires regardless of ``audit=False`` (that flag mutes
         # only the routine degrade audit below).
         _record_unknown_kind_denial(surface, kind, "debit")
-        return {"allowed": False, "degrade": False, "kind": kind, "usage": get_usage()}
+        return {"allowed": False, "degrade": False, "kind": kind, "usage": _usage_best_effort()}
 
     caps = _load_caps()
     cap = _cap_for(kind, caps)  # fail closed BEFORE recording anything
@@ -250,7 +272,7 @@ def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> di
         except Exception:
             pass
 
-    return {"allowed": not degrade, "degrade": degrade, "kind": kind, "usage": get_usage()}
+    return {"allowed": not degrade, "degrade": degrade, "kind": kind, "usage": _usage_best_effort()}
 
 
 __all__ = ["check", "debit", "get_usage", "KINDS", "BudgetKindError"]
