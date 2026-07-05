@@ -2374,8 +2374,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
         # PRD-028: record the autonomous action to the append-only ledger and
         # debit the daily budget (degrade-to-ask on breach). Best-effort —
-        # governance must never break a cron run.
-        _record_autonomous_cron_run(job, success, error or delivery_error)
+        # governance must never break a cron run. delivery_error is threaded
+        # separately (PRD-043 FR-2) so an agent-side failure is never
+        # conflated with a delivery failure in the ledger.
+        _record_autonomous_cron_run(job, success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
@@ -2385,10 +2387,30 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return False
 
 
-def _record_autonomous_cron_run(job: dict, success: bool, error: Optional[str]) -> None:
-    """Audit + budget-debit one autonomous cron run (PRD-028 R-2/R-3). Never raises."""
+def _record_autonomous_cron_run(
+    job: dict,
+    success: bool,
+    error: Optional[str],
+    delivery_error: Optional[str] = None,
+) -> None:
+    """Audit + budget-debit one autonomous cron run (PRD-028 R-2/R-3). Never raises.
+
+    Outcome is derived NEGATIVELY from delivery (PRD-043 FR-2): an agent-run
+    failure keeps its ``error: …`` outcome independent of delivery; otherwise
+    ``delivery_failed`` iff ``delivery_error is not None``. ``_deliver_result``
+    returns None on success AND on every legitimate non-delivery
+    (``deliver=local``, no resolvable origin, ``[SILENT]``/``should_deliver=False``
+    never attempts delivery) — those all stay ``"ok"``.
+    """
     try:
         from autonomy import audit, budget
+
+        if not success:
+            outcome = f"error: {str(error)[:160]}" if error else "error"
+        elif delivery_error is not None:
+            outcome = "delivery_failed"
+        else:
+            outcome = "ok"
 
         name = job.get("name") or job.get("prompt") or job.get("id") or "cron job"
         audit.record(
@@ -2397,7 +2419,7 @@ def _record_autonomous_cron_run(job: dict, success: bool, error: Optional[str]) 
             action=f"cron run: {str(name)[:200]}",
             rationale=f"scheduled job {job.get('id', '?')}",
             authority="auto-by-tier",
-            outcome="ok" if success else f"error: {str(error)[:160]}" if error else "error",
+            outcome=outcome,
         )
         result = budget.debit("cron", "actions", 1)
         if result.get("degrade"):

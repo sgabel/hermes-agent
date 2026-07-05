@@ -17,6 +17,7 @@ T4/manual (PRD-025 'no cgroup for VRAM').
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -30,7 +31,16 @@ except ImportError:  # pragma: no cover - Windows
 
 from autonomy import autonomy_dir
 
+logger = logging.getLogger(__name__)
+
 KINDS = ("actions", "second_opinion_calls", "tokens")
+
+
+class BudgetKindError(Exception):
+    """A kind is in ``KINDS`` but missing its ``_DEFAULT_CAPS``/``_KIND_TO_CAP``
+    registration (PRD-043 FR-1). Registering a kind requires all three; a
+    partial registration fails closed with this defined error — never a bare
+    ``KeyError`` — identically on ``check``/``debit``/``get_usage``."""
 
 # Conservative defaults; overridden by config.yaml ``autonomy.budget``.
 _DEFAULT_CAPS = {
@@ -43,6 +53,48 @@ _KIND_TO_CAP = {
     "second_opinion_calls": "max_second_opinion_calls",
     "tokens": "max_autonomous_tokens",
 }
+
+
+def _cap_for(kind: str, caps: dict[str, int]) -> int:
+    """Single guarded cap lookup (PRD-043 FR-1, SERIOUS-2).
+
+    Used by ``check()``, ``debit()`` AND ``get_usage()`` so a ``KINDS`` member
+    with no cap mapping fails closed with the defined ``BudgetKindError`` on
+    all three call paths (``get_usage`` backs ``hermes autonomy status``, which
+    must not crash with a bare ``KeyError`` on a partial registration).
+    """
+    cap_key = _KIND_TO_CAP.get(kind)
+    if cap_key is None or cap_key not in caps:
+        raise BudgetKindError(
+            f"budget kind '{kind}' is registered in KINDS but has no "
+            f"_KIND_TO_CAP/_DEFAULT_CAPS mapping — register all three "
+            f"(KINDS, _DEFAULT_CAPS, _KIND_TO_CAP) in the same change"
+        )
+    return caps[cap_key]
+
+
+def _record_unknown_kind_denial(surface: str, kind: str, op: str) -> None:
+    """Best-effort ``denied_unknown_kind`` audit (PRD-043 FR-1, SERIOUS-1).
+
+    An unknown/unregistered kind is a governance event, not a routine debit, so
+    this fires regardless of the caller's ``audit=False`` flag. Wrapped so it
+    can NEVER raise into a caller — ``check``/``debit`` run inside
+    ``capability_policy.guard`` (the dispatch gate), which is not inside the
+    cron path's try/except.
+    """
+    try:
+        from autonomy import audit as _audit
+
+        _audit.record(
+            tier="T3",
+            surface=surface,
+            action=f"budget {op} denied: unregistered kind '{str(kind)[:80]}'",
+            rationale="unknown budget kind — fail-closed (PRD-043 FR-1)",
+            authority="auto-by-tier",
+            outcome="denied_unknown_kind",
+        )
+    except Exception:
+        pass
 
 
 def _today() -> str:
@@ -114,7 +166,7 @@ def get_usage(day: str | None = None) -> dict[str, Any]:
     data = _read_counters(day)
     caps = _load_caps()
     remaining = {
-        kind: max(0, caps[_KIND_TO_CAP[kind]] - data["totals"].get(kind, 0))
+        kind: max(0, _cap_for(kind, caps) - data["totals"].get(kind, 0))
         for kind in KINDS
     }
     return {"day": data["day"], "totals": data["totals"], "caps": caps,
@@ -122,12 +174,21 @@ def get_usage(day: str | None = None) -> dict[str, Any]:
 
 
 def check(kind: str, amount: int = 1) -> bool:
-    """True if debiting ``amount`` of ``kind`` would stay within the daily cap."""
+    """True if debiting ``amount`` of ``kind`` would stay within the daily cap.
+
+    Unknown kinds fail CLOSED (PRD-043 FR-1): deny, WARN, and write a
+    best-effort ``denied_unknown_kind`` audit record.
+    """
     if kind not in KINDS:
-        return True
+        logger.warning(
+            "budget.check denied: unknown kind %r (registered kinds: %s) — "
+            "fail-closed per PRD-043 FR-1", kind, ", ".join(KINDS)
+        )
+        _record_unknown_kind_denial("budget-check", kind, "check")
+        return False
     caps = _load_caps()
     data = _read_counters()
-    return data["totals"].get(kind, 0) + amount <= caps[_KIND_TO_CAP[kind]]
+    return data["totals"].get(kind, 0) + amount <= _cap_for(kind, caps)
 
 
 def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> dict[str, Any]:
@@ -138,9 +199,17 @@ def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> di
     degrade governs *future* autonomous initiative, per FR-3 'degrade-to-ask'.
     """
     if kind not in KINDS:
-        return {"allowed": True, "degrade": False, "kind": kind, "usage": get_usage()}
+        logger.warning(
+            "budget.debit refused: unknown kind %r from surface %r (registered "
+            "kinds: %s) — fail-closed per PRD-043 FR-1", kind, surface, ", ".join(KINDS)
+        )
+        # Governance event: fires regardless of ``audit=False`` (that flag mutes
+        # only the routine degrade audit below).
+        _record_unknown_kind_denial(surface, kind, "debit")
+        return {"allowed": False, "degrade": False, "kind": kind, "usage": get_usage()}
 
     caps = _load_caps()
+    cap = _cap_for(kind, caps)  # fail closed BEFORE recording anything
 
     # Serialise the read-modify-write so parallel cron threads
     # (HERMES_CRON_MAX_PARALLEL > 1) can't lose an update and silently
@@ -164,7 +233,6 @@ def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> di
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
 
-    cap = caps[_KIND_TO_CAP[kind]]
     degrade = data["totals"][kind] > cap
 
     if degrade and audit:
@@ -185,4 +253,4 @@ def debit(surface: str, kind: str, amount: int = 1, *, audit: bool = True) -> di
     return {"allowed": not degrade, "degrade": degrade, "kind": kind, "usage": get_usage()}
 
 
-__all__ = ["check", "debit", "get_usage", "KINDS"]
+__all__ = ["check", "debit", "get_usage", "KINDS", "BudgetKindError"]
