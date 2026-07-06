@@ -34,6 +34,13 @@ services:
       - ~/.hermes/config.yaml:/opt/data/config.yaml:ro
       - ~/.hermes/.env:/opt/data/.env:ro
       - ~/.hermes/mem0.json:/opt/data/mem0.json:ro
+      # PRD-035 advisory relay: the hermes-only relay dir (socket + bearer),
+      # bind-mounted READ-ONLY into the GATEWAY container ONLY (never the
+      # dashboard — FR-5 UDS boundary). RO + a path outside /opt/data means the
+      # stage-2 boot chown (which only touches /opt/data + subdirs) never
+      # re-owns it (FR-11 chown-lock exclusion). The relay itself runs host-side
+      # as a systemd USER service; this mount only exposes the socket to reach it.
+      - ~/.hermes-relay:/opt/relay:ro
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}

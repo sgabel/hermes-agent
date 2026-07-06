@@ -1,0 +1,49 @@
+# Hermes advisory relay (PRD-035) — host systemd USER service.
+#
+# Gives the containerized Sylva agent a toolless Claude second opinion over a
+# unix socket on a dedicated hermes-only bind mount. The OAuth token stays
+# host-side and never enters any container.
+#
+# Install (owner go-live step — NOT auto-installed):
+#   mkdir -p ~/.hermes-relay/claude-home/.claude
+#   ln -sf ~/.claude/.credentials.json ~/.hermes-relay/claude-home/.claude/.credentials.json
+#   umask 077; head -c 32 /dev/urandom | base64 > ~/.hermes-relay/client.token
+#   chmod 700 ~/.hermes-relay; chmod 600 ~/.hermes-relay/client.token
+#   cp relay/hermes-advisory-relay.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hermes-advisory-relay.service
+#   loginctl enable-linger "$USER"    # survive logout
+#
+# The socket + token live under ~/.hermes-relay (0700), which is bind-mounted
+# read-only into the `hermes` gateway container ONLY (never the dashboard).
+
+[Unit]
+Description=Hermes Advisory Relay (toolless Claude second opinion over UDS — PRD-035)
+After=default.target
+
+[Service]
+Type=simple
+# venv python running the relay module from the fork checkout.
+WorkingDirectory=%h/hermes/hermes-agent
+ExecStart=%h/hermes/hermes-agent/venv/bin/python -m relay.advisory_relay
+Restart=on-failure
+RestartSec=5
+
+# Relay-process resource caps (the child claude is separately bounded by the
+# transient per-consult service the relay spawns — MemoryMax/RuntimeMaxSec).
+MemoryMax=1G
+CPUQuota=200%
+
+# The relay holds the OAuth token path; keep the process itself minimal-priv.
+NoNewPrivileges=true
+PrivateTmp=true
+
+Environment=HERMES_RELAY_DIR=%h/.hermes-relay
+# PYTHONPATH so `relay` + `autonomy` import from the fork checkout.
+Environment=PYTHONPATH=%h/hermes/hermes-agent
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
