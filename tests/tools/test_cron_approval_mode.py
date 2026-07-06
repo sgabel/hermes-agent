@@ -232,29 +232,55 @@ class TestCronModeInteractions:
             result = check_dangerous_command("rm -rf /", "docker")
             assert result["approved"]
 
-    def test_yolo_overrides_cron_deny(self, monkeypatch):
-        """--yolo still bypasses cron_mode=deny for dangerous (non-hardline) commands."""
+    def test_unattended_markers_beat_yolo_under_cron_deny(self, monkeypatch):
+        """PRD-044 (owner decision 2026-07-06): unattended markers BEAT YOLO.
+
+        Inverts the pre-044 `test_yolo_overrides_cron_deny`. `hermes -z` sets
+        HERMES_YOLO_MODE=1 unconditionally, so if YOLO outranked the cron floor
+        the PRD-034 overnight orchestrator's unattended marker would be dead and
+        every dangerous command would auto-approve. Under a governed-unattended
+        identity (cron here) a dangerous, non-contained command is now BLOCKED at
+        the cron_mode=deny floor even with YOLO frozen on.
+        """
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_YOLO_MODE", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
 
-        # _YOLO_MODE_FROZEN is frozen at module import time (security: prevents
-        # prompt injection from runtime-setting HERMES_YOLO_MODE). When the
-        # test process imports tools.approval BEFORE this test sets the env,
-        # the frozen value is False and yolo-bypass paths don't activate.
-        # Patch the module attribute directly to simulate process-startup
-        # with HERMES_YOLO_MODE=1.
+        # _YOLO_MODE_FROZEN is frozen at import; patch it to simulate a process
+        # started with HERMES_YOLO_MODE=1 (as `-z` does).
         from unittest.mock import patch as mock_patch
         import tools.approval
         with (
             mock_patch.object(tools.approval, "_YOLO_MODE_FROZEN", True),
             mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            # A container-contained run would legitimately allow contained cmds;
+            # force not-contained so the deny floor is the path under test.
+            mock_patch("tools.approval._is_contained_ok", return_value=False),
         ):
-            # Use a dangerous-but-not-hardline command — `rm -rf /` is now
-            # hardline-blocked regardless of yolo (see test_hardline_blocklist.py).
+            # Dangerous-but-not-hardline (`rm -rf /` is hardline-blocked anyway).
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
-            assert result["approved"]
+            assert result["approved"] is False
+            assert "cron" in result["message"].lower()
+
+    def test_yolo_still_bypasses_for_unmarked_legacy(self, monkeypatch):
+        """PRD-044: markers beat YOLO, but plain `-z` (no markers) is unchanged.
+
+        An unmarked_legacy context under YOLO still auto-approves — we only
+        inverted the precedence for GOVERNED-UNATTENDED identities, so existing
+        `-z` users see no behavior change.
+        """
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_AUTONOMOUS", raising=False)
+        monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        import tools.approval
+        with mock_patch.object(tools.approval, "_YOLO_MODE_FROZEN", True):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert result["approved"] is True
 
     def test_non_cron_non_interactive_still_auto_approves(self, monkeypatch):
         """Non-cron, non-interactive sessions (e.g. scripted usage) still auto-approve."""

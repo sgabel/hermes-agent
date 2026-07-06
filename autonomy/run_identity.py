@@ -201,12 +201,19 @@ def _gateway_context() -> bool:
     """
     if _env_truthy("HERMES_GATEWAY_SESSION"):
         return True
+    # Prefer the task-local session platform (the concurrent-gateway path binds
+    # it via contextvars), but fall back to a raw env read when the contextvar is
+    # unset OR was cleared to "" — otherwise a cleared contextvar would suppress
+    # a legitimately env-set platform. Honoring env here can only make a run MORE
+    # attended (an extra approval prompt), never less — so it is fail-safe.
     try:
         from gateway.session_context import get_session_env
 
-        return bool(get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+        if bool(get_session_env("HERMES_SESSION_PLATFORM", "") or ""):
+            return True
     except Exception:
-        return bool(os.getenv("HERMES_SESSION_PLATFORM", "") or "")
+        pass
+    return bool(os.getenv("HERMES_SESSION_PLATFORM", "") or "")
 
 
 # ---------------------------------------------------------------------------

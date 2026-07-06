@@ -92,7 +92,13 @@ class TestSecretRefusal:
 
 class TestCronRouting:
     def test_cron_skips_discord_gate_and_calls_relay(self, monkeypatch):
-        monkeypatch.setattr(t, "_in_cron_context", lambda: True)
+        # PRD-044: cron is now simulated via the env marker the classifier reads
+        # (classify_run), not the retired _in_cron_context patch. Behavior under
+        # test is unchanged: a governed-unattended (cron) consult skips the local
+        # gate and the surface label is the run-identity name.
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         with patch("tools.approval.check_all_command_guards") as gate, \
              patch("tools.claude_review_tool._call_relay", return_value=_relay_ok()) as call:
             out = json.loads(t.ask_claude(prompt="pre-action sanity check"))

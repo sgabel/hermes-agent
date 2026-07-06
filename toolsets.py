@@ -57,9 +57,12 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Claude Sonnet second-opinion (PRD-024) — gated: check_fn hides it in cron
-    # (HERMES_CRON_SESSION) until the budget governor (PRD-028) exists, and the
-    # handler runs the approval+tirith gate + input secret-redaction itself.
+    # Claude advisory second-opinion — now the PRD-035 host relay (toolless
+    # Claude over UDS; supersedes the PRD-024 direct-spawn). NOT cron-hidden any
+    # more: governed-unattended consults are ALLOWED via the relay, whose four
+    # checks (bearer / credential classifier / kill-switch / budget) are
+    # authoritative; the attended + unmarked_legacy path additionally runs the
+    # local approval+tirith gate. Surface label is run-identity-sourced (PRD-044).
     "ask_claude",
     # Cronjob management
     "cronjob",
