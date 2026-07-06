@@ -12709,7 +12709,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
@@ -12720,11 +12720,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
         )
+        # PRD-044 (code/security review N1 / MEDIUM-2): bind the ATTENDED run
+        # identity per-turn via the classifier contextvar so a gateway turn wins
+        # at precedence-1 and never falls through to a process-global
+        # HERMES_CRON_SESSION set by a CONCURRENT in-process cron job (same
+        # container = gateway + scheduler). Without this, an attended Discord
+        # command issued while a nightly cron job runs would misclassify as cron
+        # (blocked under cron_mode:deny; auto-approved under cron_mode:approve).
+        # The binding rides into executor-thread tool gates via
+        # _run_in_executor_with_context's copy_context(). Reset in
+        # _clear_session_env. Tagged so the mixed token list stays unambiguous.
+        try:
+            from autonomy.run_identity import bind_run_identity, GATEWAY_ATTENDED
+
+            _ri_token = bind_run_identity(GATEWAY_ATTENDED)
+            tokens = list(tokens) + [("__run_identity_token__", _ri_token)]
+        except Exception:
+            logger.debug("gateway run-identity bind failed (non-fatal)", exc_info=True)
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
-        clear_session_vars(tokens)
+        # PRD-044: reset the per-turn run-identity binding first (tagged tuple),
+        # then clear the plain session vars. clear_session_vars ignores its token
+        # arg (it var.set("")s), so a mixed list is harmless — but filter for
+        # clarity and to reset the identity token deterministically.
+        plain = []
+        for tok in tokens or []:
+            if isinstance(tok, tuple) and len(tok) == 2 and tok[0] == "__run_identity_token__":
+                try:
+                    from autonomy.run_identity import reset_run_identity
+                    reset_run_identity(tok[1])
+                except Exception:
+                    logger.debug("gateway run-identity reset failed (non-fatal)", exc_info=True)
+            else:
+                plain.append(tok)
+        clear_session_vars(plain)
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""

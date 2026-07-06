@@ -417,7 +417,18 @@ def is_unattended(ctx: Optional[Dict[str, Any]] = None) -> bool:
 
         return classify_run().unattended_floor
     except Exception:
-        # Defensive fallback to the pre-044 env reads (never laxer).
+        # Defensive fallback (code/security review LOW-1): consult the contextvar
+        # binding FIRST — it is the sole representation of orchestrated_headless/
+        # proactive/delegated_child — then the env markers, so a bound unattended
+        # identity is not lost if classify_run() ever raises. Fails toward the
+        # floor (never laxer than the pre-044 env-only read).
+        try:
+            from autonomy.run_identity import bound_identity, _UNATTENDED_FLOOR
+
+            if bound_identity() in _UNATTENDED_FLOOR:
+                return True
+        except Exception:
+            pass
         return bool(os.getenv("HERMES_CRON_SESSION") or os.getenv("HERMES_AUTONOMOUS"))
 
 

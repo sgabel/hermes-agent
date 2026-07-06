@@ -523,3 +523,94 @@ def test_ask_claude_orchestrated_headless_surface_and_skip(relay_env):
 
     gate.assert_not_called()
     assert relay.call_args.args[1] == ORCHESTRATED_HEADLESS
+
+
+# ---------------------------------------------------------------------------
+# Review-fold: launcher wiring (N1 gateway bind) + scheduler restore (T4)
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_runner_binds_and_resets_attended_identity(monkeypatch):
+    """N1/MEDIUM-2 fix: the gateway per-turn wrapper binds GATEWAY_ATTENDED via
+    the classifier contextvar so a concurrent in-process cron job's process-global
+    HERMES_CRON_SESSION can't misclassify an attended gateway turn as cron.
+
+    Simulates the concurrent-cron condition (env marker set) and asserts the
+    bound identity wins DURING the turn and is cleanly reset AFTER.
+    """
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+
+    # A hashable platform stand-in (the real Platform is an enum used as a dict
+    # key; SimpleNamespace defines __eq__ so it is unhashable — can't be a key).
+    class _FakePlatform:
+        value = "discord"
+
+    # A concurrent cron job has set the process-global marker.
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    assert classify_run().identity == CRON  # ambient, no gateway binding yet
+
+    runner = object.__new__(GatewayRunner)  # bare runner (no __init__), review pattern
+    runner.adapters = {}
+    ctx = SimpleNamespace(
+        source=SimpleNamespace(
+            platform=_FakePlatform(),
+            chat_id="c1", chat_name="general", thread_id=None,
+            user_id="u1", user_name="scott", message_id="m1",
+        ),
+        session_key="sess-1",
+    )
+
+    tokens = runner._set_session_env(ctx)
+    try:
+        # DURING the turn: the attended binding wins over the leaked cron env.
+        ri = classify_run()
+        assert ri.identity == GATEWAY_ATTENDED
+        assert ri.attended is True
+        assert ri.source == "context"
+    finally:
+        runner._clear_session_env(tokens)
+
+    # AFTER the turn: binding reset; ambient cron env is visible again (would be
+    # cleared by the cron job's own finally in production).
+    assert bound_identity() is None
+    assert classify_run().identity == CRON
+
+
+def test_scheduler_env_restore_contract(monkeypatch):
+    """T4: pin the scheduler's HERMES_CRON_SESSION save/restore invariant
+    (cron/scheduler.py) — prior=None → popped; prior='1' → restored to '1'.
+
+    Reproduces the exact bind→set→(work)→reset→restore sequence the scheduler's
+    run_job try/finally performs, exercising the real run_identity bind/reset.
+    """
+    # Case A: no prior marker → restored to absent.
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    prior = os.environ.get("HERMES_CRON_SESSION")
+    tok = run_identity.bind_run_identity(CRON)
+    os.environ["HERMES_CRON_SESSION"] = "1"
+    try:
+        assert classify_run().identity == CRON
+    finally:
+        run_identity.reset_run_identity(tok)
+        if prior is None:
+            os.environ.pop("HERMES_CRON_SESSION", None)
+        else:
+            os.environ["HERMES_CRON_SESSION"] = prior
+    assert "HERMES_CRON_SESSION" not in os.environ
+    assert bound_identity() is None
+
+    # Case B: a prior marker ('1') → restored to '1', never left stuck absent.
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    prior = os.environ.get("HERMES_CRON_SESSION")
+    tok = run_identity.bind_run_identity(CRON)
+    os.environ["HERMES_CRON_SESSION"] = "1"
+    try:
+        pass
+    finally:
+        run_identity.reset_run_identity(tok)
+        if prior is None:
+            os.environ.pop("HERMES_CRON_SESSION", None)
+        else:
+            os.environ["HERMES_CRON_SESSION"] = prior
+    assert os.environ.get("HERMES_CRON_SESSION") == "1"

@@ -45,11 +45,18 @@ def _audit_unmarked_legacy_autoapprove(command: str, description: str) -> None:
     try:
         from autonomy import audit
 
+        # Redact at the call site (review LOW-2) — do not rely solely on the
+        # ledger's own redactor for a durable, tamper-evident row. The ledger
+        # ALSO runs redact_for_autonomy fail-closed, so this is defense-in-depth.
+        try:
+            _safe_cmd = _redact_secrets(command)[:200]
+        except Exception:
+            _safe_cmd = "[REDACTED]"
         audit.record(
             tier="T2",
             surface="unmarked_legacy",
             action=f"autoapprove_dangerous: {description}",
-            rationale=f"WARNING: no run-identity marker; auto-approved: {command[:200]}",
+            rationale=f"WARNING: no run-identity marker; auto-approved: {_safe_cmd}",
             authority="unmarked-legacy-autoapprove",
             outcome="approved",
         )
@@ -1541,6 +1548,16 @@ def check_dangerous_command(command: str, env_type: str,
     # command via YOLO and the unattended floor would be dead. Gateway /yolo is
     # session-scoped; CLI --yolo remains process-scoped via the env var.
     if not _unattended and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
+        # Census (review INFO-1): an unmarked_legacy run (plain `-z` sets
+        # HERMES_YOLO_MODE) auto-approves dangerous commands via THIS bypass,
+        # before the fall-through audit branch below. Record them too so the
+        # caller census that gates the eventual fail-closed flip isn't a
+        # systematic undercount. Only pay the detection cost for legacy runs
+        # (an attended /yolo session is not a flip candidate).
+        if _identity.is_legacy:
+            _is_dangerous_yolo, _pk_yolo, _desc_yolo = detect_dangerous_command(command)
+            if _is_dangerous_yolo:
+                _audit_unmarked_legacy_autoapprove(command, _desc_yolo)
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):

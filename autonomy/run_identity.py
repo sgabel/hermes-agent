@@ -77,6 +77,29 @@ _UNATTENDED_FLOOR = frozenset(
     {CRON, ORCHESTRATED_HEADLESS, PROACTIVE, DELEGATED_CHILD}
 )
 
+# ---------------------------------------------------------------------------
+# LAUNCHER-WIRING STATUS (review HIGH-1 / T2 — read before assuming a floor).
+# The classifier + gate logic are correct, but a floor identity only PROTECTS a
+# run if some launcher actually BINDS it (or sets its env marker). Current
+# wiring:
+#   cron               -> BOUND (cron/scheduler.py binds CRON + sets env).       ✅
+#   gateway_attended   -> BOUND (gateway/run.py._set_session_env per-turn).      ✅
+#   interactive_cli    -> env marker (HERMES_INTERACTIVE) — attended, no floor.  ✅
+#   orchestrated_headless -> NOT wired here. HERMES_AUTONOMOUS has NO writer yet;
+#                            PRD-034's interim sets HERMES_CRON_SESSION (→ cron,
+#                            floored). The canonical bind is a PRD-034 deliverable.
+#   proactive          -> NOT wired (PRD-027 deliverable — its launcher binds it).
+#   delegated_child    -> NOT wired. 044 Constraints scope it to classification +
+#                         docs ONLY (enforcement is PRD-015 Phase 2 / PRD-040).
+#                         A child of an ATTENDED parent classifies attended today.
+# CONTRACT: any NEW unattended launcher (034 overnight, 027 proactive) MUST bind
+# its identity via bind_run_identity()/run_identity_scope() OR set an unattended
+# env marker — otherwise it inherits the `-z` YOLO auto-approve. This is the
+# FR-4 launcher contract; the fail-closed backstop is parked
+# (prd044-unmarked-legacy-failclosed-flip). Do NOT read the four-identity floor
+# set as "all four are enforced today" — only cron + (attended) gateway are wired.
+# ---------------------------------------------------------------------------
+
 #: All identities a launcher/context may legitimately bind.
 VALID_IDENTITIES = _ATTENDED | _UNATTENDED_FLOOR | {UNMARKED_LEGACY}
 
@@ -226,6 +249,14 @@ def classify_run() -> RunIdentity:
 
     Named ``classify_run`` (not ``classify``) to avoid collision with
     ``capability_policy.classify()`` (the tool-tier function).
+
+    **No-raise contract (review T3):** this function MUST NOT raise — it is
+    called unguarded inside the approval gates (`tools/approval.py`), where an
+    uncaught exception would propagate into the security-critical approval path.
+    Every branch here is an ``os.getenv`` / contextvar read or a frozen-dataclass
+    construction; the only import (`_gateway_context`) is wrapped in try/except.
+    Keep it that way — if a future edit could raise, wrap it and fail toward the
+    most restrictive plausible identity, never toward attended.
     """
     # 1. Explicit run-context binding — highest precedence, the authoritative
     #    wire format for in-process launchers and delegated children.

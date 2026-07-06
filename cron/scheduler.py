@@ -1798,9 +1798,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # readers (memory-ingest gating, delivery routing) still read it — but it is
     # RESTORED to its prior value in the finally so it is no longer sticky.
     from autonomy.run_identity import bind_run_identity, reset_run_identity, CRON as _RI_CRON
-    _run_identity_token = bind_run_identity(_RI_CRON)
+    # Capture prior env + init the token BEFORE the try; the actual bind + env
+    # mutation happen as the FIRST action INSIDE the try (code-review T1) so a
+    # raise anywhere in setup can never leave HERMES_CRON_SESSION stuck
+    # process-global past the finally — the exact permanent-sticky STOP-2 class
+    # this PRD set out to kill. Token init keeps the finally safe if we raise
+    # before binding.
+    _run_identity_token = None
     _prior_cron_env = os.environ.get("HERMES_CRON_SESSION")
-    os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -1865,6 +1870,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
     try:
+        # PRD-044 (T1): bind cron identity + set the env marker as the FIRST
+        # action inside the try, so the finally ALWAYS restores them. The
+        # setup above (session/delivery contextvars, workdir) does not read
+        # HERMES_CRON_SESSION, so doing this here (vs before the try) is safe.
+        _run_identity_token = bind_run_identity(_RI_CRON)
+        os.environ["HERMES_CRON_SESSION"] = "1"
+
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
         from dotenv import load_dotenv
@@ -2280,10 +2292,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # PRD-044: reset the per-run identity binding and restore (not blindly
         # unset) HERMES_CRON_SESSION so it is no longer sticky across jobs and
         # never leaks into a later attended gateway session in this process.
-        try:
-            reset_run_identity(_run_identity_token)
-        except Exception:
-            pass
+        if _run_identity_token is not None:
+            try:
+                reset_run_identity(_run_identity_token)
+            except Exception:
+                pass
         if _prior_cron_env is None:
             os.environ.pop("HERMES_CRON_SESSION", None)
         else:
