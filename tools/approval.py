@@ -23,7 +23,38 @@ from hermes_cli.config import cfg_get
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
 
+from autonomy.run_identity import (
+    classify_run,
+    INTERACTIVE_CLI as RI_INTERACTIVE_CLI,
+    GATEWAY_ATTENDED as RI_GATEWAY_ATTENDED,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _audit_unmarked_legacy_autoapprove(command: str, description: str) -> None:
+    """Write a WARNING audit-ledger row when an ``unmarked_legacy`` run
+    auto-approves a dangerous command (PRD-044).
+
+    The unmarked_legacy identity preserves today's non-interactive auto-approve
+    behavior (no breakage) but the owner decision is to MEASURE the hole: every
+    dangerous auto-approval through this path is recorded so the eventual
+    fail-closed flip has a caller census. Best-effort — a ledger failure must
+    never block the command path.
+    """
+    try:
+        from autonomy import audit
+
+        audit.record(
+            tier="T2",
+            surface="unmarked_legacy",
+            action=f"autoapprove_dangerous: {description}",
+            rationale=f"WARNING: no run-identity marker; auto-approved: {command[:200]}",
+            authority="unmarked-legacy-autoapprove",
+            outcome="approved",
+        )
+    except Exception:
+        logger.debug("unmarked_legacy audit row failed (non-fatal)", exc_info=True)
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
@@ -1497,9 +1528,19 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # PRD-044: ONE canonical run-identity verdict replaces the inline attended/
+    # unattended env-precedence logic. ``unattended_floor`` = a governed
+    # unattended run (cron / orchestrated_headless / proactive / delegated_child).
+    _identity = classify_run()
+    _unattended = _identity.unattended_floor
+
+    # --yolo: bypass all approval prompts — EXCEPT for a governed-unattended run.
+    # PRD-044 (owner decision 2026-07-06): unattended markers BEAT YOLO. `hermes
+    # -z` sets HERMES_YOLO_MODE=1 unconditionally, so without this an
+    # orchestrated-headless overnight run would auto-approve every dangerous
+    # command via YOLO and the unattended floor would be dead. Gateway /yolo is
+    # session-scoped; CLI --yolo remains process-scoped via the env var.
+    if not _unattended and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled()):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -1513,13 +1554,10 @@ def check_dangerous_command(command: str, env_type: str,
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
-    # Cron/autonomous absolute override (PRD-015 FR-1a / STOP-1): the in-process
-    # scheduler inherits the gateway/CLI attended flags, so force them False under
-    # HERMES_CRON_SESSION / HERMES_AUTONOMOUS to guarantee unattended work reaches
-    # the cron_mode floor.
-    _unattended = env_var_enabled("HERMES_CRON_SESSION") or env_var_enabled("HERMES_AUTONOMOUS")
-    is_cli = env_var_enabled("HERMES_INTERACTIVE") and not _unattended
-    is_gateway = _is_gateway_approval_context() and not _unattended
+    # Attended identities (a human is present) come straight from the classifier;
+    # an unattended_floor run is never cli/gateway by construction.
+    is_cli = _identity.identity == RI_INTERACTIVE_CLI
+    is_gateway = _identity.identity == RI_GATEWAY_ATTENDED
 
     if not is_cli and not is_gateway:
         # Cron / autonomous: respect cron_mode config (no human present to approve)
@@ -1539,10 +1577,15 @@ def check_dangerous_command(command: str, env_type: str,
                         "approvals.cron_mode: approve in config.yaml."
                     ),
                 }
+        else:
+            # PRD-044 unmarked_legacy: no markers, no human — today's behavior is
+            # to auto-approve. Preserved (no breakage) but now LABELED + a WARNING
+            # audit row per dangerous auto-approval so the hole is measured.
+            _audit_unmarked_legacy_autoapprove(command, description)
         logger.warning(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context "
-            "(pattern: %s): %s — set HERMES_INTERACTIVE or HERMES_GATEWAY_SESSION to require approval.",
-            description, command[:200],
+            "(identity=%s, pattern: %s): %s — set HERMES_INTERACTIVE or HERMES_GATEWAY_SESSION to require approval.",
+            _identity.identity, description, command[:200],
         )
         return {"approved": True, "message": None}
 
@@ -1769,27 +1812,35 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # PRD-044: single run-identity verdict. Preserves the PRD-015 FR-1a intent
+    # (in-process scheduler / cli.py leak the gateway/CLI attended flags — the
+    # gateway sets HERMES_EXEC_ASK=1 at import, cli.py sets HERMES_INTERACTIVE=1)
+    # but now via ONE classifier: an unattended marker forces the cron floor and
+    # keeps the smart-approval guardian strictly attended-only (no --parallel-1
+    # llama.cpp contention). ``unattended_floor`` = cron/orchestrated_headless/
+    # proactive/delegated_child.
+    _identity = classify_run()
+    _unattended = _identity.unattended_floor
+
+    # --yolo or approvals.mode=off: bypass — EXCEPT governed-unattended runs
+    # (PRD-044: markers beat YOLO; -z sets HERMES_YOLO_MODE unconditionally).
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not _unattended and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    # Cron/autonomous runs are NEVER attended, even though the in-process scheduler
-    # thread inherits the gateway/CLI attended flags: the gateway sets
-    # HERMES_EXEC_ASK=1 at module import and cli.py sets HERMES_INTERACTIVE=1, and
-    # the cron thread runs in that same process. Force all three attended flags
-    # False under HERMES_CRON_SESSION / HERMES_AUTONOMOUS so unattended work ALWAYS
-    # reaches the cron_mode floor + capability-policy enforce gate instead of leaking
-    # into the smart-approve / human-prompt paths (PRD-015 FR-1a / STOP-1). This also
-    # keeps the smart-approval guardian LLM strictly attended-only, so it never
-    # contends for the single llama.cpp lane during a --parallel 1 automation run.
-    _unattended = env_var_enabled("HERMES_CRON_SESSION") or env_var_enabled("HERMES_AUTONOMOUS")
-    is_cli = env_var_enabled("HERMES_INTERACTIVE") and not _unattended
-    is_gateway = _is_gateway_approval_context() and not _unattended
+    is_cli = _identity.identity == RI_INTERACTIVE_CLI
+    is_gateway = _identity.identity == RI_GATEWAY_ATTENDED
+    # HERMES_EXEC_ASK is an approval-CHANNEL signal (route to the gateway async
+    # decision, not a TTY prompt), NOT identity precedence — the classifier
+    # already folded it into interactive_cli and decided attended/unattended.
+    # We still read it here to pick the delivery channel, gated on the
+    # classifier's unattended verdict (an unattended run never uses the ask
+    # channel). Census disposition: channel-routing read, annotated (PRD-044).
     is_ask = env_var_enabled("HERMES_EXEC_ASK") and not _unattended
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
@@ -1812,6 +1863,12 @@ def check_all_command_guards(command: str, env_type: str,
                             "approvals.cron_mode: approve in config.yaml."
                         ),
                     }
+        else:
+            # PRD-044 unmarked_legacy: preserve today's auto-approve, but audit
+            # dangerous ones (WARNING) so the hole is measured.
+            _is_dangerous_leg, _pk_leg, _desc_leg = detect_dangerous_command(command)
+            if _is_dangerous_leg:
+                _audit_unmarked_legacy_autoapprove(command, _desc_leg)
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -2106,27 +2163,41 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
     if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    # PRD-044: run-identity verdict. NAMED ACCEPTED DELTA vs pre-044 — this guard
+    # previously keyed the unattended floor off HERMES_CRON_SESSION ONLY, so under
+    # HERMES_AUTONOMOUS (orchestrated_headless) it fell through to attended/
+    # auto-approve. It now honors ALL governed-unattended identities (closes a
+    # live gap: the overnight -z run's execute_code reaches the same contained
+    # floor cron already had). Pinned by FR-5 tests.
+    _identity = classify_run()
+    _unattended = _identity.unattended_floor
+
+    # --yolo or approvals.mode=off: bypass — EXCEPT governed-unattended
+    # (PRD-044: markers beat YOLO).
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not _unattended and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_gateway = _identity.identity == RI_GATEWAY_ATTENDED
+    # EXEC_ASK channel signal, gated on the classifier's unattended verdict.
+    is_ask = env_var_enabled("HERMES_EXEC_ASK") and not _unattended
 
-    # Cron: no user is present to approve arbitrary code. When the agent runs in
-    # the locked container, execute_code is contained (no host route except the
-    # /opt/data bind-mount) → allow; otherwise it can reach the host → block.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    # Governed-unattended: no user is present to approve arbitrary code. When the
+    # agent runs in the locked container, execute_code is contained (no host route
+    # except the /opt/data bind-mount) → allow; otherwise it can reach the host
+    # → block.
+    if _unattended:
         if _get_cron_approval_mode() == "deny" and not _local_exec_is_contained():
             return {
                 "approved": False,
                 "message": (
                     "BLOCKED: execute_code runs arbitrary local Python "
                     "(including subprocess calls that bypass shell-string "
-                    "approval checks). Cron jobs run without a user present "
+                    "approval checks). Unattended runs have no user present "
                     "to approve it. Use normal tools instead, or set "
-                    "approvals.cron_mode: approve only if this cron profile "
+                    "approvals.cron_mode: approve only if this profile "
                     "is intentionally trusted."
                 ),
                 "pattern_key": pattern_key,

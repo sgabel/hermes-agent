@@ -402,13 +402,23 @@ def is_unattended(ctx: Optional[Dict[str, Any]] = None) -> bool:
     gate covers attended T4. Unattended is where deny-by-default T4 + per-action
     budget/kill-switch (R3) bite.
     """
+    # PRD-044: the explicit ctx override stays HIGHEST precedence — the cron
+    # scheduler passes ctx={"unattended": True} for the `cron_script` gate, which
+    # fires BEFORE any env marker/run-context binding exists. Preserved exactly.
     if ctx and ctx.get("unattended") is not None:
         return bool(ctx["unattended"])
-    if os.getenv("HERMES_CRON_SESSION"):
-        return True
-    if os.getenv("HERMES_AUTONOMOUS"):
-        return True
-    return False
+    # Otherwise defer to the ONE canonical classifier. Use ``unattended_floor``
+    # (governed unattended: cron/orchestrated_headless/proactive/delegated_child)
+    # — NOT ``is_unattended`` — so an ``unmarked_legacy`` context stays on the
+    # attended path (owner decision: keep today's behavior; the approval layer
+    # audits it, the capability tier does not flip here). No privilege change.
+    try:
+        from autonomy.run_identity import classify_run
+
+        return classify_run().unattended_floor
+    except Exception:
+        # Defensive fallback to the pre-044 env reads (never laxer).
+        return bool(os.getenv("HERMES_CRON_SESSION") or os.getenv("HERMES_AUTONOMOUS"))
 
 
 # ---------------------------------------------------------------------------

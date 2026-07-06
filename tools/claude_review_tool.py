@@ -66,6 +66,24 @@ def _in_cron_context() -> bool:
     return bool(os.environ.get("HERMES_CRON_SESSION"))
 
 
+def _run_identity():
+    """PRD-044: the canonical run-identity verdict for this consult.
+
+    Replaces the binary cron check for BOTH the local-gate decision and the
+    relay ``surface`` label. Governed-unattended consults (cron /
+    orchestrated_headless / proactive / delegated_child) stay ALLOWED via the
+    relay (owner decision 2026-07-06 — preserves PRD-035 FR-7) and skip the
+    interactive-only local approval/tirith screen; the relay's four checks are
+    authoritative there. Attended + unmarked_legacy consults run the local gate.
+    """
+    try:
+        from autonomy.run_identity import classify_run
+
+        return classify_run()
+    except Exception:
+        return None
+
+
 def _relay_available() -> bool:
     """Availability predicate — the relay socket + token must both be present."""
     return os.path.exists(_RELAY_SOCKET) and os.path.exists(_RELAY_TOKEN_PATH)
@@ -155,7 +173,15 @@ def ask_claude(prompt: str = "", context: str = "", **_) -> str:
     # FR-9: interactive path keeps the Discord approval + tirith inspection of the
     # OUTBOUND PROMPT (fed the assembled payload, not a synthetic constant). Skipped
     # in cron — there the relay's own checks are authoritative (FR-7).
-    if not _in_cron_context():
+    _identity = _run_identity()
+    # Governed-unattended runs skip the interactive-only local approval/tirith
+    # screen (the relay's checks are authoritative); attended + unmarked_legacy
+    # run it. Falls back to the pre-044 cron check if the classifier is
+    # unavailable (never laxer: env cron still skips).
+    _skip_local_gate = (
+        _identity.unattended_floor if _identity is not None else _in_cron_context()
+    )
+    if not _skip_local_gate:
         try:
             from tools.approval import check_all_command_guards
             decision = check_all_command_guards(assembled, env_type="local")
@@ -173,7 +199,13 @@ def ask_claude(prompt: str = "", context: str = "", **_) -> str:
                 success=False, blocked="gate",
             )
 
-    surface = "cron" if _in_cron_context() else "interactive"
+    # PRD-044: classifier-sourced surface label (honest attended/unattended +
+    # identity name). Still an UNTRUSTED analytics label at the relay — never a
+    # gating input there (relay/advisory_relay.py). A relay-authenticatable
+    # signal is parked as `prd035-relay-authenticated-surface-signal`.
+    surface = _identity.identity if _identity is not None else (
+        "cron" if _in_cron_context() else "interactive"
+    )
     try:
         status, body = _call_relay(assembled, surface)
     except Exception as e:

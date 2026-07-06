@@ -1787,9 +1787,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
+    # PRD-044 (Opus/Codex STOP-2): bind this run's identity via the classifier
+    # contextvar — the AUTHORITATIVE wire format. Previously this line did
+    #     os.environ["HERMES_CRON_SESSION"] = "1"
+    # process-globally and NEVER unset it, so after the first agent-mode cron job
+    # every subsequent *attended* gateway session in this process classified
+    # unattended (approval floor misapplied, ask_claude gate skipped + mislabeled,
+    # budget/audit attribution polluted). We now bind per-run and restore in the
+    # finally. The env var is still set for the job's duration — many unmigrated
+    # readers (memory-ingest gating, delivery routing) still read it — but it is
+    # RESTORED to its prior value in the finally so it is no longer sticky.
+    from autonomy.run_identity import bind_run_identity, reset_run_identity, CRON as _RI_CRON
+    _run_identity_token = bind_run_identity(_RI_CRON)
+    _prior_cron_env = os.environ.get("HERMES_CRON_SESSION")
     os.environ["HERMES_CRON_SESSION"] = "1"
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
@@ -2267,6 +2277,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        # PRD-044: reset the per-run identity binding and restore (not blindly
+        # unset) HERMES_CRON_SESSION so it is no longer sticky across jobs and
+        # never leaks into a later attended gateway session in this process.
+        try:
+            reset_run_identity(_run_identity_token)
+        except Exception:
+            pass
+        if _prior_cron_env is None:
+            os.environ.pop("HERMES_CRON_SESSION", None)
+        else:
+            os.environ["HERMES_CRON_SESSION"] = _prior_cron_env
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected
