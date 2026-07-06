@@ -53,6 +53,7 @@ from autonomy.exec_profile import (
     assert_tool_surface,
     get_exec_profile,
     in_quiet_window,
+    is_silent_suppression,
     known_profile_names,
     resolve_pinned_target,
     resolve_quiet_hours,
@@ -741,10 +742,10 @@ def test_ac003_exact_silent_skips_delivery_outcome_ok(monkeypatch):
     assert budget.get_usage()["totals"]["proactive_messages"] == 0
 
 
-def test_ac003_message_containing_silent_is_delivered(monkeypatch):
-    """EXACT-match [SILENT] only: a message that merely CONTAINS the marker is a
-    real message and IS delivered (the global cron path's substring test would
-    wrongly drop it)."""
+def test_ac003_message_mentioning_silent_midtext_is_delivered(monkeypatch):
+    """Trailing-sentinel: a real message that merely MENTIONS the marker mid-text
+    (marker is NOT the terminal token) IS delivered — only a trailing [SILENT]
+    suppresses."""
     _patch_happy_gates(monkeypatch)
     _stub_marks(monkeypatch)
     _stub_run_job_returns(monkeypatch, "here is a note mentioning [SILENT] inline")
@@ -758,6 +759,46 @@ def test_ac003_message_containing_silent_is_delivered(monkeypatch):
     assert delivered == ["discord:1234"]          # routed only to the pin
     assert _last_proactive_outcome() == "ok"
     assert budget.get_usage()["totals"]["proactive_messages"] == 1
+
+
+def test_ac003_narrated_then_trailing_silent_suppresses(monkeypatch):
+    """The live-observed bug (2026-07-06): the local model NARRATES its reasoning
+    then appends [SILENT] on a final line. Trailing-sentinel suppresses it — the
+    deliberation blob is NOT delivered and nothing is debited (exact-match wrongly
+    delivered this)."""
+    _patch_happy_gates(monkeypatch)
+    _stub_marks(monkeypatch)
+    _stub_run_job_returns(
+        monkeypatch,
+        "Looking at recent context, nothing here meets the bar for reaching out.\n\n[SILENT]",
+    )
+
+    def _must_not_deliver(*a, **k):
+        raise AssertionError("a narrated-then-[SILENT] response must be suppressed, not delivered")
+
+    monkeypatch.setattr(s, "_deliver_exec_profile_result", _must_not_deliver)
+    job = {"id": "sil3", "name": "p", "exec_profile": "proactive_read"}
+
+    assert s._run_exec_profile_job(job) is True
+    assert _last_proactive_outcome() == "ok"
+    assert budget.get_usage()["totals"]["proactive_messages"] == 0
+
+
+@pytest.mark.parametrize(
+    "content,expect_suppress",
+    [
+        ("[SILENT]", True),                                   # bare marker
+        ("  [SILENT]  ", True),                               # whitespace-padded
+        ("reasoning...\n\n[SILENT]", True),                   # narrated then trailing marker
+        ("line one\nline two\n[SILENT]\n", True),             # trailing marker after blank tail
+        ("here is a real message mentioning [SILENT] mid-text", False),  # mention, not terminal
+        ("[SILENT] then more content", False),                # marker first, content after
+        ("a genuinely useful nudge", False),                  # ordinary message
+        ("", False),                                          # empty
+    ],
+)
+def test_is_silent_suppression(content, expect_suppress):
+    assert is_silent_suppression(content) is expect_suppress
 
 
 def test_ac008_successful_delivery_audits_proactive_ok(monkeypatch):

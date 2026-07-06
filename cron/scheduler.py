@@ -2743,9 +2743,12 @@ def _run_exec_profile_job(job: dict, *, adapters=None, loop=None, verbose: bool 
         # message that merely mentions [SILENT]).
         deliver_content = final_response if success else ""
         should_deliver = bool(deliver_content.strip())
-        if should_deliver and deliver_content.strip() == SILENT_MARKER:
-            logger.info("Job '%s': agent returned exactly %s — skipping delivery",
-                        job_id, SILENT_MARKER)
+        # Trailing-sentinel suppression (FR-2): suppress when the LAST non-empty
+        # line is exactly the marker — robust to a local model that narrates its
+        # reasoning and then appends [SILENT] (exact-match delivered that blob).
+        if should_deliver and _exec_profile.is_silent_suppression(deliver_content):
+            logger.info("Job '%s': agent signalled suppression (trailing %s) — skipping delivery",
+                        job_id, _exec_profile.SILENT_MARKER)
             should_deliver = False
 
         delivery_error = None

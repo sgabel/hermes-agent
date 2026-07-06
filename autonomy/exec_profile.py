@@ -304,11 +304,45 @@ def is_quiet_now(cfg: Optional[dict] = None) -> bool:
     return in_quiet_window(dt.hour * 60 + dt.minute, start, end)
 
 
+# ---------------------------------------------------------------------------
+# Suppression signal (FR-2) — trailing-sentinel, robust to a chatty local model.
+# ---------------------------------------------------------------------------
+
+SILENT_MARKER = "[SILENT]"
+
+
+def is_silent_suppression(content: str) -> bool:
+    """True if *content* is a suppression signal — the run delivers nothing.
+
+    Robust to a local model that reasons ALOUD and then appends the marker
+    (observed live 2026-07-06: Qwen narrated "…nothing meets the bar … [SILENT]",
+    which an exact-match rule delivered as a real message). Suppress when the
+    **last non-empty line**, stripped, is exactly the marker — so
+    "reasoning…\\n\\n[SILENT]" suppresses, a bare "[SILENT]" suppresses, but a real
+    message that merely MENTIONS the marker mid-text still delivers (the marker
+    must be the terminal token to suppress).
+
+    This deliberately relaxes the earlier exact-match rule **for the outreach
+    surface only**. Rationale: the exact-match choice guarded against a message
+    being wrongly *dropped* — not against exfil. For proactive outreach the
+    tradeoff inverts: exact-match's failure mode (deliver a deliberation blob on
+    every "nothing to report" run) is common and defeats the feature, while
+    trailing-sentinel's failure mode is a rare, benign non-delivery. Suppression
+    always sends *less*, so it is never an exfil path; the delivery-side content
+    guards (media/secret scan) are unaffected.
+    """
+    if not content:
+        return False
+    non_empty = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    return bool(non_empty) and non_empty[-1] == SILENT_MARKER
+
+
 __all__ = [
     "ExecProfile",
     "ExecProfileError",
     "PinnedTarget",
     "PROACTIVE_READ",
+    "SILENT_MARKER",
     "get_exec_profile",
     "known_profile_names",
     "assert_tool_surface",
@@ -316,4 +350,5 @@ __all__ = [
     "resolve_quiet_hours",
     "in_quiet_window",
     "is_quiet_now",
+    "is_silent_suppression",
 ]
