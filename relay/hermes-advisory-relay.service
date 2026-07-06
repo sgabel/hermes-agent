@@ -20,6 +20,12 @@
 [Unit]
 Description=Hermes Advisory Relay (toolless Claude second opinion over UDS — PRD-035)
 After=default.target
+# N3: bound the restart storm. The startup self-canary is a REAL claude spawn
+# (unmetered Max quota); without this, a transient canary failure (Anthropic 529,
+# expired OAuth) under Restart=on-failure would fire a claude call every RestartSec
+# forever. Give up after 5 failures in 5 min → stop, don't loop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -27,7 +33,7 @@ Type=simple
 WorkingDirectory=%h/hermes/hermes-agent
 ExecStart=%h/hermes/hermes-agent/venv/bin/python -m relay.advisory_relay
 Restart=on-failure
-RestartSec=5
+RestartSec=30
 
 # Relay-process resource caps (the child claude is separately bounded by the
 # transient per-consult service the relay spawns — MemoryMax/RuntimeMaxSec).
@@ -41,6 +47,13 @@ PrivateTmp=true
 Environment=HERMES_RELAY_DIR=%h/.hermes-relay
 # PYTHONPATH so `relay` + `autonomy` import from the fork checkout.
 Environment=PYTHONPATH=%h/hermes/hermes-agent
+# S1 (go-live blocker): the systemd --user manager PATH does NOT include
+# ~/.npm-global/bin, so a bare `claude` is unresolvable under the unit. Pin the
+# ABSOLUTE path — also closes the "a different claude earlier on PATH" hole.
+Environment=HERMES_RELAY_CLAUDE_BIN=%h/.npm-global/bin/claude
+Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# NF-2: the relay + any child it resolves must never self-update the CLI.
+Environment=DISABLE_AUTOUPDATER=1
 
 StandardOutput=journal
 StandardError=journal

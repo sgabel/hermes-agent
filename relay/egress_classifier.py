@@ -28,8 +28,8 @@ the live fork, PRD-035 FR-6):
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
-import signal
 from dataclasses import dataclass
 from typing import Optional
 
@@ -65,8 +65,10 @@ def _c(pattern: str, flags: int = 0) -> re.Pattern:
 
 # JSON-key shapes for the three peer credential files. We match the *key*
 # adjacent to a quoted/bare value so a bare English word ("access denied") does
-# not trip the gate.
-_JSON_VALUE = r'\s*:\s*["\']?[^"\',}\s]'
+# not trip the gate. The value is captured GREEDILY (`+`) so that redaction masks
+# the WHOLE token, not just its first character (NF-1) — detection only needs
+# presence, but redact() reuses these patterns via .sub().
+_JSON_VALUE = r'\s*:\s*["\']?[^"\',}\s]+'
 
 _PATTERNS: list[tuple[str, re.Pattern]] = [
     # (a) Claude Code OAuth file — the container-envelope key + camelCase tokens.
@@ -94,14 +96,20 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("aws_access_key_id", _c(r'\b(?:AKIA|ASIA)[A-Z0-9]{16}\b')),
     ("slack_token", _c(r'\bxox[baprs]-[A-Za-z0-9\-]{10,}')),
     ("fireworks_key", _c(r'\bfw_[A-Za-z0-9]{20,}')),
-    # URL userinfo credentials  scheme://user:secret@host
-    ("url_userinfo", _c(r'[a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+:[^/\s:@]+@')),
+    # URL userinfo credentials  scheme://user:secret@host. Quantifiers are BOUNDED
+    # (N1) so a long run of matching chars with no "://" is O(n), not O(n^2).
+    ("url_userinfo", _c(r'[a-zA-Z][a-zA-Z0-9+.\-]{1,40}://[^/\s:@]{1,256}:[^/\s:@]{1,256}@')),
     # Token-bearing URL query / form params (the display redactor's blind spot).
     ("url_or_form_token", _c(
         r'(?:access_token|refresh_token|id_token|api[_\-]?key|auth[_\-]?token|'
         r'client[_\-]?secret|password|passwd|pwd|session|token)=[^&\s"\']{6,}',
         re.IGNORECASE,
     )),
+    # Common secret JSON-key shapes in config/code payloads (the primary review
+    # use case): "api_key"/"apiKey"/"client_secret"/"secret"/"password".
+    ("json_api_key", _c(r'["\']?api[_\-]?key["\']?' + _JSON_VALUE, re.IGNORECASE)),
+    ("json_client_secret", _c(r'["\']?client[_\-]?secret["\']?' + _JSON_VALUE, re.IGNORECASE)),
+    ("json_secret", _c(r'["\'](?:secret|password|passwd)["\']' + _JSON_VALUE, re.IGNORECASE)),
 ]
 
 # Benign high-entropy shapes we must NOT treat as secrets (avoid self-DoS on
@@ -135,7 +143,7 @@ class _ScanTimeout(Exception):
 
 def _scan(text: str) -> Optional[Finding]:
     """Return the first credential Finding, or None. Raises ClassifierError on a
-    bad input type; raises _ScanTimeout if the (backstop) alarm fires."""
+    bad input type or oversize payload."""
     if not isinstance(text, str):
         raise ClassifierError(f"payload must be str, got {type(text).__name__}")
     if len(text) > _MAX_SCAN_CHARS:
@@ -149,37 +157,22 @@ def _scan(text: str) -> Optional[Finding]:
     return _gemini_shape(text)
 
 
+# One shared single-thread executor for the scan timeout. `signal.alarm` only
+# fires on the main thread, but the relay runs consults on worker threads
+# (ThreadingMixIn) — a futures timeout is thread-safe (NF-4). The regexes are
+# all linear (bounded input, negated char classes, no nested quantifiers), so
+# the timeout is a backstop, not the primary defense.
+_SCAN_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="egress-scan")
+
+
 def _run_with_timeout(text: str) -> Optional[Finding]:
-    """Run _scan under a wall-clock alarm (main thread only). If signals are
-    unavailable (non-main thread), fall back to a direct scan — the bounded
-    payload makes a blowup practically impossible, and any real error still
-    surfaces as ClassifierError => refuse."""
+    """Run _scan under a real wall-clock timeout that works on any thread. On
+    timeout raise _ScanTimeout => the caller refuses (fail-closed)."""
+    fut = _SCAN_POOL.submit(_scan, text)
     try:
-        has_alarm = hasattr(signal, "SIGALRM")
-    except Exception:  # pragma: no cover - defensive
-        has_alarm = False
-
-    if not has_alarm:
-        return _scan(text)
-
-    def _handler(signum, frame):  # noqa: ARG001
+        return fut.result(timeout=_SCAN_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
         raise _ScanTimeout()
-
-    try:
-        old = signal.signal(signal.SIGALRM, _handler)
-    except (ValueError, OSError):
-        # Not on the main thread — no alarm available. Direct scan.
-        return _scan(text)
-
-    try:
-        signal.alarm(_SCAN_TIMEOUT_SECONDS)
-        return _scan(text)
-    finally:
-        signal.alarm(0)
-        try:
-            signal.signal(signal.SIGALRM, old)
-        except (ValueError, OSError):  # pragma: no cover
-            pass
 
 
 def contains_credential(text: str) -> tuple[bool, Optional[str]]:

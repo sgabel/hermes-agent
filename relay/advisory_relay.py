@@ -88,6 +88,22 @@ _BUDGET_KIND = "second_opinion_calls"
 _AUDIT_TIER = "T1"  # sanctioned external second-opinion egress (AGENT_SECURITY_MODEL)
 _SURFACE_LABEL_MAX = 32
 
+# NF-3: sibling credential stores the toolless child must NOT be able to read,
+# so a containment miss (a claude update re-enabling tools) cannot exfil them.
+# ~/.claude is deliberately NOT blocked — the child reads its OAuth file there.
+# The leading '-' makes systemd tolerate an absent path.
+_INACCESSIBLE_SUBDIRS = (".hermes", ".ssh", ".gnupg", ".aws", ".codex", ".config/gcloud")
+
+# NF-5: provider-credential env names neutralized (emptied) in the child even if
+# they leak into the systemd --user manager environment block. Belt-and-braces:
+# the toolless model can't read its own env, but this prevents a stray
+# ANTHROPIC_API_KEY from switching billing off OAuth to metered.
+_NEUTRALIZE_ENV = (
+    "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS", "GEMINI_API_KEY",
+)
+
 
 class RelayConfig:
     """Resolved relay settings. Paths default to the dedicated hermes-only dir."""
@@ -114,6 +130,14 @@ class RelayConfig:
         self.child_runtime_max_sec = child_runtime_max_sec
         self.consult_timeout_sec = consult_timeout_sec
         self.queue_wait_sec = queue_wait_sec
+        # Load-bearing invariant: the Python-side subprocess timeout must exceed
+        # the child's RuntimeMaxSec, else subprocess.run SIGKILLs systemd-run
+        # while the transient child runs on. Fail fast at construction.
+        if consult_timeout_sec <= child_runtime_max_sec:
+            raise ValueError(
+                f"consult_timeout_sec ({consult_timeout_sec}) must exceed "
+                f"child_runtime_max_sec ({child_runtime_max_sec})"
+            )
 
 
 class AdvisoryRelay:
@@ -125,6 +149,18 @@ class AdvisoryRelay:
         # FR-12: one consult in-flight. A bounded wait gives a small queue; past
         # it, callers get 503 rather than fanning out host processes.
         self._consult_lock = threading.Lock()
+        # NF-2: remember the claude binary's identity at canary time so we can
+        # re-canary if it changes under us (auto-update / manual reinstall).
+        self._canary_binary_sig: Optional[tuple] = None
+
+    def _binary_signature(self) -> Optional[tuple]:
+        """(size, mtime) of the resolved claude binary — a cheap change detector."""
+        try:
+            path = shutil.which(self.config.claude_bin) or self.config.claude_bin
+            st = os.stat(path)
+            return (st.st_size, int(st.st_mtime))
+        except OSError:
+            return None
 
     # -- bearer (FR-5) --------------------------------------------------------
 
@@ -144,13 +180,16 @@ class AdvisoryRelay:
     # -- toolless spawn (FR-2 / FR-3 / FR-4 / FR-12) --------------------------
 
     def _child_env(self) -> dict[str, str]:
-        """Minimal allowlist env. HOME points at the isolated creds-only dir; we
-        keep only what `claude` (a Node CLI) needs to run + read its OAuth file.
-        The host provider creds / AWS chain are NOT inherited (FR-4)."""
+        """Minimal allowlist env passed to the child via --setenv. HOME points at
+        the isolated creds-only dir; we keep only what `claude` (a Node CLI) needs
+        to run + read its OAuth file, plus DISABLE_AUTOUPDATER=1 (NF-2 — the child
+        must never self-update the on-disk binary). The host provider creds / AWS
+        chain are NOT inherited (FR-4)."""
         env = {
             "HOME": str(self.config.isolated_home),
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-            # Node/npm runtime discovery for the global `claude` install.
+            "DISABLE_AUTOUPDATER": "1",   # NF-2
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "NODE_PATH": os.environ.get("NODE_PATH", ""),
         }
         xdg = os.environ.get("XDG_RUNTIME_DIR")
@@ -162,29 +201,39 @@ class AdvisoryRelay:
         """Run the toolless claude under a hardened transient systemd service.
         Prompt is fed on stdin (never argv — FR-3). Returns (ok, text)."""
         env = self._child_env()
+        home = str(self.config.isolated_home)
         cmd = [
             "systemd-run", "--user", "--pipe", "--quiet", "--wait", "--collect",
             *_SYSTEMD_RUN_PROPS,
             "-p", f"MemoryMax={self.config.child_mem_max}",
             "-p", f"RuntimeMaxSec={self.config.child_runtime_max_sec}",
-            "-p", f"ReadWritePaths={self.config.isolated_home}",
-            f"--setenv=HOME={env['HOME']}",
-            f"--setenv=PATH={env['PATH']}",
+            "-p", f"ReadWritePaths={home}",
         ]
-        if env.get("XDG_RUNTIME_DIR"):
-            cmd.append(f"--setenv=XDG_RUNTIME_DIR={env['XDG_RUNTIME_DIR']}")
+        # NF-3: make sibling credential stores unreadable to the child (a
+        # containment miss cannot exfil ~/.hermes/.env, ~/.ssh, other OAuth files).
+        for sub in _INACCESSIBLE_SUBDIRS:
+            cmd += ["-p", f"InaccessiblePaths=-{Path.home() / sub}"]
+        # allowlisted env via --setenv …
+        for k, v in env.items():
+            cmd.append(f"--setenv={k}={v}")
+        # NF-5: neutralize any provider-credential vars that leaked into the
+        # systemd --user manager environment block (empty value clears them).
+        for name in _NEUTRALIZE_ENV:
+            cmd.append(f"--setenv={name}=")
         cmd += [self.config.claude_bin, "--model", self.config.model, *_CLAUDE_BASE_ARGS]
 
+        # The outer systemd-run process needs the user bus + a DISABLE_AUTOUPDATER
+        # so it, too, never triggers a self-update while resolving `claude`.
+        outer_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
+            "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""),
+            "DISABLE_AUTOUPDATER": "1",
+        }
         try:
             proc = subprocess.run(
-                cmd,
-                input=assembled_prompt,
-                capture_output=True,
-                text=True,
-                timeout=self.config.consult_timeout_sec,
-                env={"PATH": os.environ.get("PATH", ""),
-                     "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", ""),
-                     "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")},
+                cmd, input=assembled_prompt, capture_output=True, text=True,
+                timeout=self.config.consult_timeout_sec, env=outer_env,
             )
         except subprocess.TimeoutExpired:
             return False, "advisory consult timed out"
@@ -193,7 +242,8 @@ class AdvisoryRelay:
             return False, "advisory consult failed to spawn"
 
         if proc.returncode != 0:
-            logger.warning("claude child exited %s: %s", proc.returncode, proc.stderr[:200])
+            # N-2: never log child stderr content (may echo a prompt fragment).
+            logger.warning("claude child exited non-zero (rc=%s)", proc.returncode)
             return False, "advisory consult returned an error"
 
         return True, self._extract_text(proc.stdout)
@@ -231,6 +281,13 @@ class AdvisoryRelay:
         # surface is an UNTRUSTED analytics label only (FR-1). Never a gating input.
         surface = str(body.get("surface") or "relay")[:_SURFACE_LABEL_MAX]
 
+        # (FR-5) refuse if the relay bearer itself appears in the payload — it must
+        # never be echoed out to Anthropic (it rides the auth header, not the body).
+        if self._bearer and self._bearer in assembled:
+            self._audit(surface, action="consult refused: bearer in payload",
+                        rationale="bearer token present in prompt/context", outcome="refused_secret")
+            return 422, {"error": "refused: relay bearer must not appear in the payload"}
+
         # (2) egress classifier — fail-closed (FR-6).
         refuse, reason = egress_classifier.contains_credential(assembled)
         if refuse:
@@ -266,12 +323,26 @@ class AdvisoryRelay:
                             rationale=f"{_BUDGET_KIND} daily cap reached", outcome="degraded")
                 return 429, {"error": "second-opinion daily budget exhausted (degrade-to-ask)"}
 
+            # NF-2: if the claude binary changed since the last canary (auto-update
+            # / reinstall), re-prove toolless containment BEFORE trusting it again.
+            if self._binary_signature() != self._canary_binary_sig:
+                logger.warning("claude binary changed since last canary — re-running self-canary")
+                if not self.self_canary():
+                    self._audit(surface, action="consult refused: canary re-check failed",
+                                rationale="toolless containment not re-confirmed after binary change",
+                                outcome="blocked")
+                    return 503, {"error": "advisory relay: toolless containment re-check failed; refusing"}
+
             # spawn toolless claude (FR-2).
             ok, text = self._spawn_claude(assembled)
         finally:
             self._consult_lock.release()
 
         if not ok:
+            # Note: the admission debit above is NOT refunded on a failed spawn
+            # (FR-8 over-count trade). A persistently broken child therefore burns
+            # the daily cap — 25 consecutive 502s convert to 429s. Acceptable
+            # (fail-safe: over-count, never under-count), but worth monitoring.
             self._audit(surface, action="consult error", rationale="spawn/child error",
                         outcome="error")
             return 502, {"error": text}
@@ -331,13 +402,22 @@ class AdvisoryRelay:
         if leaked:
             logger.error("self-canary FAILED — planted secret leaked; toolless containment "
                          "NOT confirmed (tools may be re-enabled); refusing to bind")
-        return not leaked
+            return False
+        # NF-2: pin the binary identity this canary vouched for.
+        self._canary_binary_sig = self._binary_signature()
+        return True
 
 
 # --- HTTP-over-UDS server (FR-1) --------------------------------------------
 
 class _RelayHTTPHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
+    # HTTP/1.0 → the connection closes after each response (no keep-alive), so a
+    # slow client cannot hold a worker thread across requests and there is no
+    # keep-alive body-drain desync (N2). The tool client closes per call anyway.
+    protocol_version = "HTTP/1.0"
+    # N2: a per-request socket timeout bounds slow-loris (a client that stalls
+    # mid-body releases the thread after this many seconds).
+    timeout = 15
     relay: AdvisoryRelay = None  # set on the server instance below
 
     def log_message(self, fmt, *args):  # keep BaseHTTPRequestHandler off stderr
@@ -389,20 +469,44 @@ class _RelayHTTPHandler(BaseHTTPRequestHandler):
         self._send(status, payload)
 
 
+# N2: hard cap on concurrent connection threads. Real consult work is already
+# serialized to 1 by the consult lock; this bounds the number of connection
+# threads a burst of (possibly stalling) clients can spawn, so a compromised
+# container cannot exhaust host threads/fds by opening many sockets at once.
+_MAX_CONNECTIONS = 16
+
+
 class _ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """UnixStreamServer that speaks HTTP via BaseHTTPRequestHandler. Threading is
     only for connection handling; the consult itself is serialized by the relay's
-    consult lock (FR-12)."""
+    consult lock (FR-12), and concurrent connections are capped (N2)."""
 
     daemon_threads = True
     allow_reuse_address = True
     relay: AdvisoryRelay
+    _conn_sem = threading.BoundedSemaphore(_MAX_CONNECTIONS)
 
     def get_request(self):
         # BaseHTTPRequestHandler expects (conn, client_address); UnixStreamServer
         # yields an empty peer name, so synthesize one.
         conn, _ = super().get_request()
         return conn, ("unix", 0)
+
+    def process_request(self, request, client_address):
+        # Bound concurrent connection threads. If the cap is hit, refuse fast
+        # (close) rather than queueing another host thread.
+        if not self._conn_sem.acquire(blocking=False):
+            try:
+                request.close()
+            finally:
+                return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._conn_sem.release()
 
 
 def create_server(relay: AdvisoryRelay) -> _ThreadingUnixHTTPServer:
@@ -458,9 +562,46 @@ def _resolve_pinned_model() -> str:
     return "claude-sonnet-5"
 
 
+def preflight_ownership(config: RelayConfig) -> bool:
+    """FR-11 / AC-009 fail-closed preflight: the bearer token must be owned by
+    THIS process's uid and be mode 0600. A wrong owner/mode (e.g. after a bad
+    container recreate re-chowned the mount) refuses to start. The socket is
+    created by this process so it is owner-correct by construction; the token is
+    owner-authored at install time, so it is the one to verify."""
+    tok = config.token_path
+    try:
+        st = os.stat(tok)
+    except OSError as exc:
+        logger.error("preflight: cannot stat bearer token %s: %s", tok, exc)
+        return False
+    if st.st_uid != os.getuid():
+        logger.error("preflight: bearer token %s owner uid=%s != relay uid=%s — refusing (fail-closed)",
+                     tok, st.st_uid, os.getuid())
+        return False
+    mode = st.st_mode & 0o777
+    if mode & 0o077:
+        logger.error("preflight: bearer token %s mode %o is group/other-accessible — refusing", tok, mode)
+        return False
+    return True
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = _resolve_config_from_env()
+
+    # N-3: T1 audit rows (AC-007) silently no-op if audit is disabled — warn loudly.
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+        if cfg_get(read_raw_config(), "autonomy", "audit_enabled") is False:
+            logger.warning("autonomy.audit_enabled is FALSE — relay T1 audit rows will NOT be recorded")
+    except Exception:
+        pass
+
+    # FR-11 / AC-009: ownership preflight before anything else.
+    if not preflight_ownership(config):
+        logger.error("ownership preflight failed — NOT starting the relay (fail-closed)")
+        return 4
+
     relay = AdvisoryRelay(config)
 
     # FR-2a: refuse to bind unless the toolless containment canary passes.

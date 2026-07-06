@@ -124,8 +124,23 @@ def test_redact_masks_named_shapes():
 def test_redact_masks_gemini_pair():
     text = '{"access": "tok-aaaa1111", "refresh": "tok-bbbb2222", "email": "x@y.z"}'
     out = ec.redact(text)
-    assert "tok-aaaa1111" not in out
-    assert "tok-bbbb2222" not in out
+    # NF-1: the WHOLE value must be gone, not just the leading char.
+    assert "tok-aaaa1111" not in out and "ok-aaaa1111" not in out
+    assert "tok-bbbb2222" not in out and "ok-bbbb2222" not in out
+
+
+def test_redact_masks_full_json_key_values():
+    # NF-1 regression: JSON-key credential values must be fully masked, including
+    # opaque tokens with no known prefix.
+    for text, leaked in [
+        ('{"accessToken":"abcdefGHIJKLmnop1234567890xyz"}', "abcdefGHIJKLmnop1234567890xyz"),
+        ('{"refreshToken":"zzz-9988-abcd-efgh-ijkl"}', "zzz-9988-abcd-efgh-ijkl"),
+        ('{"access_token":"opaque-value-no-known-prefix-1234567890"}', "opaque-value-no-known-prefix-1234567890"),
+        ('{"refresh_token":"r-1a2b3c4d5e6f7g8h9i0j"}', "r-1a2b3c4d5e6f7g8h9i0j"),
+    ]:
+        out = ec.redact(text)
+        assert leaked not in out, f"value leaked through redact(): {out!r}"
+        assert ec._REDACT_MASK in out
 
 
 def test_redact_non_string_fails_closed():

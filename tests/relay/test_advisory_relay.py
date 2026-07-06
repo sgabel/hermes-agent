@@ -29,7 +29,12 @@ def relay(tmp_path):
         model="claude-sonnet-5-PINNED",
         isolated_home=str(tmp_path / "claude-home"),
     )
-    return AdvisoryRelay(cfg)
+    r = AdvisoryRelay(cfg)
+    # Simulate a passed startup self-canary so the per-consult re-canary guard
+    # (NF-2) treats the binary as vouched-for. Tests that exercise the re-canary
+    # path override this explicitly.
+    r._canary_binary_sig = r._binary_signature()
+    return r
 
 
 @pytest.fixture
@@ -214,3 +219,97 @@ def test_self_canary_fails_when_spawn_fails(relay, monkeypatch, tmp_path):
     relay.config.isolated_home = tmp_path
     monkeypatch.setattr(relay, "_spawn_claude", lambda probe: (False, "spawn error"))
     assert relay.self_canary() is False
+
+
+# --- NF-2 re-canary on binary change ----------------------------------------
+
+def test_recanary_fires_when_binary_changes(relay, stub_autonomy, monkeypatch):
+    # Force a binary-signature mismatch → the consult must re-run the canary.
+    relay._canary_binary_sig = ("stale", 0)
+    calls = {"canary": 0}
+
+    def _canary():
+        calls["canary"] += 1
+        relay._canary_binary_sig = relay._binary_signature()
+        return True
+
+    monkeypatch.setattr(relay, "self_canary", _canary)
+    monkeypatch.setattr(relay, "_spawn_claude", lambda a: (True, "ok"))
+    status, _ = relay.handle_consult({"prompt": "x"})
+    assert status == 200
+    assert calls["canary"] == 1  # re-canary ran before the spawn
+
+
+def test_recanary_failure_refuses(relay, stub_autonomy, monkeypatch):
+    relay._canary_binary_sig = ("stale", 0)
+    monkeypatch.setattr(relay, "self_canary", lambda: False)
+    spawned = {"n": 0}
+    monkeypatch.setattr(relay, "_spawn_claude", lambda a: (spawned.__setitem__("n", spawned["n"] + 1), "x"))
+    status, _ = relay.handle_consult({"prompt": "x"})
+    assert status == 503
+    assert spawned["n"] == 0  # never spawned after a failed re-canary
+
+
+# --- FR-5 bearer-in-payload refuse (NF-6) -----------------------------------
+
+def test_bearer_in_payload_refused(relay, stub_autonomy, monkeypatch):
+    monkeypatch.setattr(relay, "_spawn_claude", lambda a: (True, "ok"))
+    status, body = relay.handle_consult({"prompt": f"here is the token {relay._bearer}"})
+    assert status == 422
+    assert "bearer" in body["error"].lower()
+    assert stub_autonomy["debits"] == []  # refused before debit
+
+
+# --- _spawn_claude command assembly static assertion (move the check left) ---
+
+def test_spawn_command_carries_toolless_and_hardening_flags():
+    from relay import advisory_relay as m
+    # The containment-critical flags must be present in the fixed arg lists.
+    assert "--tools" in m._CLAUDE_BASE_ARGS
+    assert m._CLAUDE_BASE_ARGS[m._CLAUDE_BASE_ARGS.index("--tools") + 1] == ""
+    assert "--disallowedTools" in m._CLAUDE_BASE_ARGS
+    assert "--setting-sources" in m._CLAUDE_BASE_ARGS
+    props = " ".join(m._SYSTEMD_RUN_PROPS)
+    for needed in ("NoNewPrivileges=yes", "PrivateTmp=yes", "ProtectSystem=strict", "ProtectHome=read-only"):
+        assert needed in props
+
+
+# --- config invariant -------------------------------------------------------
+
+def test_config_rejects_bad_timeout_ordering(tmp_path):
+    tok = tmp_path / "t"; tok.write_text("x")
+    with pytest.raises(ValueError):
+        RelayConfig(socket_path=str(tmp_path / "s.sock"), token_path=str(tok),
+                    model="m", isolated_home=str(tmp_path),
+                    consult_timeout_sec=100, child_runtime_max_sec=100)
+
+
+# --- ownership preflight (FR-11 / AC-009) -----------------------------------
+
+def test_ownership_preflight_passes_for_owned_0600_token(tmp_path):
+    from relay.advisory_relay import preflight_ownership
+    tok = tmp_path / "client.token"; tok.write_text("x")
+    import os
+    os.chmod(tok, 0o600)
+    cfg = RelayConfig(socket_path=str(tmp_path / "s.sock"), token_path=str(tok),
+                      model="m", isolated_home=str(tmp_path))
+    assert preflight_ownership(cfg) is True
+
+
+def test_ownership_preflight_fails_for_group_readable_token(tmp_path):
+    from relay.advisory_relay import preflight_ownership
+    import os
+    tok = tmp_path / "client.token"; tok.write_text("x")
+    os.chmod(tok, 0o640)
+    cfg = RelayConfig(socket_path=str(tmp_path / "s.sock"), token_path=str(tok),
+                      model="m", isolated_home=str(tmp_path))
+    assert preflight_ownership(cfg) is False
+
+
+def test_ownership_preflight_fails_for_missing_token(tmp_path):
+    from relay.advisory_relay import preflight_ownership
+    cfg = RelayConfig(socket_path=str(tmp_path / "s.sock"), token_path=str(tmp_path / "nope"),
+                      model="m", isolated_home=str(tmp_path))
+    # token must exist to load bearer; preflight is checked before construction,
+    # so call it directly.
+    assert preflight_ownership(cfg) is False
