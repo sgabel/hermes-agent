@@ -96,9 +96,16 @@ services:
       # `docker exec hermes hermes gateway restart`.)
       - GATEWAY_HEALTH_URL=http://hermes:8642
     # Internal-only (no host publish here); host ingress 127.0.0.1:9119 via host-ingress.
-    # Bind 0.0.0.0 INSIDE so the forwarder can reach it; --insecure required to bind
-    # non-localhost; safe because the only host exposure is the loopback forwarder.
-    command: ["dashboard", "--host", "0.0.0.0", "--no-open", "--insecure"]
+    # Bind 0.0.0.0 INSIDE so the forwarder can reach it. --insecure REMOVED 2026-07-06 (PRD-045):
+    # the earlier "safe because only the loopback forwarder reaches it" rationale was WRONG — the
+    # `hermes` AGENT container is a sibling on this same internal net and (proxy-bypassed) could scrape
+    # the SPA-injected _SESSION_TOKEN from GET / and replay it to reach every mutating route, letting a
+    # code-exec agent reconfigure itself (bypassing the PRD-032 ladder/approval/budget/killswitch).
+    # Dropping --insecure engages the real cookie/session gate. Auth = the `basic` provider, already
+    # host-provisioned via HERMES_DASHBOARD_BASIC_AUTH_{USERNAME,PASSWORD_HASH,SECRET} in ~/.hermes/.env
+    # (env-wins over config.yaml dashboard.basic_auth). Provider fails CLOSED (won't bind) if creds are
+    # absent — the .env creds MUST exist before dropping --insecure.
+    command: ["dashboard", "--host", "0.0.0.0", "--no-open"]
     mem_limit: 2g
     pids_limit: 1024
 
@@ -121,8 +128,9 @@ services:
       - "127.0.0.1:8642:8642"          # gateway API — host cockpit (FR-6) + RTVC voice (FR-7); loopback-only (sensitive)
       - "127.0.0.1:9119:9119"          # dashboard — local + SSH-tunnel access
       - "192.168.50.182:9119:9119"     # dashboard — LAN-accessible (gaming rig), bound to the LAN IP only
-                                        # (not 0.0.0.0). Matches the pre-migration posture; --insecure on the
-                                        # dashboard is acceptable because exposure is the single LAN interface.
+                                        # (not 0.0.0.0). LAN clients now authenticate (dashboard.basic_auth) —
+                                        # --insecure was removed 2026-07-06 (PRD-045); the LAN is NOT a trust
+                                        # boundary because the agent container sits inside it.
     mem_limit: 128m
     pids_limit: 128
 
