@@ -33,7 +33,7 @@ from autonomy import autonomy_dir
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("actions", "second_opinion_calls", "tokens")
+KINDS = ("actions", "second_opinion_calls", "tokens", "proactive_messages")
 
 
 class BudgetKindError(Exception):
@@ -47,11 +47,17 @@ _DEFAULT_CAPS = {
     "max_autonomous_actions": 200,
     "max_second_opinion_calls": 25,
     "max_autonomous_tokens": 2_000_000,
+    # PRD-027 FR-4: daily cap on proactive idle-time outreach messages.
+    "max_proactive_messages": 2,
 }
 _KIND_TO_CAP = {
     "actions": "max_autonomous_actions",
     "second_opinion_calls": "max_second_opinion_calls",
     "tokens": "max_autonomous_tokens",
+    # PRD-027 FR-4: register in all three (KINDS + _DEFAULT_CAPS + _KIND_TO_CAP)
+    # in the same change (PRD-043 registration contract) or the surface fails
+    # closed / raises BudgetKindError.
+    "proactive_messages": "max_proactive_messages",
 }
 
 

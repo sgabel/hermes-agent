@@ -740,7 +740,7 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, preresolved_targets=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -749,9 +749,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
+    ``preresolved_targets`` (PRD-027 NF-3): when provided (a list of target
+    dicts), delivery uses it verbatim and SKIPS the internal
+    ``_resolve_delivery_targets`` call. The exec_profile pin path passes the
+    single tuple it already asserted, so the target that is SENT to is the exact
+    target that was asserted — closing the resolve-twice redirect window where a
+    channel-directory change between two independent resolutions could redirect
+    the send past the pin assert. Default ``None`` keeps every ordinary caller
+    bit-identical.
+
     Returns None on success, or an error string on failure.
     """
-    targets = _resolve_delivery_targets(job)
+    targets = preresolved_targets if preresolved_targets is not None else _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -1599,10 +1608,18 @@ def _scan_assembled_cron_prompt(
     return assembled
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def run_job(job: dict, *, profile=None) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
-    
+
+    ``profile`` (PRD-027 FR-6): when set to an ``autonomy.exec_profile.ExecProfile``
+    this is a CONTAINED run — the profile OVERRIDES the job's toolsets, MCP init
+    is skipped, ``_skip_mcp_refresh`` is set, the resolved tool surface is
+    asserted == the profile allowlist EXACTLY (fail-closed abort on mismatch,
+    after provider injection AND before each model call), lazy installs are
+    disabled at run scope, and the ``proactive`` run identity is bound nested
+    inside the CRON bind. ``profile=None`` is the ordinary cron path, unchanged.
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -1805,6 +1822,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # this PRD set out to kill. Token init keeps the finally safe if we raise
     # before binding.
     _run_identity_token = None
+    # PRD-027 FR-8: a profile run binds its identity (proactive) NESTED inside
+    # the CRON bind — the inner contextvar bind wins (classify_run() -> proactive,
+    # unattended floor, markers-beat-YOLO) for the job's scope and resets cleanly.
+    _profile_identity_token = None
+    # PRD-027 FR-6: run-scoped lazy-install disable (entered post-construction,
+    # exited in the finally). Kept alongside the tokens so the finally is safe.
+    _lazy_override_cm = None
     _prior_cron_env = os.environ.get("HERMES_CRON_SESSION")
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
@@ -1876,6 +1900,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # HERMES_CRON_SESSION, so doing this here (vs before the try) is safe.
         _run_identity_token = bind_run_identity(_RI_CRON)
         os.environ["HERMES_CRON_SESSION"] = "1"
+        # PRD-027 FR-8: nest the profile identity (proactive) inside CRON. The
+        # env marker stays HERMES_CRON_SESSION (unmigrated readers still need
+        # it); the contextvar bind is the authoritative wire format and the
+        # inner bind wins for classify_run().
+        if profile is not None:
+            _profile_identity_token = bind_run_identity(profile.identity)
 
         # Re-read .env and config.yaml fresh every run so provider/key
         # changes take effect without a gateway restart.
@@ -1885,7 +1915,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
 
-        delivery_target = _resolve_delivery_target(job)
+        # PRD-027 FR-7 (synthesize): a profile run NEVER consults the job's raw
+        # deliver/origin for routing — the target is synthesized from the pin at
+        # the _deliver_result choke point (run_one_job). Leave the
+        # HERMES_CRON_AUTO_DELIVER_* contextvars unset ("") here; the profile's
+        # tool surface has no send_message tool that could read them anyway.
+        delivery_target = None if profile is not None else _resolve_delivery_target(job)
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
@@ -2060,19 +2095,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        # PRD-027 FR-6: a profile run SKIPS MCP init entirely (registry-view
+        # exclusion) and sets _skip_mcp_refresh below so the per-turn re-injection
+        # prologue is closed too. In-process MCP servers are process-global, so
+        # the honest closure is registry view + refresh-skip + the exact-name
+        # tool-surface assert (any MCP name that leaks in trips the assert).
+        if profile is None or not profile.skip_mcp:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         agent = AIAgent(
             model=model,
@@ -2092,8 +2133,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            # PRD-027 FR-6: the profile OVERRIDES any job-level enabled_toolsets
+            # and declares its OWN (job/profile-scoped) denylist — never the
+            # global agent.disabled_toolsets (wrong scope, review STOP-2).
+            enabled_toolsets=(
+                list(profile.enabled_toolsets) if profile is not None
+                else _resolve_cron_enabled_toolsets(job, _cfg)
+            ),
+            disabled_toolsets=(
+                list(profile.disabled_toolsets) if profile is not None
+                else _resolve_cron_disabled_toolsets(_cfg)
+            ),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -2118,7 +2168,31 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
-        
+
+        # PRD-027 FR-6: close the profile's tool surface immediately after
+        # construction + provider injection.
+        #   1. _skip_mcp_refresh — close the per-turn MCP re-injection prologue.
+        #   2. assert resolved valid_tool_names == the declared allowlist EXACTLY
+        #      (fail-closed: a mismatch raises ExecProfileError, caught by the
+        #      except below → failure tuple, NO agent run). Never degrade.
+        #   3. attach a re-assert closure the per-turn prologue calls before each
+        #      model call (agent/turn_context.py), so a mid-run mutation cannot
+        #      slip a tool past the construction-time check.
+        #   4. disable lazy installs at run scope via the ContextVar override,
+        #      entered BEFORE copy_context() below so it rides the copy into the
+        #      agent worker thread and does not race a concurrent job.
+        if profile is not None:
+            from autonomy import exec_profile as _exec_profile
+            agent._skip_mcp_refresh = True
+            _exec_profile.assert_tool_surface(agent, profile)
+            agent._exec_profile_tool_assert = (
+                lambda _a=agent, _p=profile: _exec_profile.assert_tool_surface(_a, _p)
+            )
+            if profile.disable_lazy_installs:
+                from tools.lazy_deps import lazy_install_override
+                _lazy_override_cm = lazy_install_override(False)
+                _lazy_override_cm.__enter__()
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
@@ -2141,6 +2215,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
+        # PRD-027 FR-6: re-assert the exact tool surface immediately before the
+        # agent run is dispatched (a construction-time-only check can pass and
+        # then be mutated). Fail-closed abort → except below.
+        if profile is not None:
+            from autonomy import exec_profile as _exec_profile
+            _exec_profile.assert_tool_surface(agent, profile)
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -2289,9 +2369,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        # PRD-044: reset the per-run identity binding and restore (not blindly
-        # unset) HERMES_CRON_SESSION so it is no longer sticky across jobs and
-        # never leaks into a later attended gateway session in this process.
+        # PRD-027 FR-6: exit the run-scoped lazy-install override.
+        if _lazy_override_cm is not None:
+            try:
+                _lazy_override_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+        # PRD-044/027: reset the per-run identity bindings and restore (not
+        # blindly unset) HERMES_CRON_SESSION so it is no longer sticky across
+        # jobs and never leaks into a later attended gateway session in this
+        # process. Reset the nested profile bind FIRST (reverse of bind order).
+        if _profile_identity_token is not None:
+            try:
+                reset_run_identity(_profile_identity_token)
+            except Exception:
+                pass
         if _run_identity_token is not None:
             try:
                 reset_run_identity(_run_identity_token)
@@ -2357,6 +2449,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # PRD-027: jobs carrying an ``exec_profile`` take a SEPARATE, fully-gated
+    # entry path (contained profile + fail-closed delivery pin). Ordinary cron
+    # jobs fall through to the unchanged sequence below — bit-identical behavior
+    # (AC-012). This dispatch is the ONLY change ordinary jobs see.
+    if job.get("exec_profile"):
+        return _run_exec_profile_job(job, adapters=adapters, loop=loop, verbose=verbose)
+
     # PRD-028 kill switch: poll the flag file before doing ANY autonomous work.
     # This is the shared firing body for both the in-process ticker and an
     # external provider's fire_due, so the guard here covers the gateway-wedged
@@ -2421,11 +2520,280 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return False
 
 
+def _deliver_exec_profile_result(job, profile, pin, content, *, adapters=None, loop=None):
+    """Fail-closed pinned delivery for a profile run (PRD-027 FR-7).
+
+    SYNTHESIZE, then ASSERT:
+      1. *Synthesize* — build a delivery-only job whose ``deliver`` IS the pin
+         and whose ``origin`` is cleared, so none of the resolver's raw-form
+         pathways (origin-fallback / bare-platform / ``all`` / comma-list) are
+         reachable. The job's own raw ``deliver`` / ``origin`` are never consulted.
+      2. *Assert* — resolve the concrete target and require the tuple to equal
+         the pin EXACTLY (``thread_id=None`` included — a stray
+         ``DISCORD_HOME_CHANNEL_THREAD_ID`` must not attach a thread). Any
+         non-pin tuple, multi-target, or blank/unresolvable resolution → NO
+         delivery + a real error string (so ``_record_autonomous_cron_run``
+         derives ``delivery_failed``).
+
+    Returns None on success, or an error string on failure.
+
+    Two outbound-content guards run FIRST (security review NF-1/NF-2) — the pin
+    bounds the *recipient*, not the *payload*, so a prompt-injected agent message
+    must not exfiltrate via the delivery channel:
+      * **Text-only (NF-1):** refuse any content carrying a ``MEDIA:<path>``
+        attachment directive — otherwise the agent could upload an arbitrary
+        readable file (e.g. the relay bearer token, ``state.db``) as a Discord
+        attachment past the read-only tool surface.
+      * **Outbound secret scan (NF-2):** ``session_search`` returns un-redacted
+        ``state.db`` content; run the PRD-035 fail-closed credential classifier
+        over the message and refuse on a named credential shape (the same
+        defense ``ask_claude`` applies).
+    """
+    # NF-1 — text-only: refuse a message that carries any MEDIA attachment tag.
+    from gateway.platforms.base import BasePlatformAdapter
+    media_files, _cleaned = BasePlatformAdapter.extract_media(content)
+    if media_files:
+        msg = (
+            "proactive delivery refused: message carries a MEDIA attachment "
+            "directive (exec_profile delivery is text-only) — fail closed"
+        )
+        logger.error("Job '%s': %s", job.get("id"), msg)
+        return msg
+
+    # NF-2 — outbound secret scan (fail closed; contains_credential self-contains
+    # and returns True on timeout/error/oversize, never leaking the match).
+    try:
+        from relay.egress_classifier import contains_credential
+
+        _flagged, _reason = contains_credential(content)
+    except Exception as _cls_exc:  # never let a scan crash open
+        _flagged, _reason = True, f"classifier_error:{type(_cls_exc).__name__}"
+    if _flagged:
+        msg = (
+            f"proactive delivery refused: outbound content flagged by the egress "
+            f"classifier ({_reason}) — fail closed"
+        )
+        logger.error("Job '%s': %s", job.get("id"), msg)
+        return msg
+
+    deliver_job = dict(job)
+    deliver_job["deliver"] = f"{pin.platform}:{pin.chat_id}"
+    deliver_job["origin"] = None  # no origin-fallback / raw-form pathway reachable
+
+    targets = _resolve_delivery_targets(deliver_job)
+    if len(targets) != 1:
+        msg = (
+            f"proactive delivery refused: expected exactly the pinned target, "
+            f"resolved {len(targets)} target(s) — fail closed"
+        )
+        logger.error("Job '%s': %s", job.get("id"), msg)
+        return msg
+    t = targets[0]
+    resolved = (str(t.get("platform", "")).lower(), str(t.get("chat_id", "")), t.get("thread_id"))
+    expected = pin.as_tuple()
+    if resolved != expected:
+        msg = (
+            f"proactive delivery refused: resolved target {resolved} != pin "
+            f"{expected} — fail closed"
+        )
+        logger.error("Job '%s': %s", job.get("id"), msg)
+        return msg
+
+    # NF-3 — resolve ONCE: hand the asserted target straight to the send so
+    # _deliver_result cannot independently re-resolve to a different tuple.
+    return _deliver_result(deliver_job, content, adapters=adapters, loop=loop,
+                           preresolved_targets=[t])
+
+
+def _run_exec_profile_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+    """Run ONE exec_profile (contained/proactive) job end-to-end (PRD-027).
+
+    Entry closures run BEFORE any execution and are scoped to profile jobs only:
+    unknown-profile fail-closed → reject ``script``/``no_agent`` → kill switch →
+    fail-closed delivery-pin resolution → quiet-hours → idle (active_agents>0) →
+    budget pre-check. Only then does the contained agent run (identity bound,
+    tool surface asserted, lazy installs disabled — all inside ``run_job``).
+    Delivery is synthesized from the pin and asserted fail-closed; the
+    ``proactive_messages`` budget is debited ONLY on a confirmed send.
+    """
+    from autonomy import exec_profile as _exec_profile
+
+    job_id = job.get("id")
+    profile_name = job.get("exec_profile")
+    profile = _exec_profile.get_exec_profile(profile_name)
+
+    # 1. Unknown profile → fail closed, audit, no run (never fall through to the
+    #    ordinary cron path — that would run the job UNcontained).
+    if profile is None:
+        reason = f"unknown exec_profile {profile_name!r}"
+        logger.error("Job '%s': %s — refusing to run (fail closed)", job_id, reason)
+        mark_job_run(job_id, False, reason)
+        _record_autonomous_cron_run(job, False, reason, surface="proactive", tier="T3",
+                                    debit_actions=False)
+        return True  # cleanly refused, not a processing crash
+
+    _surface, _tier = profile.audit_surface, profile.tier
+
+    # 2. Reject out-of-catalog execution modes BEFORE any execution (defense in
+    #    depth with the create/update-time check in cron/jobs.py).
+    if profile.reject_script_no_agent and (job.get("no_agent") or job.get("script")):
+        reason = "exec_profile job must not set script/no_agent (contained read-only surface)"
+        logger.error("Job '%s': %s — refusing to run (fail closed)", job_id, reason)
+        mark_job_run(job_id, False, reason)
+        _record_autonomous_cron_run(job, False, reason, surface=_surface, tier=_tier,
+                                    debit_actions=False)
+        return True
+
+    # 3. Kill switch (proactive surface). killswitch.guard already audits.
+    try:
+        from autonomy import killswitch as _killswitch
+
+        if _killswitch.guard(profile.killswitch_surface):
+            logger.info("Job '%s': skipped — kill switch engaged (%s)", job_id,
+                        profile.killswitch_surface)
+            return True  # cleanly skipped
+    except Exception as _ks_exc:
+        # Security review: a NEW T3 outreach surface must FAIL CLOSED — an
+        # unreadable QUIESCE flag suppresses, never proceeds (FR-4). This is
+        # stricter than the ordinary-cron posture on purpose.
+        logger.error("Job '%s': kill-switch check failed — suppressing (fail closed): %s",
+                     job_id, _ks_exc)
+        return True
+
+    # 4. Fail-closed delivery-pin resolution — a missing/blank pin refuses to run
+    #    (FR-7/D-2). Resolved BEFORE the agent spawns so a misconfig never burns
+    #    a run.
+    try:
+        pin = _exec_profile.resolve_pinned_target()
+    except _exec_profile.ExecProfileError as _pin_exc:
+        logger.error("Job '%s': %s", job_id, _pin_exc)
+        mark_job_run(job_id, False, str(_pin_exc))
+        _record_autonomous_cron_run(job, False, str(_pin_exc), surface=_surface, tier=_tier,
+                                    debit_actions=False)
+        return True
+
+    # 5. Quiet-hours wall-clock gate (HERMES_TIMEZONE-local; no urgent override).
+    try:
+        _quiet = _exec_profile.is_quiet_now()
+    except Exception as _qh_exc:  # never let a gate error run the job
+        logger.warning("Job '%s': quiet-hours check failed — suppressing (fail safe): %s",
+                       job_id, _qh_exc)
+        _quiet = True
+    if _quiet:
+        logger.info("Job '%s': suppressed — quiet hours", job_id)
+        _record_autonomous_cron_run(job, True, None, surface=_surface, tier=_tier,
+                                    outcome_override="suppressed_quiet_hours",
+                                    debit_actions=False)
+        return True
+
+    # 6. Idle gate — suppress while the gateway is mid-turn (active_agents > 0).
+    try:
+        from gateway.status import read_runtime_status, parse_active_agents
+
+        _active = parse_active_agents((read_runtime_status() or {}).get("active_agents", 0))
+    except Exception as _idle_exc:
+        logger.debug("Job '%s': idle read failed (treating as idle): %s", job_id, _idle_exc)
+        _active = 0
+    if _active > 0:
+        logger.info("Job '%s': suppressed — gateway busy (active_agents=%d)", job_id, _active)
+        _record_autonomous_cron_run(job, True, None, surface=_surface, tier=_tier,
+                                    outcome_override="suppressed_busy",
+                                    debit_actions=False)
+        return True
+
+    # 7. Budget pre-check BEFORE spawning the agent (avoid burning a run only to
+    #    have the debit denied). Over cap → no run.
+    try:
+        from autonomy import budget as _budget
+
+        _within = _budget.check(profile.budget_kind, 1)
+    except Exception as _bud_exc:
+        logger.warning("Job '%s': budget check failed — suppressing (fail closed): %s",
+                       job_id, _bud_exc)
+        _within = False
+    if not _within:
+        logger.info("Job '%s': suppressed — %s budget cap reached", job_id, profile.budget_kind)
+        _record_autonomous_cron_run(job, True, None, surface=_surface, tier=_tier,
+                                    outcome_override="budget_exceeded",
+                                    debit_actions=False)
+        return True
+
+    # 8. Contained agent run (identity bind + tool assert + lazy-install disable
+    #    all inside run_job(profile=...)), then pinned fail-closed delivery.
+    try:
+        success, output, final_response, error = run_job(job, profile=profile)
+
+        output_file = save_job_output(job_id, output)
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        # Empty final_response is a soft failure (mirror the ordinary cron path).
+        # Finalize `success` BEFORE deciding delivery.
+        if success and not final_response.strip():
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        # Security review + FR-2: proactive delivery happens ONLY on a successful
+        # run. A FAILED run is audited (ledger-visible) but never delivers a
+        # diagnostic summary to the pinned home channel and never debits the
+        # proactive cap — unsolicited outreach must not push internal failure
+        # detail to Scott nor let two failed runs exhaust the daily budget with
+        # zero real outreach. EXACT-match [SILENT] suppresses a successful run
+        # (the global check is substring-based and would drop a legitimate
+        # message that merely mentions [SILENT]).
+        deliver_content = final_response if success else ""
+        should_deliver = bool(deliver_content.strip())
+        if should_deliver and deliver_content.strip() == SILENT_MARKER:
+            logger.info("Job '%s': agent returned exactly %s — skipping delivery",
+                        job_id, SILENT_MARKER)
+            should_deliver = False
+
+        delivery_error = None
+        delivered = False
+        if should_deliver:
+            try:
+                delivery_error = _deliver_exec_profile_result(
+                    job, profile, pin, deliver_content, adapters=adapters, loop=loop,
+                )
+                delivered = delivery_error is None
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Proactive delivery failed for job %s: %s", job_id, de)
+
+        mark_job_run(job_id, success, error, delivery_error=delivery_error)
+        _record_autonomous_cron_run(job, success, error, delivery_error=delivery_error,
+                                    surface=_surface, tier=_tier)
+
+        # PRD-027 FR-7: debit the proactive-message cap ONLY on a confirmed
+        # successful send (delivery attempted + no delivery error). A [SILENT]
+        # suppression, a failed run, or a delivery failure debits nothing.
+        if delivered:
+            try:
+                _budget.debit(profile.audit_surface, profile.budget_kind, 1)
+            except Exception as _dbt_exc:
+                # A confirmed send whose debit failed under-counts the cap —
+                # WARNING (not debug) so it is visible (security NOTE).
+                logger.warning("Job '%s': proactive budget debit FAILED after a "
+                               "confirmed send (cap under-counts): %s", job_id, _dbt_exc)
+        return True
+
+    except Exception as e:
+        logger.error("Error processing profile job %s: %s", job_id, e)
+        mark_job_run(job_id, False, str(e))
+        _record_autonomous_cron_run(job, False, str(e), surface=_surface, tier=_tier)
+        return False
+
+
 def _record_autonomous_cron_run(
     job: dict,
     success: bool,
     error: Optional[str],
     delivery_error: Optional[str] = None,
+    *,
+    surface: str = "cron",
+    tier: str = "T3",
+    outcome_override: Optional[str] = None,
+    debit_actions: bool = True,
 ) -> None:
     """Audit + budget-debit one autonomous cron run (PRD-028 R-2/R-3). Never raises.
 
@@ -2435,11 +2803,24 @@ def _record_autonomous_cron_run(
     returns None on success AND on every legitimate non-delivery
     (``deliver=local``, no resolvable origin, ``[SILENT]``/``should_deliver=False``
     never attempts delivery) — those all stay ``"ok"``.
+
+    PRD-027 FR-5: ``surface`` / ``tier`` are parameterized (defaults preserve the
+    existing cron behavior EXACTLY) so a profile run records ``surface="proactive"``
+    / tier T3 through this SAME path rather than forking a parallel one.
+    ``outcome_override`` lets a pre-run gate (quiet hours / gateway busy /
+    over-budget) record a distinct visible outcome. ``debit_actions`` defaults
+    True (the generic ``("cron","actions")`` debit is UNCHANGED for every real
+    cron run); it is set False ONLY for the profile pre-run gates/rejections
+    where nothing actually ran — those get a visible ledger row without burning
+    the daily autonomous-action cap. The ADDITIONAL ``proactive_messages`` debit
+    on a confirmed send lives in the profile branch of ``run_one_job``.
     """
     try:
         from autonomy import audit, budget
 
-        if not success:
+        if outcome_override is not None:
+            outcome = outcome_override
+        elif not success:
             outcome = f"error: {str(error)[:160]}" if error else "error"
         elif delivery_error is not None:
             outcome = "delivery_failed"
@@ -2448,13 +2829,15 @@ def _record_autonomous_cron_run(
 
         name = job.get("name") or job.get("prompt") or job.get("id") or "cron job"
         audit.record(
-            tier="T3",
-            surface="cron",
+            tier=tier,
+            surface=surface,
             action=f"cron run: {str(name)[:200]}",
             rationale=f"scheduled job {job.get('id', '?')}",
             authority="auto-by-tier",
             outcome=outcome,
         )
+        if not debit_actions:
+            return
         result = budget.debit("cron", "actions", 1)
         if result.get("degrade"):
             logger.warning(

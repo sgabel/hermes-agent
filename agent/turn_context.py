@@ -130,6 +130,16 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
+    # PRD-027 FR-6: an execution profile pins an EXACT-NAME tool surface. Re-assert
+    # it in the per-turn prologue — before this turn's first model call — so a
+    # mid-run mutation cannot slip a tool past the construction-time check. Set by
+    # the scheduler's profile run (cron/scheduler.py). Deliberately OUTSIDE the try
+    # above: a mismatch MUST raise (fail-closed abort of the turn), never be
+    # swallowed as a best-effort refresh.
+    _exec_profile_assert = getattr(agent, "_exec_profile_tool_assert", None)
+    if _exec_profile_assert is not None:
+        _exec_profile_assert()
+
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)

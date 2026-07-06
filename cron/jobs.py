@@ -738,6 +738,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    exec_profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -816,6 +817,8 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_exec_profile = str(exec_profile).strip() if isinstance(exec_profile, str) else None
+    normalized_exec_profile = normalized_exec_profile or None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -825,6 +828,32 @@ def create_job(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
         )
+
+    # PRD-027 FR-6/FR-9: an exec_profile job runs under a contained execution
+    # profile. Validate at create time (defense in depth — the run-entry check
+    # in cron/scheduler.py remains the load-bearing gate):
+    #   - the profile must be a known execution profile, and
+    #   - it must NOT combine with script / no_agent (the profile rejects those
+    #     out-of-catalog execution paths at run-entry; a job that carried them
+    #     could never legally run).
+    if normalized_exec_profile is not None:
+        try:
+            from autonomy.exec_profile import known_profile_names
+            _known = known_profile_names()
+        except Exception as _ep_exc:  # pragma: no cover - import guard
+            raise ValueError(
+                f"cannot validate exec_profile {normalized_exec_profile!r}: {_ep_exc}"
+            ) from _ep_exc
+        if normalized_exec_profile not in _known:
+            raise ValueError(
+                f"Unknown exec_profile {normalized_exec_profile!r}. "
+                f"Known execution profiles: {', '.join(sorted(_known)) or '(none)'}."
+            )
+        if normalized_no_agent or normalized_script:
+            raise ValueError(
+                "exec_profile jobs must not set script or no_agent — a contained "
+                "execution profile rejects those out-of-catalog execution paths."
+            )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -847,6 +876,7 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "exec_profile": normalized_exec_profile,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -961,6 +991,45 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = _normalize_workdir(_wd)
 
             updated = _apply_skill_fields({**job, **updates})
+
+            # PRD-027 FR-9 (AC-004a): keep the exec_profile invariant across
+            # updates too — a job may not be mutated into an unknown profile,
+            # nor have script / no_agent SNEAKED IN alongside an exec_profile
+            # via a later update. The run-entry check stays load-bearing; this
+            # is defense in depth at the mutation boundary.
+            _orig_profile = job.get("exec_profile")
+            _upd_profile = updated.get("exec_profile")
+            # Security review: an update may not STRIP exec_profile off a
+            # contained job (that would silently convert it to an ordinary,
+            # UNcontained cron job). Removing containment requires an explicit
+            # delete + recreate.
+            if (isinstance(_orig_profile, str) and _orig_profile.strip()
+                    and not (isinstance(_upd_profile, str) and _upd_profile.strip())):
+                raise ValueError(
+                    "cannot remove exec_profile from a contained job via update "
+                    "(that would drop containment) — delete and recreate instead."
+                )
+            if isinstance(_upd_profile, str) and _upd_profile.strip():
+                _upd_profile = _upd_profile.strip()
+                try:
+                    from autonomy.exec_profile import known_profile_names
+                    _known = known_profile_names()
+                except Exception as _ep_exc:  # pragma: no cover - import guard
+                    raise ValueError(
+                        f"cannot validate exec_profile {_upd_profile!r}: {_ep_exc}"
+                    ) from _ep_exc
+                if _upd_profile not in _known:
+                    raise ValueError(
+                        f"Unknown exec_profile {_upd_profile!r}. "
+                        f"Known execution profiles: {', '.join(sorted(_known)) or '(none)'}."
+                    )
+                if updated.get("no_agent") or (updated.get("script") or "").strip():
+                    raise ValueError(
+                        "exec_profile jobs must not set script or no_agent — a "
+                        "contained execution profile rejects those out-of-catalog "
+                        "execution paths."
+                    )
+
             schedule_changed = "schedule" in updates
 
             if "skills" in updates or "skill" in updates:

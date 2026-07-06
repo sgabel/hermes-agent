@@ -168,6 +168,48 @@ def test_ac003_partial_registration_of_other_kind_does_not_poison_valid_debit(mo
     assert budget.get_usage()["totals"]["actions"] == 1
 
 
+# ---------------------------------------------------------------------------
+# PRD-027 FR-4 / AC-005a — proactive_messages kind registered in all three maps
+# ---------------------------------------------------------------------------
+
+def test_ac005a_proactive_messages_registered_in_all_three_maps():
+    """Registration contract (PRD-043): a debited surface must appear in KINDS,
+    _DEFAULT_CAPS, AND _KIND_TO_CAP or it fails closed / raises BudgetKindError.
+    Default cap is 2 (FR-4)."""
+    assert "proactive_messages" in budget.KINDS
+    assert budget._KIND_TO_CAP.get("proactive_messages") == "max_proactive_messages"
+    assert budget._DEFAULT_CAPS["max_proactive_messages"] == 2
+
+
+def test_ac005a_proactive_messages_check_and_debit_no_kind_error(monkeypatch):
+    """The kind is fully registered → no BudgetKindError on check/debit/get_usage."""
+    _set_caps(monkeypatch, max_proactive_messages=2)
+    assert budget.check("proactive_messages", 1) is True
+    r = budget.debit("proactive", "proactive_messages", 1)
+    assert r["allowed"] is True and r["degrade"] is False
+    usage = budget.get_usage()
+    assert usage["totals"]["proactive_messages"] == 1
+    assert usage["by_surface"]["proactive"]["proactive_messages"] == 1
+    assert usage["remaining"]["proactive_messages"] == 1
+
+
+def test_ac005a_proactive_messages_cap_breach_degrades(monkeypatch):
+    """Third send in a day (cap=2) trips degrade-to-ask."""
+    _set_caps(monkeypatch, max_proactive_messages=2)
+    assert budget.debit("proactive", "proactive_messages")["degrade"] is False
+    assert budget.debit("proactive", "proactive_messages")["degrade"] is False
+    r = budget.debit("proactive", "proactive_messages")
+    assert r["degrade"] is True and r["allowed"] is False
+
+
+def test_ac005a_proactive_messages_config_override_honored(monkeypatch):
+    """A raised cap (config override) is honored: 5 allowed, the 6th degrades."""
+    _set_caps(monkeypatch, max_proactive_messages=5)
+    for _ in range(5):
+        assert budget.debit("proactive", "proactive_messages", 1)["degrade"] is False
+    assert budget.debit("proactive", "proactive_messages", 1)["degrade"] is True
+
+
 def test_parallel_debits_do_not_lose_updates(monkeypatch):
     """Code-review NEEDS-FIX: cron runs jobs in a ThreadPoolExecutor, so the
     debit read-modify-write must not lose updates (was 54/400 without a lock)."""

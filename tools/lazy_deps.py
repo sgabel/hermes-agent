@@ -57,11 +57,53 @@ import re
 import shutil
 import subprocess
 import sys
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Per-run lazy-install override (PRD-027 FR-6).
+#
+# Cron is in-process and thread-based: jobs share thread pools with COPIED
+# contextvars. A process-global env toggle (HERMES_DISABLE_LAZY_INSTALLS) would
+# race a concurrent non-profile job in the same pool. So a contained execution
+# profile disables lazy installs for the exact scope of ITS run via this
+# ContextVar, entered BEFORE ``contextvars.copy_context()`` so it rides the copy
+# into the agent worker thread and leaves concurrent jobs (which never entered
+# the override) unaffected. Checked FIRST in ``_allow_lazy_installs`` — before
+# the env var and config — so the run-scoped decision wins.
+# =============================================================================
+
+_LAZY_INSTALL_OVERRIDE: ContextVar[Optional[bool]] = ContextVar(
+    "hermes_lazy_install_override", default=None
+)
+
+
+class lazy_install_override:
+    """Context manager forcing lazy installs on/off for the current run scope.
+
+    ``with lazy_install_override(False):`` disables lazy installs for the
+    enclosing block (and any thread that copies this context). Restores the
+    prior value on exit. ContextVar-backed on purpose (see the module note) —
+    do NOT replace with an env-var toggle.
+    """
+
+    def __init__(self, allow: bool) -> None:
+        self._allow = bool(allow)
+        self._token = None
+
+    def __enter__(self) -> "lazy_install_override":
+        self._token = _LAZY_INSTALL_OVERRIDE.set(self._allow)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._token is not None:
+            _LAZY_INSTALL_OVERRIDE.reset(self._token)
+            self._token = None
 
 
 # =============================================================================
@@ -241,6 +283,12 @@ def _allow_lazy_installs() -> bool:
     refusing to install would lock people out of their own backends; the
     decision to block is an explicit user opt-in.
     """
+    # PRD-027 FR-6: a run-scoped ContextVar override wins over env/config so a
+    # contained profile can disable lazy installs for its run without racing a
+    # concurrent non-profile job in the shared cron thread pool.
+    override = _LAZY_INSTALL_OVERRIDE.get()
+    if override is not None:
+        return override
     if os.environ.get("HERMES_DISABLE_LAZY_INSTALLS") == "1":
         return False
     try:
