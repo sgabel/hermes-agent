@@ -13,8 +13,8 @@ Security model (PRD-035):
   agent can reach the socket directly, so the in-container gate below is UX +
   defense-in-depth, NOT the security boundary.
 * FR-10 — there is **no direct-spawn fallback**. If the relay is unreachable the
-  tool REFUSES (fail-closed). A surviving `subprocess.run(["claude", …])` path
-  would bypass every relay control.
+  tool REFUSES (fail-closed). A surviving direct `claude` subprocess spawn on this
+  path would bypass every relay control, so none exists here.
 * FR-9 — on the interactive path the tool still runs ``check_all_command_guards``
   first (Discord approval UX + tirith inspection of the outbound prompt).
 * FR-1 — the model is **pinned by the relay**; there is no client model override.
