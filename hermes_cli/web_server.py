@@ -63,6 +63,13 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
     redact_key,
 )
+# PRD-045 FR-6 — server-side security-floor denylist on the config/env write surface.
+from hermes_cli.dashboard_security_floor import (
+    pin_config_floor,
+    is_floor_env_key,
+    floor_env_write_message,
+    floor_env_reveal_message,
+)
 from hermes_cli.memory_providers import (
     MemoryProvider,
     ProviderField,
@@ -4028,7 +4035,9 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
-            save_config(_denormalize_config_from_web(body.config))
+            # PRD-045 FR-6: pin security-floor keys to their on-disk values so a
+            # web config write cannot weaken approvals/tirith/pinned_target/auth.
+            save_config(pin_config_floor(_denormalize_config_from_web(body.config)))
         return {"ok": True}
     except HTTPException:
         raise
@@ -4172,6 +4181,10 @@ async def get_env_vars(profile: Optional[str] = None):
 @app.put("/api/env")
 async def set_env_var(body: EnvVarUpdate, profile: Optional[str] = None):
     try:
+        # PRD-045 FR-6: security-floor credentials (API_SERVER_KEY, dashboard
+        # basic-auth) are host-only — never writable from the web surface.
+        if is_floor_env_key(body.key):
+            raise ValueError(floor_env_write_message(body.key))
         with _profile_scope(body.profile or profile):
             save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
@@ -4291,6 +4304,10 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
 @app.delete("/api/env")
 async def remove_env_var(body: EnvVarDelete, profile: Optional[str] = None):
     try:
+        # PRD-045 FR-6: security-floor credentials are host-only — deleting them
+        # from the web would break gateway/dashboard auth (lockout / fall-open).
+        if is_floor_env_key(body.key):
+            raise ValueError(floor_env_write_message(body.key))
         with _profile_scope(body.profile or profile):
             removed = remove_env_value(body.key)
         if not removed:
@@ -4321,6 +4338,10 @@ async def reveal_env_var(
     """
     # --- Token check ---
     _require_token(request)
+
+    # --- PRD-045 FR-6: security-floor credentials are never revealed to the web ---
+    if is_floor_env_key(body.key):
+        raise HTTPException(status_code=403, detail=floor_env_reveal_message(body.key))
 
     # --- Rate limit ---
     now = time.time()
@@ -8311,8 +8332,13 @@ async def install_mcp_catalog_entry(body: MCPCatalogInstall, profile: Optional[s
     if body.env:
         with _profile_scope(effective_profile):
             for k, v in body.env.items():
-                if v:
-                    save_env_value(k, v)
+                if not v:
+                    continue
+                # PRD-045 FR-6: a catalog install must not become a floor-credential
+                # write path (API_SERVER_KEY / dashboard basic-auth) — reject those.
+                if is_floor_env_key(k):
+                    raise HTTPException(status_code=400, detail=floor_env_write_message(k))
+                save_env_value(k, v)
 
     # Git-bootstrap entries can take a while to clone — run via the background
     # action path so the request returns immediately and the UI can tail logs.
@@ -10706,7 +10732,8 @@ async def update_config_raw(body: RawConfigUpdate, profile: Optional[str] = None
         if not isinstance(parsed, dict):
             raise HTTPException(status_code=400, detail="YAML must be a mapping")
         with _profile_scope(body.profile or profile):
-            save_config(parsed)
+            # PRD-045 FR-6: same floor pin on the raw-YAML config write path.
+            save_config(pin_config_floor(parsed))
         return {"ok": True}
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
