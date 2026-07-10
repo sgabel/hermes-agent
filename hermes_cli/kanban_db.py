@@ -98,7 +98,12 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+# PRD-049: "scheduled" is a valid direct-creation status so agenda cards can be
+# created straight into the one status the dispatcher never claims. A
+# create→schedule two-step is impossible (write_txn is BEGIN IMMEDIATE /
+# non-reentrant, and a non-sticky blocked intermediate auto-promotes to ready
+# within one tick via recompute_ready).
+VALID_INITIAL_STATUSES = {"running", "blocked", "scheduled"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -836,6 +841,11 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # PRD-049: optional due date (epoch seconds, UTC). NULL = undated. A
+    # YYYY-MM-DD input is stored as end-of-day in the configured tz; a full
+    # ISO8601-with-offset input is stored verbatim. Only the agenda board sets
+    # it today; all other boards read back NULL and are unaffected.
+    due_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -910,6 +920,10 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            # PRD-049: legacy rows (pre-migration snapshot) read back None.
+            due_at=(
+                row["due_at"] if "due_at" in keys else None
             ),
         )
 
@@ -1071,7 +1085,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- PRD-049: optional due date (epoch seconds, UTC). NULL = undated. Only
+    -- the agenda board populates it; every other board leaves it NULL and is
+    -- unaffected. Legacy DBs gain the column via _migrate_add_optional_columns.
+    due_at               INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1883,6 +1901,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    # PRD-049: optional due date (epoch seconds, UTC). NULL on legacy rows and
+    # on every board that never sets it. No index — the agenda board is tiny
+    # and snapshot ordering happens in Python.
+    if "due_at" not in cols:
+        _add_column_if_missing(conn, "tasks", "due_at", "due_at INTEGER")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2262,6 +2286,7 @@ def create_task(
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    due_at: Optional[int] = None,  # PRD-049: optional due date (epoch seconds)
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2396,6 +2421,17 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "scheduled":
+                    # PRD-049: direct creation into the non-dispatchable
+                    # ``scheduled`` status (agenda cards). No dispatchable
+                    # intermediate state ever exists — the 'created' event
+                    # below records status='scheduled' with no preceding
+                    # status-transition event (AC-002).
+                    task_status = "scheduled"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                 elif triage:
                     task_status = "triage"
                 else:
@@ -2425,8 +2461,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        due_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2448,6 +2485,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(due_at) if due_at is not None else None,  # PRD-049
                     ),
                 )
                 for pid in parents:
@@ -2496,6 +2534,26 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def set_due(
+    conn: sqlite3.Connection, task_id: str, due_at: Optional[int]
+) -> bool:
+    """PRD-049: set or clear a task's due date (epoch seconds, UTC).
+
+    ``due_at=None`` clears the date. Returns ``True`` when a row was updated,
+    ``False`` when the task id does not exist. Appends a ``due_set`` event for
+    the live feed. Does not touch status — an agenda card stays ``scheduled``.
+    """
+    value = int(due_at) if due_at is not None else None
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET due_at = ? WHERE id = ?", (value, task_id)
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "due_set", {"due_at": value})
+        return True
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -2507,6 +2565,9 @@ VALID_SORT_ORDERS: dict[str, str] = {
     "assignee": "assignee ASC, created_at ASC",
     "title": "title ASC, id ASC",
     "updated": "started_at DESC NULLS LAST, created_at DESC",
+    # PRD-049: soonest-due first, undated last (explicit NULLS LAST), then
+    # priority as the standing-importance tiebreaker, then creation order.
+    "due": "due_at IS NULL, due_at ASC, priority DESC, created_at ASC",
 }
 
 
