@@ -592,11 +592,27 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    due_at: Optional[int] = None  # PRD-049: optional due date (epoch seconds, UTC)
 
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    # PRD-049: agenda-board policy — agenda cards rest in the non-dispatchable
+    # 'scheduled' status (the one status the dispatcher never claims) and never
+    # enter triage. Resolve the effective board (query param, else active board)
+    # so the coercion + rejection below can branch on it.
+    effective_board = board if board is not None else kanban_db.get_current_board()
+    is_agenda = effective_board == "agenda"
+    if is_agenda and payload.triage:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "triage:true is not allowed on the agenda board — agenda cards "
+                "must rest in 'scheduled' (never dispatchable)."
+            ),
+        )
+    initial_status = "scheduled" if is_agenda else "running"
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(
@@ -616,6 +632,8 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            initial_status=initial_status,  # PRD-049: 'scheduled' on the agenda board
+            due_at=payload.due_at,  # PRD-049
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -816,11 +834,25 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    due_at: Optional[int] = None  # PRD-049: epoch seconds, UTC; null clears (see PATCH)
 
 
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    # PRD-049: agenda-board policy — an agenda card must stay in the
+    # non-dispatchable 'scheduled' status. Reject any PATCH that would move it
+    # into a dispatchable / triage lane. Resolve the effective board once.
+    effective_board = board if board is not None else kanban_db.get_current_board()
+    is_agenda = effective_board == "agenda"
+    if is_agenda and payload.status in ("triage", "todo", "ready", "running"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"cannot set an agenda-board card to {payload.status!r} — agenda "
+                "cards must rest in 'scheduled' (never dispatchable)."
+            ),
+        )
     conn = _conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
@@ -930,6 +962,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     "VALUES (?, 'edited', NULL, ?)",
                     (task_id, int(time.time())),
                 )
+
+        # --- due_at (set / clear) -----------------------------------------
+        # PRD-049: the wire convention is fields-set based. ``"due_at": null``
+        # PRESENT in the body clears the date; ``due_at`` absent = no change.
+        # pydantic v2 exposes the explicitly-supplied fields via
+        # ``model_fields_set`` (v1 used ``__fields_set__``); this plugin runs on
+        # pydantic v2. ``set_due(None)`` clears, ``set_due(int)`` sets.
+        if "due_at" in payload.model_fields_set:
+            kanban_db.set_due(conn, task_id, payload.due_at)
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
