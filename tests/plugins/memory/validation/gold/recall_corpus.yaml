@@ -1,0 +1,87 @@
+# PRD-050 FR-3 — recall corpus + gold queries.
+#
+# The driver's `recall` subcommand upserts each doc into the sandbox collection
+# `sylva_lab_validation_recall` (payload: data/speaker/date/source=<doc id>/
+# category=journal), embeds via real TEI, then runs
+# ChronicleSearcher(collection="sylva_lab_validation_recall").search(...) per
+# query. Returned points are mapped back to doc ids via the `source` field.
+#
+#   * >=30 docs, synthetic dated journal entries, speakers scott|sylva, dates
+#     spread across 2026-05..07, including >=8 topic-free DISTRACTORS.
+#   * >=15 gold queries; each with expected_ids; >=4 carry a speaker/date filter.
+#
+# For a FILTERED query the driver computes `allowed_ids` from this corpus (the
+# docs that satisfy the query's filter) and hands it to score_recall — every
+# returned doc must be in it (HARD filter-correctness). Content is synthetic.
+meta:
+  prd: PRD-050
+  collection_suffix: recall
+  precision_k: 2
+
+docs:
+  # cluster A — grant eligibility ranking
+  - {id: rc-001, speaker: scott, date: "2026-05-04", data: "Scott asked whether the grant eligibility signal is being drowned out by mission-fit in the ranker."}
+  - {id: rc-002, speaker: sylva, date: "2026-05-04", data: "I found a grant with high eligibility ranking at position ten, below nine lower-eligibility grants."}
+  - {id: rc-003, speaker: sylva, date: "2026-05-05", data: "We rebalanced the ranker so eligibility lifts the grant the org can actually win into the top tier."}
+  # cluster B — soccer / TeamSnap
+  - {id: rc-004, speaker: scott, date: "2026-05-10", data: "Scott wanted the soccer sidekick to broadcast game reminders to the team through TeamSnap."}
+  - {id: rc-005, speaker: sylva, date: "2026-05-11", data: "I validated the TeamSnap broadcast emails endpoint for the team with Scott as the sender."}
+  - {id: rc-006, speaker: sylva, date: "2026-05-12", data: "The GotSport schedule export auto-fetch worked without a reCAPTCHA wall, so the poll runs every thirty minutes."}
+  # cluster C — memory / chronicle
+  - {id: rc-007, speaker: sylva, date: "2026-06-02", data: "I explained that the chronicle is my episodic journal, written once per real session boundary."}
+  - {id: rc-008, speaker: scott, date: "2026-06-03", data: "Scott asked why recall felt reluctant on explicit do-you-remember questions."}
+  - {id: rc-009, speaker: sylva, date: "2026-06-04", data: "We added a bounded recall assist so an explicit recall question warms one chronicle search that same turn."}
+  # cluster D — docker migration
+  - {id: rc-010, speaker: scott, date: "2026-06-10", data: "Scott decided to move the whole agent into Docker so the container namespace becomes the trust boundary."}
+  - {id: rc-011, speaker: sylva, date: "2026-06-11", data: "I noted the agent runs on an internal-only network with Discord as the sole egress via the proxy."}
+  - {id: rc-012, speaker: sylva, date: "2026-06-12", data: "After the migration, a code change needs an image rebuild, not just a container restart."}
+  # cluster E — voice latency
+  - {id: rc-013, speaker: scott, date: "2026-06-15", data: "Scott reported the local voice felt slow to start talking."}
+  - {id: rc-014, speaker: sylva, date: "2026-06-15", data: "I traced the time-to-first-token lag to the model's thinking mode and disabled it to drop latency under a second."}
+  # cluster F — autonomy governance
+  - {id: rc-015, speaker: sylva, date: "2026-07-01", data: "I described the kill switch: writing a QUIESCE flag halts autonomous loops but leaves interactive chat untouched."}
+  - {id: rc-016, speaker: scott, date: "2026-07-02", data: "Scott wanted the budget governor to fail closed on unknown kinds."}
+  - {id: rc-017, speaker: sylva, date: "2026-07-03", data: "We registered every budget-debited surface in all three maps so a new surface fails closed if unregistered."}
+  # cluster G — proactive outreach
+  - {id: rc-018, speaker: scott, date: "2026-07-05", data: "Scott framed proactive outreach as she-comes-to-me, bounded by a rubric and quiet hours."}
+  - {id: rc-019, speaker: sylva, date: "2026-07-06", data: "I send at most a handful of proactive messages a day, only to the pinned home channel, never during quiet hours."}
+  # cluster H — advisory relay
+  - {id: rc-020, speaker: sylva, date: "2026-07-06", data: "The advisory relay lets me ask a toolless Claude for a second opinion over a unix socket with no credential entering the container."}
+  - {id: rc-021, speaker: scott, date: "2026-07-06", data: "Scott stressed the relay's own four checks are the sole security boundary, not the in-container tool gate."}
+  # cluster I — fedpulse guardrail + context pin
+  - {id: rc-030, speaker: sylva, date: "2026-05-28", data: "I summarized that the FedPulse Postgres and Supabase stack must never be touched during Hermes work."}
+  - {id: rc-031, speaker: scott, date: "2026-06-25", data: "Scott pinned the local model context window to sixty-four thousand tokens to avoid overflow crashes."}
+  - {id: rc-032, speaker: sylva, date: "2026-06-26", data: "I confirmed the context-window pin is hermes-internal and never sent to the llama server."}
+  # distractors (topic-free small talk) — >=8
+  - {id: rc-022, speaker: scott, date: "2026-05-20", data: "Scott mentioned it rained hard all weekend and the yard flooded a little."}
+  - {id: rc-023, speaker: sylva, date: "2026-05-21", data: "I suggested a slow-cooker chili recipe for the cold evening ahead."}
+  - {id: rc-024, speaker: scott, date: "2026-05-22", data: "Scott was excited about a new science-fiction novel he had just started reading."}
+  - {id: rc-025, speaker: sylva, date: "2026-06-06", data: "We chatted about how the local coffee shop changed its opening hours."}
+  - {id: rc-026, speaker: scott, date: "2026-06-18", data: "Scott said the gaming rig needed a new graphics-card fan after it got loud."}
+  - {id: rc-027, speaker: sylva, date: "2026-06-20", data: "I recommended taking stretching breaks during long coding sessions."}
+  - {id: rc-028, speaker: scott, date: "2026-07-04", data: "Scott watched the fireworks with the family from the driveway."}
+  - {id: rc-029, speaker: sylva, date: "2026-07-07", data: "I wished Scott a good morning and asked how he had slept."}
+  - {id: rc-033, speaker: scott, date: "2026-05-25", data: "Scott planned to repaint the fence this weekend if the weather held."}
+  - {id: rc-034, speaker: sylva, date: "2026-06-08", data: "I shared a short playlist of instrumental music for focus."}
+  - {id: rc-035, speaker: scott, date: "2026-07-08", data: "Scott said the neighbor's dog kept barking early in the morning."}
+
+queries:
+  # ── unfiltered (12) ──────────────────────────────────────────────────────────
+  - {id: q-01, query: "is the grant eligibility signal drowned out by mission fit in the ranker", expected_ids: [rc-001, rc-002, rc-003]}
+  - {id: q-02, query: "broadcast game reminders to the soccer team via teamsnap", expected_ids: [rc-004, rc-005, rc-006]}
+  - {id: q-03, query: "why does recall feel reluctant on do you remember questions", expected_ids: [rc-007, rc-008, rc-009]}
+  - {id: q-04, query: "moving the agent into docker and the container trust boundary", expected_ids: [rc-010, rc-011, rc-012]}
+  - {id: q-05, query: "local voice slow time to first token thinking mode", expected_ids: [rc-013, rc-014]}
+  - {id: q-06, query: "kill switch quiesce flag and budget governor fail closed", expected_ids: [rc-015, rc-016, rc-017]}
+  - {id: q-07, query: "proactive outreach she comes to me quiet hours pinned channel", expected_ids: [rc-018, rc-019]}
+  - {id: q-08, query: "advisory relay second opinion toolless claude over a socket", expected_ids: [rc-020, rc-021]}
+  - {id: q-09, query: "local model context window pin to avoid overflow crashes", expected_ids: [rc-031, rc-032]}
+  - {id: q-10, query: "teamsnap broadcast emails endpoint validated for the team", expected_ids: [rc-005, rc-004]}
+  - {id: q-11, query: "what is the chronicle episodic journal and the recall assist", expected_ids: [rc-007, rc-009]}
+  - {id: q-12, query: "a code change needs an image rebuild not just a restart", expected_ids: [rc-012, rc-010]}
+  # ── filtered (5): >=1 speaker filter, >=3 date filter ────────────────────────
+  - {id: q-13, query: "kill switch and budget governor fail closed", expected_ids: [rc-015, rc-016, rc-017], filter: {date_from: "2026-07-01", date_to: "2026-07-03"}}
+  - {id: q-14, query: "the chronicle is an episodic journal and the recall assist", expected_ids: [rc-007, rc-009], filter: {speaker: sylva}}
+  - {id: q-15, query: "grant eligibility ranking rebalance to the top tier", expected_ids: [rc-001, rc-002, rc-003], filter: {date_from: "2026-05-04", date_to: "2026-05-05"}}
+  - {id: q-16, query: "moving the agent into docker and image rebuild", expected_ids: [rc-010, rc-011, rc-012], filter: {date_from: "2026-06-10", date_to: "2026-06-12"}}
+  - {id: q-17, query: "Scott weekend family fireworks and a new novel", expected_ids: [rc-022, rc-024, rc-028], filter: {speaker: scott}}
