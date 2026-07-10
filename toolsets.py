@@ -53,6 +53,8 @@ _HERMES_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Standing agenda (PRD-049): read-only view of the agenda kanban board
+    "agenda_view",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -227,6 +229,14 @@ TOOLSETS = {
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
+        "includes": []
+    },
+
+    # PRD-049: standing-agenda read-only view (the agenda kanban board). Tiny,
+    # single-tool toolset — the proactive/nightly surfaces enable it explicitly.
+    "agenda": {
+        "description": "Read-only view of the standing agenda (agenda kanban board)",
+        "tools": ["agenda_view"],
         "includes": []
     },
 
