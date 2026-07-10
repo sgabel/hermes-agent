@@ -744,12 +744,32 @@ def _handle_create(args: dict, **kw) -> str:
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
+    # PRD-049: agenda-board policy — cards rest in the non-dispatchable
+    # 'scheduled' status and carry no assignee. Resolve the board early so the
+    # assignee requirement and the status coercion below can branch on it.
+    _board_arg = args.get("board")
+    try:
+        from hermes_cli import kanban_db as _kb
+        _is_agenda = (_kb._normalize_board_slug(_board_arg) == "agenda")
+    except Exception:
+        _is_agenda = (str(_board_arg or "").strip().lower() == "agenda")
     assignee = args.get("assignee")
-    if not assignee:
+    if not assignee and not _is_agenda:
         return tool_error(
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # PRD-049: optional due date (ISO date string; parsed host-side via the
+    # single canonical parser). Invalid input is a loud tool error — a due date
+    # is never silently dropped.
+    due_at = None
+    _due_arg = args.get("due")
+    if _due_arg is not None and str(_due_arg).strip():
+        try:
+            from hermes_cli.agenda import parse_due
+            due_at = parse_due(str(_due_arg))
+        except ValueError as _due_err:
+            return tool_error(f"kanban_create: invalid due — {_due_err}")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -776,6 +796,11 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    if _is_agenda:
+        # PRD-049: agenda-board cards are coerced into the non-dispatchable
+        # 'scheduled' status regardless of any requested initial_status — they
+        # are standing-agenda items, never dispatched work.
+        initial_status = "scheduled"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -811,7 +836,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=(str(assignee) if assignee else None),  # PRD-049: agenda cards carry no assignee
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -831,6 +856,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                due_at=due_at,  # PRD-049
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1291,7 +1317,10 @@ KANBAN_CREATE_SCHEMA = {
                     "Profile name that should execute this task "
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
                     "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "dispatched. NOT required when board='agenda': "
+                    "standing-agenda items carry no assignee and are "
+                    "created directly into the non-dispatchable "
+                    "'scheduled' status."
                 ),
             },
             "body": {
@@ -1411,6 +1440,17 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "due": {
+                "type": "string",
+                "description": (
+                    "PRD-049: optional due date for standing-agenda items. "
+                    "A bare 'YYYY-MM-DD' is interpreted as end-of-day in the "
+                    "configured timezone; a full ISO8601 datetime WITH an "
+                    "offset (e.g. '2026-07-20T09:00:00-04:00' or '...Z') is "
+                    "accepted verbatim. Invalid input is a loud error, never "
+                    "silently dropped. Most useful with board='agenda'."
                 ),
             },
             "board": _board_schema_prop(),
