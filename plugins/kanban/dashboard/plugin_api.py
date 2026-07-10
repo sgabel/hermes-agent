@@ -845,7 +845,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     # into a dispatchable / triage lane. Resolve the effective board once.
     effective_board = board if board is not None else kanban_db.get_current_board()
     is_agenda = effective_board == "agenda"
-    if is_agenda and payload.status in ("triage", "todo", "ready", "running"):
+    # "blocked" is rejected defensively: block_task's own status IN
+    # ('running','ready') guard already stops scheduled->blocked today, but a
+    # future block_task refactor must not silently open this (review nit 2).
+    if is_agenda and payload.status in ("triage", "todo", "ready", "running", "blocked"):
         raise HTTPException(
             status_code=422,
             detail=(
@@ -1216,7 +1219,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
     # guard). Same rule as PATCH: agenda cards never enter a dispatchable /
     # triage lane.
     effective_board = board if board is not None else kanban_db.get_current_board()
-    if effective_board == "agenda" and payload.status in ("triage", "todo", "ready", "running"):
+    if effective_board == "agenda" and payload.status in ("triage", "todo", "ready", "running", "blocked"):
         raise HTTPException(
             status_code=422,
             detail=(

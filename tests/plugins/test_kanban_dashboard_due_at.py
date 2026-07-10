@@ -91,7 +91,7 @@ def test_agenda_board_bulk_rejects_dispatchable_statuses(client):
     # Found at code review: POST /tasks/bulk was a status-write surface that
     # bypassed the PATCH-route guard. Pin the closure.
     tid = client.post(f"{B}/tasks?board=agenda", json={"title": "b"}).json()["task"]["id"]
-    for status in ("triage", "todo", "ready", "running"):
+    for status in ("triage", "todo", "ready", "running", "blocked"):
         r = client.post(f"{B}/tasks/bulk?board=agenda",
                         json={"ids": [tid], "status": status})
         assert r.status_code == 422, f"{status}: {r.status_code} {r.text}"
@@ -101,7 +101,7 @@ def test_agenda_board_bulk_rejects_dispatchable_statuses(client):
 
 def test_agenda_board_patch_rejects_dispatchable_statuses(client):
     tid = client.post(f"{B}/tasks?board=agenda", json={"title": "a"}).json()["task"]["id"]
-    for status in ("triage", "todo", "ready", "running"):
+    for status in ("triage", "todo", "ready", "running", "blocked"):
         r = client.patch(f"{B}/tasks/{tid}?board=agenda", json={"status": status})
         assert r.status_code == 422, f"{status}: {r.status_code} {r.text}"
     with kb.connect_closing(board="agenda") as conn:
