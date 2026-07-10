@@ -316,6 +316,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_create.add_argument("--due", default=None, metavar="<YYYY-MM-DD|ISO8601>",
+                          help="PRD-049: optional due date. A bare YYYY-MM-DD is "
+                               "end-of-day in the configured timezone; a full "
+                               "ISO8601 datetime with offset is taken verbatim. "
+                               "Invalid input is a hard error. Most useful with "
+                               "--board agenda.")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
@@ -560,6 +566,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
+    p_schedule.add_argument("--due", default=None, metavar="<YYYY-MM-DD|ISO8601>",
+                            help="PRD-049: set a due date while scheduling. YYYY-MM-DD "
+                                 "(end-of-day, configured tz) or ISO8601 with offset. "
+                                 "Invalid input is a hard error.")
+    p_schedule.add_argument("--clear-due", action="store_true", dest="clear_due",
+                            help="PRD-049: clear any existing due date on the scheduled "
+                                 "task(s). Mutually exclusive with --due.")
 
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
     p_unblock.add_argument(
@@ -1310,6 +1323,31 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # PRD-049: agenda-board policy — cards rest in the non-dispatchable
+    # 'scheduled' status (the one status the dispatcher never claims) and never
+    # enter triage. Runs inside the --board scope, so get_current_board() sees
+    # the resolved slug.
+    is_agenda = kb.get_current_board() == "agenda"
+    initial_status = getattr(args, "initial_status", "running")
+    if is_agenda:
+        if bool(getattr(args, "triage", False)):
+            print(
+                "kanban: --triage is not allowed on the agenda board — agenda "
+                "cards must rest in 'scheduled' (never dispatchable).",
+                file=sys.stderr,
+            )
+            return 2
+        initial_status = "scheduled"
+    # PRD-049: optional due date. Invalid input is a hard error — never dropped.
+    due_at = None
+    due_raw = getattr(args, "due", None)
+    if due_raw:
+        try:
+            from hermes_cli.agenda import parse_due
+            due_at = parse_due(due_raw)
+        except ValueError as exc:
+            print(f"kanban: --due: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1330,7 +1368,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=initial_status,
+            due_at=due_at,  # PRD-049
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1946,6 +1985,21 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
+    # PRD-049: optional due-date mutation applied on successful scheduling.
+    due_raw = getattr(args, "due", None)
+    clear_due = bool(getattr(args, "clear_due", False))
+    if due_raw and clear_due:
+        print("kanban: --due and --clear-due are mutually exclusive", file=sys.stderr)
+        return 2
+    set_due = due_raw is not None or clear_due
+    due_at = None
+    if due_raw:
+        try:
+            from hermes_cli.agenda import parse_due
+            due_at = parse_due(due_raw)
+        except ValueError as exc:
+            print(f"kanban: --due: {exc}", file=sys.stderr)
+            return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
@@ -1960,7 +2014,21 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
-                print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
+                # PRD-049: set/clear the due date only after a successful
+                # schedule (due_at=None clears). Missing task ids here are
+                # unreachable — schedule_task already returned truthy.
+                if set_due:
+                    kb.set_due(conn, tid, due_at)
+                due_note = ""
+                if due_raw:
+                    due_note = f" (due {due_raw})"
+                elif clear_due:
+                    due_note = " (due cleared)"
+                print(
+                    f"Scheduled {tid}"
+                    + (f": {reason}" if reason else "")
+                    + due_note
+                )
     return 0 if not failed else 1
 
 
