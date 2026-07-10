@@ -87,6 +87,18 @@ def test_agenda_board_create_coerces_scheduled_and_rejects_triage(client):
     assert r.status_code == 422, r.text
 
 
+def test_agenda_board_bulk_rejects_dispatchable_statuses(client):
+    # Found at code review: POST /tasks/bulk was a status-write surface that
+    # bypassed the PATCH-route guard. Pin the closure.
+    tid = client.post(f"{B}/tasks?board=agenda", json={"title": "b"}).json()["task"]["id"]
+    for status in ("triage", "todo", "ready", "running"):
+        r = client.post(f"{B}/tasks/bulk?board=agenda",
+                        json={"ids": [tid], "status": status})
+        assert r.status_code == 422, f"{status}: {r.status_code} {r.text}"
+    with kb.connect_closing(board="agenda") as conn:
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+
 def test_agenda_board_patch_rejects_dispatchable_statuses(client):
     tid = client.post(f"{B}/tasks?board=agenda", json={"title": "a"}).json()["task"]["id"]
     for status in ("triage", "todo", "ready", "running"):

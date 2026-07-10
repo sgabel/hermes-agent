@@ -1211,6 +1211,19 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
         raise HTTPException(status_code=400, detail="ids is required")
     results: list[dict] = []
     board = _resolve_board(board)
+    # PRD-049: agenda-board policy — bulk is a status-write surface too (found
+    # at code review: _set_status_direct/unblock_task here bypassed the PATCH
+    # guard). Same rule as PATCH: agenda cards never enter a dispatchable /
+    # triage lane.
+    effective_board = board if board is not None else kanban_db.get_current_board()
+    if effective_board == "agenda" and payload.status in ("triage", "todo", "ready", "running"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"cannot bulk-set agenda-board cards to {payload.status!r} — agenda "
+                "cards must rest in 'scheduled' (never dispatchable)."
+            ),
+        )
     conn = _conn(board=board)
     try:
         for tid in ids:
