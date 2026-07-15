@@ -39,7 +39,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from plugins.memory.canon.consolidation import run_consolidation  # noqa: E402
+from plugins.memory.canon.consolidation import (  # noqa: E402
+    _CHRONICLE_LOOKBACK_DAYS,
+    run_consolidation,
+)
 
 
 def main() -> int:
@@ -62,13 +65,29 @@ def main() -> int:
         action="store_true",
         help="tag the audit entry surface as 'cron' (set when run by the scheduler)",
     )
+    ap.add_argument(
+        "--include-chronicle",
+        action="store_true",
+        help="PRD-051: also source the episodic chronicle (omitted -> the "
+        "memory.consolidation_chronicle_source config knob decides, default off)",
+    )
+    ap.add_argument(
+        "--chronicle-days",
+        type=int,
+        default=_CHRONICLE_LOOKBACK_DAYS,
+        help=f"chronicle lookback window in days (default {_CHRONICLE_LOOKBACK_DAYS}; "
+        "only ~21 points are that recent today — widen for early knob-on trials)",
+    )
     args = ap.parse_args()
 
     kwargs = {
         "dry_run": args.dry_run,
         "limit_sessions": args.limit_sessions,
         "surface": "cron" if args.cron else "cli",
+        "chronicle_days": args.chronicle_days,
     }
+    if args.include_chronicle:
+        kwargs["include_chronicle"] = True
     if args.sandbox:
         kwargs["target_collection"] = args.sandbox
 

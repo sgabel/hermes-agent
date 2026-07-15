@@ -49,7 +49,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
@@ -115,6 +115,13 @@ _MAX_SESSIONS = 12
 _MAX_AGENCY_ITEMS = 40
 _LEDGER_LOOKBACK_HOURS = 24.0 * 7  # one week of agency signal
 
+# PRD-051 — episodic-chronicle third input (default-off knob; see FR-1..FR-3).
+_CHRONICLE_COLLECTION = "sylva_chronicle"
+_CHRONICLE_LOOKBACK_DAYS = 7
+_CHRONICLE_MAX_ENTRIES = 40
+_CHRONICLE_BLOCK_CHARS = 6000     # total block cap fed to the deriver
+_CHRONICLE_PER_ENTRY_CHARS = 400  # per-entry truncation inside the block
+
 
 # ── result type ──────────────────────────────────────────────────────────────
 @dataclass
@@ -129,15 +136,23 @@ class ConsolidationResult:
     dry_run: bool = False
     skipped_reason: str = ""
     candidate_ids: List[str] = field(default_factory=list)
+    chronicle_entries_used: int = 0  # PRD-051 — 0 whenever the knob is off
 
     def summary(self) -> str:
         if self.skipped_reason:
             return f"consolidation skipped: {self.skipped_reason}"
         verb = "would write" if self.dry_run else "wrote"
+        # chronicle clause only when the source actually fed entries — the
+        # knob-off summary string stays byte-identical to pre-PRD-051.
+        chron = (
+            f" + {self.chronicle_entries_used} chronicle entrie(s)"
+            if self.chronicle_entries_used
+            else ""
+        )
         return (
             f"consolidation: {verb} {self.candidates_written} candidate(s) to "
             f"{self.target_collection} from {self.sessions_seen} session(s) + "
-            f"{self.agency_items} agency item(s) via {self.model or '<no-model>'}"
+            f"{self.agency_items} agency item(s){chron} via {self.model or '<no-model>'}"
         )
 
 
@@ -419,6 +434,145 @@ def _agency_from_work_blocks() -> List[Dict[str, Any]]:
     return out
 
 
+# ── 2b. chronicle gather (PRD-051 — default-off third input) ────────────────────
+def _chronicle_source_enabled() -> bool:
+    """``memory.consolidation_chronicle_source`` — STRICT bool read (default False).
+
+    Mirrors ``render.py:_canon_token_budget``: only a real YAML boolean counts.
+    ``bool(val)`` would make a hand-edited quoted ``"false"`` truthy
+    (adversarial C-3), silently arming the source.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        val = (cfg.get("memory") or {}).get("consolidation_chronicle_source")
+        if isinstance(val, bool):
+            return val
+    except Exception as e:  # pragma: no cover - config best-effort
+        logger.debug("consolidation_chronicle_source falling back to off: %s", e)
+    return False
+
+
+def _chronicle_points(date_from: str) -> List[Dict[str, Any]]:
+    """Scroll ``sylva_chronicle`` for entries with ``date >= date_from``.
+
+    Qdrant-only (the gatherer never embeds — no TEI dependency). Endpoint
+    resolution reuses ``CanonStore.from_config`` (mem0.json container-DNS →
+    env override → reachability-probed localhost fallback) — NEVER a bare
+    ``ChronicleSearcher()``, whose unprobed localhost default would make the
+    gather silently empty in-container while every host test passes
+    (adversarial NF-4). The lexicographic keyword range filter on ``date``
+    was verified working live at review (Qdrant 1.17.1).
+    """
+    import requests
+
+    from .store import CanonStore
+
+    qdrant_url = CanonStore.from_config()._qdrant_url
+    points: List[Dict[str, Any]] = []
+    offset: Any = None
+    while True:
+        body: Dict[str, Any] = {
+            "limit": 500,
+            "with_payload": True,
+            "with_vector": False,
+            "filter": {"must": [{"key": "date", "range": {"gte": date_from}}]},
+        }
+        if offset is not None:
+            body["offset"] = offset
+        r = requests.post(
+            f"{qdrant_url}/collections/{_CHRONICLE_COLLECTION}/points/scroll",
+            json=body,
+            timeout=30,
+        )
+        r.raise_for_status()
+        result = r.json().get("result", {})
+        points.extend(result.get("points", []))
+        offset = result.get("next_page_offset")
+        if offset is None:
+            break
+    return points
+
+
+def _gather_chronicle(
+    days: int = _CHRONICLE_LOOKBACK_DAYS,
+    limit: int = _CHRONICLE_MAX_ENTRIES,
+    exclude_session_ids: Any = (),
+) -> List[Dict[str, Any]]:
+    """Recent-window chronicle entries, newest first (PRD-051 FR-1).
+
+    Overlap exclusion (adversarial NF-3 — the input-side double-feed is real):
+    PRD-037 entries carry ``source=session:<id>`` for the very sessions
+    ``_gather_recent_sessions`` already feeds the deriver in full; without the
+    drop the deriver sees the same fact twice and transient-echo proposals get
+    doubled emphasis. Output dedup does NOT cover this.
+
+    Degrades to ``[]`` on any gather failure (the WRITE path's raise-on-down
+    behavior is deliberately unchanged — adversarial NF-5 rescope).
+    """
+    try:
+        date_from = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        raw = _chronicle_points(date_from)
+    except Exception as e:
+        logger.debug("consolidation: chronicle gather failed (degrade to empty): %s", e)
+        return []
+    excluded = {f"session:{sid}" for sid in exclude_session_ids}
+    out: List[Dict[str, Any]] = []
+    for p in raw:
+        payload = p.get("payload") or {}
+        data = str(payload.get("data") or "").strip()
+        when = str(payload.get("date") or "")
+        source = str(payload.get("source") or "")
+        # belt-and-braces Python-side window check on top of the Qdrant filter
+        if not data or not when or when < date_from:
+            continue
+        if source in excluded:
+            continue
+        out.append(
+            {
+                "kind": "chronicle",
+                "claim": _scrub_secrets(data),
+                "ref": f"chronicle:{p.get('id')}",
+                "when": when,
+                "source": source,
+            }
+        )
+    out.sort(key=lambda e: e["when"], reverse=True)
+    return out[:limit]
+
+
+def _format_chronicle(entries: List[Dict[str, Any]]) -> str:
+    """Bounded block: per-entry truncation + total cap ≤ _CHRONICLE_BLOCK_CHARS."""
+    if not entries:
+        return "(none)"
+    lines: List[str] = []
+    total = 0
+    for e in entries:
+        claim = str(e.get("claim", ""))[:_CHRONICLE_PER_ENTRY_CHARS]
+        line = f"- [{e.get('when')}] {claim}  (ref: {e.get('ref')})"
+        if total + len(line) + 1 > _CHRONICLE_BLOCK_CHARS:
+            break
+        lines.append(line)
+        total += len(line) + 1
+    return "\n".join(lines) if lines else "(none)"
+
+
+# Appended to the byte-untouched _SYSTEM_PROMPT / _USER_TEMPLATE ONLY when the
+# knob is on AND entries survived the overlap exclusion (adversarial NF-1 —
+# disabled/empty runs produce the exact pre-change (system, user) pair).
+_CHRONICLE_USER_HEADER = (
+    "=== EPISODIC CHRONICLE (already-summarized session records, newest first) ==="
+)
+_CHRONICLE_SYSTEM_ADDENDUM = """
+
+CHRONICLE ADDENDUM: an EPISODIC CHRONICLE block may follow the agency layer — \
+already-summarized records of past sessions (one compressed entry set per real \
+session boundary). The HARD RULES apply to it unchanged: a summarized transient \
+event is still transient, never durable identity. Chronicle-grounded proposals \
+use provenance_refs of the form "chronicle:<point_id>"."""
+
+
 # ── 3. derive: one neutral-model LLM call → candidate proposals ─────────────────
 _SYSTEM_PROMPT = """\
 You are an identity-consolidation analyst for an AI agent named Sylva. You read \
@@ -512,6 +666,7 @@ def _format_agency(items: List[Dict[str, Any]]) -> str:
 def _derive_candidates(
     sessions: List[Dict[str, Any]],
     agency: List[Dict[str, Any]],
+    chronicle: Optional[List[Dict[str, Any]]] = None,
     *,
     timeout: int = 180,
 ) -> Tuple[List[Dict[str, Any]], str]:
@@ -519,8 +674,14 @@ def _derive_candidates(
 
     Degrades to ([], "") if no auxiliary client is configured/reachable — a
     consolidation run with no model is a no-op, never a crash and never a write.
+
+    ``chronicle`` (PRD-051) is the OPTIONAL third input. The call contract is
+    positional-compatible with every pre-051 caller: two-arg calls (and empty
+    chronicle) produce the exact pre-change ``(system, user)`` prompt pair —
+    the block/addendum are appended conditionally, the template constants stay
+    byte-identical (adversarial NF-1/NF-2).
     """
-    if not sessions and not agency:
+    if not sessions and not agency and not chronicle:
         return [], ""
     try:
         from agent.auxiliary_client import (
@@ -555,11 +716,16 @@ def _derive_candidates(
         sessions=_format_sessions(sessions),
         agency=_format_agency(agency),
     )
+    system_msg = _SYSTEM_PROMPT
+    if chronicle:
+        # conditional append ONLY — never touch the template constants (NF-1)
+        user_msg += f"\n\n{_CHRONICLE_USER_HEADER}\n{_format_chronicle(chronicle)}"
+        system_msg = _SYSTEM_PROMPT + _CHRONICLE_SYSTEM_ADDENDUM
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.2,
@@ -687,6 +853,8 @@ def run_consolidation(
     dry_run: bool = False,
     derive_fn: Optional[Any] = None,
     surface: str = "cli",
+    include_chronicle: Optional[bool] = None,
+    chronicle_days: int = _CHRONICLE_LOOKBACK_DAYS,
 ) -> ConsolidationResult:
     """Run one consolidation pass: gather → derive → write candidates.
 
@@ -716,8 +884,27 @@ def run_consolidation(
         sessions = _gather_recent_sessions(db, limit=limit_sessions)
         agency = _gather_agency_layer()
 
+        # PRD-051: optional third input. None → config knob (strict-bool,
+        # default False); the gatherer is NEVER touched when disabled (AC-001).
+        chronicle_enabled = (
+            include_chronicle
+            if isinstance(include_chronicle, bool)
+            else _chronicle_source_enabled()
+        )
+        chronicle: List[Dict[str, Any]] = []
+        if chronicle_enabled:
+            chronicle = _gather_chronicle(
+                days=chronicle_days,
+                exclude_session_ids={str(s.get("id")) for s in sessions},
+            )
+
         derive = derive_fn or _derive_candidates
-        raw_candidates, model = derive(sessions, agency)
+        # NF-2 option (a): two-arg call — the pre-051 shape — whenever disabled
+        # OR the gather came back empty; three-arg only enabled-with-entries.
+        if chronicle_enabled and chronicle:
+            raw_candidates, model = derive(sessions, agency, chronicle)
+        else:
+            raw_candidates, model = derive(sessions, agency)
 
         points: List[Dict[str, Any]] = []
         seen_ids = set()
@@ -735,11 +922,14 @@ def run_consolidation(
             target_collection=target_collection,
             dry_run=dry_run,
             candidate_ids=[p["id"] for p in points],
+            chronicle_entries_used=len(chronicle),
         )
 
         if not points:
             result.skipped_reason = (
-                "no durable candidates derived" if (sessions or agency) else "no input"
+                "no durable candidates derived"
+                if (sessions or agency or chronicle)
+                else "no input"
             )
             return result
 
@@ -801,13 +991,20 @@ def _record_ledger(result: ConsolidationResult, *, surface: str = "cli") -> None
     try:
         from autonomy import audit
 
+        # PRD-051 FR-4: the ledger row carries the chronicle count; the
+        # knob-off rationale stays byte-identical to pre-051.
+        chron = (
+            f" + {result.chronicle_entries_used} chronicle entrie(s)"
+            if result.chronicle_entries_used
+            else ""
+        )
         audit.record(
             tier="T2",
             surface=surface,
             action=f"canon consolidation → {result.candidates_written} candidate(s)",
             rationale=(
                 f"proposed from {result.sessions_seen} session(s) + "
-                f"{result.agency_items} agency item(s) via {result.model}"
+                f"{result.agency_items} agency item(s){chron} via {result.model}"
             ),
             authority="auto-by-tier",
             outcome="ok",

@@ -564,18 +564,21 @@ def _consolidation_replay(failures: List[str]) -> Dict[str, Any]:
                 target_collection="sylva_canon",
                 store=_Store(),
                 db=_DB(),
+                include_chronicle=False,
                 derive_fn=lambda s, a: ([_proposal(stmt_a)], "mv-model"),
             )
             checks["sole_writer_guard"] = "FAIL: writing sylva_canon did not raise"
         except ValueError:
             checks["sole_writer_guard"] = "ok"
 
-        # 2. dry_run derives but never writes
+        # 2. dry_run derives but never writes (include_chronicle pinned False so
+        #    the replay never consults the live config knob — PRD-051 C-1)
         st = _Store()
         res = C.run_consolidation(
             store=st,
             db=_DB(),
             dry_run=True,
+            include_chronicle=False,
             derive_fn=lambda s, a: ([_proposal(stmt_a)], "mv-model"),
         )
         if st.upserts == [] and res.dry_run:
@@ -589,6 +592,7 @@ def _consolidation_replay(failures: List[str]) -> Dict[str, Any]:
         C.run_consolidation(
             store=st,
             db=_DB(),
+            include_chronicle=False,
             derive_fn=lambda s, a: ([_proposal(stmt_a), _proposal(stmt_b)], "mv-model"),
         )
         try:
@@ -613,6 +617,7 @@ def _consolidation_replay(failures: List[str]) -> Dict[str, Any]:
         res = C.run_consolidation(
             store=st,
             db=_DB(),
+            include_chronicle=False,
             derive_fn=lambda s, a: ([_proposal(stmt_a), _proposal(stmt_b)], "mv-model"),
         )
         written = [p["payload"]["statement"] for _, pts in st.upserts for p in pts]
@@ -620,6 +625,54 @@ def _consolidation_replay(failures: List[str]) -> Dict[str, Any]:
             checks["cross_store_dedup"] = "ok"
         else:
             checks["cross_store_dedup"] = f"FAIL: written={written!r}"
+
+        # 5. chronicle sourcing (PRD-051 fixture case, cross-noted in PRD-050):
+        #    enabled-with-entries → three-arg derive + a validating chronicle:*
+        #    ref; explicitly disabled → the pre-051 two-arg call shape.
+        if hasattr(C, "_gather_chronicle"):
+            calls: List[str] = []
+
+            def derive_c(s, a, c=None):
+                calls.append("3arg" if c else "2arg")
+                prop = _proposal(stmt_b)
+                if c:
+                    prop["source_event"]["provenance_refs"] = [c[0]["ref"]]
+                return [prop], "mv-model"
+
+            fixture = [
+                {
+                    "kind": "chronicle",
+                    "claim": "a summarized episodic record",
+                    "ref": "chronicle:mv-replay-fixture-1",
+                    "when": "2026-07-14",
+                    "source": "session:not-in-window",
+                }
+            ]
+            orig_gather = C._gather_chronicle
+            C._gather_chronicle = lambda **kw: list(fixture)
+            try:
+                st = _Store()
+                C.run_consolidation(
+                    store=st, db=_DB(), derive_fn=derive_c, include_chronicle=True
+                )
+                payloads = [p["payload"] for _, pts in st.upserts for p in pts]
+                refs_ok = payloads and all(
+                    validate_consolidation_payload(p) is None
+                    and p["source_event"]["provenance_refs"] == ["chronicle:mv-replay-fixture-1"]
+                    for p in payloads
+                )
+                st2 = _Store()
+                C.run_consolidation(
+                    store=st2, db=_DB(), derive_fn=derive_c, include_chronicle=False
+                )
+                if calls == ["3arg", "2arg"] and refs_ok:
+                    checks["chronicle_source_replay"] = "ok"
+                else:
+                    checks["chronicle_source_replay"] = (
+                        f"FAIL: calls={calls!r} refs_ok={refs_ok}"
+                    )
+            finally:
+                C._gather_chronicle = orig_gather
     finally:
         C._gather_agency_layer = orig_agency
 

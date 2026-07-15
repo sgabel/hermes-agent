@@ -143,6 +143,7 @@ def test_consolidation_replay_passes_and_hits_only_the_stub():
         "dry_run_zero_writes",
         "provenance_completeness",
         "cross_store_dedup",
+        "chronicle_source_replay",  # PRD-051 fixture case (cross-noted in PRD-050)
     }
     # the two non-dry replay runs write their ledger entries into the stub
     assert len(MV._AUDIT_CAPTURE) >= captured_before + 1
