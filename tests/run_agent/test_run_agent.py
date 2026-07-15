@@ -6804,3 +6804,73 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestDelegationSteerGuidance:
+    """PRD-017 FR-1/FR-3 — the delegation steer is MECHANICALLY gated at
+    compose time: present iff delegate_task resolved AND the run identity is
+    off the unattended floor. Both absence tests are REQUIRED (adversarial
+    NF-1: cron sessions also resolve delegate_task and render these same
+    stable parts — phrasing-only scoping would be literally true in cron and
+    push T4 child-spawn attempts into the degrade-to-ask queue)."""
+
+    def _make_agent(self, *tool_names):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs(*tool_names),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {}},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_present_for_non_floored_identity_with_delegate_task(self):
+        """Plain test process classifies unmarked_legacy — NOT on the
+        unattended floor — so the steer renders when the tool is resolved."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        agent = self._make_agent("terminal", "delegate_task")
+        prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE in prompt
+
+    def test_absent_under_floored_identity(self):
+        """Absence test (a): bind CRON — the same agent, the same resolved
+        tools, but a floored identity → the steer must NOT render."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with run_identity.run_identity_scope(run_identity.CRON):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE not in prompt
+
+    def test_absent_without_delegate_task(self):
+        """Absence test (b): no delegate_task in valid_tool_names → no steer,
+        regardless of identity."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        agent = self._make_agent("terminal", "web_search")
+        prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE not in prompt
+
+    def test_attended_gateway_identity_gets_the_steer(self):
+        """The gateway binds attended per-turn — steer present."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with run_identity.run_identity_scope(run_identity.GATEWAY_ATTENDED):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE in prompt

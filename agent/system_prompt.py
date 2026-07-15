@@ -27,6 +27,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
+    DELEGATION_STEER_GUIDANCE,
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -193,6 +194,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # PRD-017 FR-1: delegation steer — MECHANICALLY gated at compose time on
+    # (a) delegate_task actually resolved this session and (b) a run identity
+    # off the unattended floor (READ-only import of the PRD-044 primitive —
+    # cron binds CRON before agent construction, the gateway binds attended
+    # per-turn, plain CLI classifies unmarked_legacy → non-floored contexts
+    # get the steer, floored ones never do).  Fail-closed: no identity
+    # verdict → no steer (a cron/proactive/delegated child must never be
+    # nudged into spawning children — T4-unattended surface).
+    if "delegate_task" in agent.valid_tool_names:
+        try:
+            from autonomy.run_identity import classify_run
+
+            if not classify_run().unattended_floor:
+                stable_parts.append(DELEGATION_STEER_GUIDANCE)
+        except Exception:
+            pass
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

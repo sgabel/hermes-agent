@@ -363,6 +363,20 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# PRD-017 FR-1: delegation steer (capability-audit item 4 — the one genuinely
+# open behavioral item).  Injected by system_prompt.py ONLY when delegate_task
+# is resolved AND the run identity is not on the unattended floor — the gate is
+# MECHANICAL, not phrasing: cron sessions also resolve delegate_task and render
+# these same stable parts, so a "when available in this session" clause would
+# be literally true in cron and push T4 child-spawn attempts into the
+# degrade-to-ask queue (adversarial NF-1).  Keep it under 240 chars (tested).
+DELEGATION_STEER_GUIDANCE = (
+    "# Delegation\n"
+    "When a task splits into more than two independent subtasks, delegate the "
+    "independent ones via delegate_task instead of grinding through them "
+    "serially — keep synthesis and decisions in this session."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

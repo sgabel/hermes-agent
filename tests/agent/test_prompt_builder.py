@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent.prompt_builder import (
+    DELEGATION_STEER_GUIDANCE,
     _scan_context_content,
     _truncate_content,
     _parse_skill_file,
@@ -1547,3 +1548,29 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+
+
+class TestDelegationSteerGuidance:
+    """PRD-017 FR-1/FR-3 — constant-content invariants for the delegation
+    steer (injection gating is covered in tests/run_agent/test_run_agent.py).
+    Asserts what the block must DO, not its exact wording."""
+
+    def test_is_nonempty_string_with_heading(self):
+        assert isinstance(DELEGATION_STEER_GUIDANCE, str)
+        assert DELEGATION_STEER_GUIDANCE.lstrip().startswith("#")
+
+    def test_steers_delegation_of_independent_subtasks(self):
+        text = DELEGATION_STEER_GUIDANCE.lower()
+        assert "delegate" in text
+        assert "independent" in text
+        # names the actual tool so the steer is actionable, not aspirational
+        assert "delegate_task" in DELEGATION_STEER_GUIDANCE
+
+    def test_keeps_synthesis_in_the_parent_session(self):
+        # the steer must not read as "hand everything off" — decisions stay here
+        text = DELEGATION_STEER_GUIDANCE.lower()
+        assert "synthesis" in text or "decision" in text
+
+    def test_char_bound_under_240(self):
+        # PRD-017 AC-001: token-lean, shipped in the cached stable prompt
+        assert len(DELEGATION_STEER_GUIDANCE) < 240
