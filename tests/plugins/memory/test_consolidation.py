@@ -537,3 +537,279 @@ def test_real_upsert_into_throwaway_collection():
         assert got[0][1]["status"] == "candidate"
     finally:
         requests.delete(f"{_QDRANT}/collections/{name}", timeout=10)
+
+
+# ══ PRD-051 — chronicle sourcing (default-off third input) ══════════════════════
+# C-1: run_consolidation consults the live config knob when include_chronicle is
+# None — hermetic tests must never read the real ~/.hermes/config.yaml. The
+# autouse fixture pins the resolver off for EVERY test in this module (including
+# the pre-051 two-arg-fake tests above, which would otherwise 3-arg-crash if the
+# owner ever flips the live knob on this box). The resolver's own strict-bool
+# tests use the captured original.
+_ORIG_KNOB_RESOLVER = C._chronicle_source_enabled
+
+
+@pytest.fixture(autouse=True)
+def _chronicle_knob_off(monkeypatch):
+    monkeypatch.setattr(C, "_chronicle_source_enabled", lambda: False)
+
+
+def _chron_entry(ref="chronicle:pt-1", when="2026-07-14", claim="a summarized record",
+                 source="session:zzz"):
+    return {"kind": "chronicle", "claim": claim, "ref": ref, "when": when, "source": source}
+
+
+def _fixture_point(pid="pt-1", date="2026-07-14", data="a summarized record",
+                   source="session:zzz"):
+    return {"id": pid, "payload": {"data": data, "date": date, "source": source,
+                                   "speaker": "sylva", "category": "journal"}}
+
+
+# ── AC-001: default-off — zero chronicle reads, exact pre-change call shape ────
+def test_default_off_zero_chronicle_reads_and_two_arg_derive(monkeypatch):
+    gather_calls = []
+    monkeypatch.setattr(C, "_gather_chronicle",
+                        lambda **kw: gather_calls.append(kw) or [])
+    seen = {}
+
+    def two_arg_fake(sessions, agency):
+        seen["nargs"] = 2
+        return [_proposal()], "m"
+
+    res = run_consolidation(
+        store=_FakeStore(),
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=two_arg_fake,
+    )
+    assert gather_calls == []          # gatherer never touched
+    assert seen["nargs"] == 2          # pre-change call shape
+    assert res.chronicle_entries_used == 0
+    assert res.candidates_written == 1
+
+
+def test_prompt_pair_byte_identical_when_disabled(monkeypatch):
+    """AC-001 second half: the REAL _derive_candidates, called two-arg, sends
+    the exact pre-051 (system, user) pair — constants untouched, no appended
+    block. Three-arg with entries appends the labeled block + addendum."""
+    import agent.auxiliary_client as aux
+
+    captured = {}
+
+    class _Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured["messages"] = kwargs["messages"]
+
+            class _M:
+                content = "[]"
+
+            class _Ch:
+                message = _M()
+
+            class _R:
+                choices = [_Ch()]
+
+            return _R()
+
+    class _Client:
+        class chat:
+            completions = _Completions()
+
+    monkeypatch.setattr(aux, "get_text_auxiliary_client", lambda task: (_Client(), "m"))
+    monkeypatch.setattr(aux, "get_auxiliary_extra_body", lambda: None)
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: {})
+
+    sessions = [{"id": "s1", "when": "2026-07-14", "source": "tui", "transcript": "hello"}]
+    agency = [{"kind": "ledger", "claim": "did a thing", "ref": "ledger:1"}]
+
+    expected_user = C._USER_TEMPLATE.format(
+        sessions=C._format_sessions(sessions), agency=C._format_agency(agency)
+    )
+
+    # two-arg (pre-051 shape) → byte-identical pair
+    C._derive_candidates(sessions, agency)
+    assert captured["messages"][0]["content"] == C._SYSTEM_PROMPT
+    assert captured["messages"][1]["content"] == expected_user
+
+    # explicit empty chronicle behaves identically (enabled-but-empty contract)
+    C._derive_candidates(sessions, agency, [])
+    assert captured["messages"][0]["content"] == C._SYSTEM_PROMPT
+    assert captured["messages"][1]["content"] == expected_user
+
+    # three-arg with entries → appended labeled block + system addendum ONLY
+    chron = [_chron_entry()]
+    C._derive_candidates(sessions, agency, chron)
+    assert captured["messages"][0]["content"] == C._SYSTEM_PROMPT + C._CHRONICLE_SYSTEM_ADDENDUM
+    assert captured["messages"][1]["content"] == (
+        expected_user + f"\n\n{C._CHRONICLE_USER_HEADER}\n{C._format_chronicle(chron)}"
+    )
+    assert "chronicle:<point_id>" in C._CHRONICLE_SYSTEM_ADDENDUM
+
+
+# ── AC-002: enabled — third block, three-arg call, overlap exclusion, refs ─────
+def test_enabled_with_entries_three_arg_call_and_result_count(monkeypatch):
+    monkeypatch.setattr(C, "_gather_chronicle", lambda **kw: [_chron_entry()])
+    seen = {}
+
+    def spy(sessions, agency, chronicle=None):
+        seen["chronicle"] = chronicle
+        return [_proposal()], "m"
+
+    res = run_consolidation(
+        store=_FakeStore(),
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=spy,
+        include_chronicle=True,
+    )
+    assert seen["chronicle"] and seen["chronicle"][0]["ref"] == "chronicle:pt-1"
+    assert res.chronicle_entries_used == 1
+
+
+def test_enabled_but_empty_gather_keeps_two_arg_call(monkeypatch):
+    monkeypatch.setattr(C, "_gather_chronicle", lambda **kw: [])
+    seen = {}
+
+    def two_arg_fake(sessions, agency):
+        seen["nargs"] = 2
+        return [_proposal()], "m"
+
+    res = run_consolidation(
+        store=_FakeStore(),
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=two_arg_fake,
+        include_chronicle=True,
+    )
+    assert seen["nargs"] == 2
+    assert res.chronicle_entries_used == 0
+
+
+def test_gather_overlap_exclusion_drops_already_fed_sessions(monkeypatch):
+    monkeypatch.setattr(C, "_chronicle_points", lambda date_from: [
+        _fixture_point(pid="a", source="session:s1"),   # overlaps gathered session
+        _fixture_point(pid="b", source="session:other"),
+        _fixture_point(pid="c", source="migration:legacy"),
+    ])
+    out = C._gather_chronicle(exclude_session_ids={"s1"})
+    refs = [e["ref"] for e in out]
+    assert "chronicle:a" not in refs
+    assert {"chronicle:b", "chronicle:c"} <= set(refs)
+    for e in out:
+        assert e["kind"] == "chronicle"
+        assert e["ref"].startswith("chronicle:")
+
+
+def test_gather_window_limit_and_newest_first(monkeypatch):
+    pts = [
+        _fixture_point(pid="old", date="2026-01-01"),   # outside window (belt-and-braces)
+        _fixture_point(pid="mid", date="2026-07-12"),
+        _fixture_point(pid="new", date="2026-07-14"),
+        _fixture_point(pid="empty", data="   "),        # blank data dropped
+    ]
+    monkeypatch.setattr(C, "_chronicle_points", lambda date_from: pts)
+    out = C._gather_chronicle(days=7)
+    ids = [e["ref"] for e in out]
+    assert ids[0] == "chronicle:new" and ids[1] == "chronicle:mid"
+    assert "chronicle:old" not in ids and "chronicle:empty" not in ids
+
+    monkeypatch.setattr(C, "_chronicle_points", lambda date_from: [
+        _fixture_point(pid=f"p{i}", date="2026-07-14") for i in range(60)
+    ])
+    assert len(C._gather_chronicle(days=7, limit=40)) == 40
+
+
+def test_chronicle_ref_passes_consolidation_validation():
+    from plugins.memory.canon.schema import validate_consolidation_payload
+
+    prop = _proposal(refs=["chronicle:0b7e4a"])
+    pt = _candidate_point(prop, model="m", now_iso="2026-07-15T00:00:00+00:00",
+                          run_id="r1")
+    assert pt is not None
+    validate_consolidation_payload(pt["payload"])  # must not raise
+    assert pt["payload"]["source_event"]["provenance_refs"] == ["chronicle:0b7e4a"]
+
+
+# ── AC-003: gather failure degrades, never raises ───────────────────────────────
+def test_gather_failure_degrades_to_empty_run_completes(monkeypatch):
+    def boom(date_from):
+        raise ConnectionError("qdrant down")
+
+    monkeypatch.setattr(C, "_chronicle_points", boom)
+    res = run_consolidation(
+        store=_FakeStore(),
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=lambda s, a: ([_proposal()], "m"),
+        include_chronicle=True,
+    )
+    assert res.chronicle_entries_used == 0
+    assert res.candidates_written == 1  # run completed normally
+
+
+# ── AC-004: dedup parity for chronicle-grounded proposals ───────────────────────
+def test_chronicle_grounded_proposal_dedups_against_open_candidate(monkeypatch):
+    from plugins.memory.canon.schema import content_hash
+
+    stmt = "I verify before I assert."
+    seeded = ("pre", {"content_hash": content_hash(stmt), "status": "candidate"})
+    store = _FakeStore(existing={CANDIDATES_COLLECTION: [seeded]})
+    monkeypatch.setattr(C, "_gather_chronicle", lambda **kw: [_chron_entry()])
+    res = run_consolidation(
+        store=store,
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=lambda s, a, c=None: ([_proposal(statement=stmt, refs=["chronicle:pt-1"])], "m"),
+        include_chronicle=True,
+    )
+    assert res.candidates_written == 0
+    assert store.upserts == []
+    assert "already in canon or open queue" in res.skipped_reason
+
+
+# ── dry-run + knob + bounds ──────────────────────────────────────────────────────
+def test_dry_run_with_chronicle_still_writes_nothing(monkeypatch):
+    monkeypatch.setattr(C, "_gather_chronicle", lambda **kw: [_chron_entry()])
+    store = _FakeStore()
+    res = run_consolidation(
+        store=store,
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=lambda s, a, c=None: ([_proposal()], "m"),
+        include_chronicle=True,
+        dry_run=True,
+    )
+    assert store.upserts == []
+    assert res.dry_run and res.chronicle_entries_used == 1
+
+
+def test_knob_resolver_is_strict_bool(monkeypatch):
+    """C-3: only a real YAML boolean arms the source — a hand-edited quoted
+    'false'/'true' string is NOT truthy here. Uses the captured original
+    resolver (the autouse fixture pins the module attr off)."""
+    import hermes_cli.config as hc
+
+    def with_val(val):
+        cfg = {"memory": {"consolidation_chronicle_source": val}} if val is not None else {"memory": {}}
+        monkeypatch.setattr(hc, "load_config_readonly", lambda: cfg)
+        return _ORIG_KNOB_RESOLVER()
+
+    assert with_val(True) is True
+    assert with_val(False) is False
+    assert with_val("true") is False    # string, not bool → off
+    assert with_val("false") is False
+    assert with_val(1) is False         # int, not bool → off
+    assert with_val(None) is False
+
+
+def test_format_chronicle_caps_block_and_entries():
+    entries = [_chron_entry(ref=f"chronicle:p{i}", claim="x" * 1000) for i in range(100)]
+    block = C._format_chronicle(entries)
+    assert len(block) <= C._CHRONICLE_BLOCK_CHARS
+    for line in block.split("\n"):
+        # per-entry truncation applied before the total cap
+        assert len(line) <= C._CHRONICLE_PER_ENTRY_CHARS + 60  # frame chars
+    assert C._format_chronicle([]) == "(none)"
+
+
+def test_summary_mentions_chronicle_only_when_used():
+    r0 = ConsolidationResult(candidates_written=1, sessions_seen=2, agency_items=3, model="m")
+    assert "chronicle" not in r0.summary()  # knob-off string byte-identical
+    r1 = ConsolidationResult(candidates_written=1, sessions_seen=2, agency_items=3,
+                             model="m", chronicle_entries_used=4)
+    assert "4 chronicle" in r1.summary()

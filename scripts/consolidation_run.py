@@ -62,13 +62,29 @@ def main() -> int:
         action="store_true",
         help="tag the audit entry surface as 'cron' (set when run by the scheduler)",
     )
+    ap.add_argument(
+        "--include-chronicle",
+        action="store_true",
+        help="PRD-051: also source the episodic chronicle (omitted -> the "
+        "memory.consolidation_chronicle_source config knob decides, default off)",
+    )
+    ap.add_argument(
+        "--chronicle-days",
+        type=int,
+        default=7,
+        help="chronicle lookback window in days (default 7; only ~21 points are "
+        "<=7 days old today — widen for early knob-on trials)",
+    )
     args = ap.parse_args()
 
     kwargs = {
         "dry_run": args.dry_run,
         "limit_sessions": args.limit_sessions,
         "surface": "cron" if args.cron else "cli",
+        "chronicle_days": args.chronicle_days,
     }
+    if args.include_chronicle:
+        kwargs["include_chronicle"] = True
     if args.sandbox:
         kwargs["target_collection"] = args.sandbox
 
