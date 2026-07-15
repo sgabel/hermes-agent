@@ -147,12 +147,18 @@ def test_ingest_deterministic_point_ids(monkeypatch):
     p.on_session_end(_GOOD_MESSAGES)
     ids1 = [pt["id"] for pt in cap["put"][0]["body"]["points"]]
     # Re-derive independently — ids are uuid5(NS, "session:<id>:<hash>").
+    # PRD-052 FR-B1: the hash (and therefore the id) is SHA-256 for new entries.
     import hashlib
     expect = [
-        str(uuid.uuid5(mem0mod._INGEST_NS, f"session:sess-abc:{hashlib.md5(e.encode()).hexdigest()}"))
+        str(uuid.uuid5(mem0mod._INGEST_NS, f"session:sess-abc:{hashlib.sha256(e.encode()).hexdigest()}"))
         for e in ["did a real thing with the foo.py module", "decided to use bar for the new config knob"]
     ]
     assert ids1 == expect
+    # pinned contract: payload hash is the 64-hex sha256 of the entry data
+    for pt in cap["put"][0]["body"]["points"]:
+        pl = pt["payload"]
+        assert pl["hash"] == hashlib.sha256(pl["data"].encode()).hexdigest()
+        assert len(pl["hash"]) == 64
 
 
 def test_trivial_session_skipped(monkeypatch):
@@ -321,3 +327,49 @@ def test_interactive_session_end_does_ingest():
     a._memory_passive_enabled = True
     a.shutdown_memory_provider(messages=_GOOD_MESSAGES)
     a._memory_manager.on_session_end.assert_called_once()
+
+
+# --- PRD-052 WS-B: SHA-256 upgrade + dual-hash back-compat --------------------
+
+def test_legacy_md5_content_is_never_reingested(monkeypatch):
+    """FR-B2: a point stored under the legacy MD5 scheme blocks SHA-256-era
+    re-ingest of the same content (dual-hash dedup, no migration)."""
+    import hashlib
+    entries = ["did a real thing with the foo.py module",
+               "decided to use bar for the new config knob"]
+    existing = [{"payload": {"data": e, "hash": hashlib.md5(e.encode()).hexdigest()}}
+                for e in entries]
+    p, cap = _provider(monkeypatch, existing_points=existing)
+    p.on_session_end(_GOOD_MESSAGES)
+    assert cap["put"] == []
+    assert cap["audit"] == []
+
+
+def test_mixed_old_new_store_dedups_both_schemes(monkeypatch):
+    """One legacy-MD5 point + one SHA-256 point + one novel entry → only the
+    novel entry is written."""
+    import hashlib
+    e1 = "did a real thing with the foo.py module"          # legacy md5 point
+    e2 = "decided to use bar for the new config knob"        # sha256 point
+    e3 = "agreed to ship the novel third thing tomorrow"     # novel
+    existing = [
+        {"payload": {"data": e1, "hash": hashlib.md5(e1.encode()).hexdigest()}},
+        {"payload": {"data": e2, "hash": hashlib.sha256(e2.encode()).hexdigest()}},
+    ]
+    p, cap = _provider(monkeypatch, existing_points=existing,
+                       summary=f"- {e1}\n- {e2}\n- {e3}")
+    p.on_session_end(_GOOD_MESSAGES)
+    assert len(cap["put"]) == 1
+    datas = [pt["payload"]["data"] for pt in cap["put"][0]["body"]["points"]]
+    assert datas == [e3]
+
+
+def test_point_missing_hash_payload_still_blocks_reingest(monkeypatch):
+    """AC-006: legacy fallback preserved — a point with no `hash` payload is
+    deduped via digests computed from its data in the scroll pass."""
+    e = "did a real thing with the foo.py module"
+    existing = [{"payload": {"data": e}}]  # no hash field at all
+    p, cap = _provider(monkeypatch, existing_points=existing,
+                       summary=f"- {e}")
+    p.on_session_end(_GOOD_MESSAGES)
+    assert cap["put"] == []

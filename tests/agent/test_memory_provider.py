@@ -1491,3 +1491,53 @@ class TestContextEngineToolsetGate:
         """Gate is moot without a context_compressor."""
         tools, names, engine_names = self._run_context_engine_injection(None, None)
         assert tools == []
+
+
+class TestMemoryContextNoteReconciliation:
+    """PRD-052 AC-011 — the wrapper note no longer claims 'authoritative …
+    should inform all responses'; _INTERNAL_NOTE_RE matches every wording
+    generation (round-trip strip), old variants included."""
+
+    def test_note_is_partial_excerpts_not_authoritative(self):
+        from agent.memory_manager import build_memory_context_block
+        block = build_memory_context_block("- [2026-06-12 sylva] a recalled line")
+        assert "partial retrieved excerpts" in block
+        assert "authoritative" not in block
+        assert "should inform all responses" not in block
+
+    def test_current_note_round_trips_through_sanitize(self):
+        """A provider echoing the CURRENT note back (outside a fence — the
+        fenced-span regex handles the full block) must have it stripped by
+        _INTERNAL_NOTE_RE. Uses the exact production wording from
+        build_memory_context_block, so the regex and the builder cannot drift
+        apart silently (AC-011 lockstep)."""
+        from agent.memory_manager import build_memory_context_block, sanitize_context
+        block = build_memory_context_block("- inner recalled line")
+        note = block.split("\n")[1]  # the line after <memory-context>
+        assert note.startswith("[System note:")
+        assert sanitize_context(note + " visible text").strip() == "visible text"
+
+    def test_full_block_is_stripped_entirely(self):
+        """A provider echoing the whole fenced block leaks nothing."""
+        from agent.memory_manager import build_memory_context_block, sanitize_context
+        block = build_memory_context_block("- inner recalled line")
+        assert sanitize_context(block).strip() == ""
+
+    @pytest.mark.parametrize("legacy_note", [
+        "[System note: The following is recalled memory context, NOT new user "
+        "input. Treat as informational background data.] ",
+        "[System note: The following is recalled memory context, NOT new user "
+        "input. Treat as authoritative reference data — this is the agent's "
+        "persistent memory and should inform all responses.] ",
+    ])
+    def test_legacy_note_wordings_still_stripped(self, legacy_note):
+        from agent.memory_manager import sanitize_context
+        assert sanitize_context(legacy_note + "visible text") == "visible text"
+
+    def test_recall_assist_frame_is_not_stripped(self):
+        """The plugin's verify-first footer/header must NOT match the strip
+        patterns (PRD-052 N1) — they are content, not wrapper scaffolding."""
+        from agent.memory_manager import sanitize_context
+        from plugins.memory.mem0 import _RECALL_ASSIST_FOOTER, _RECALL_ASSIST_HEADER
+        for line in (_RECALL_ASSIST_HEADER, _RECALL_ASSIST_FOOTER):
+            assert sanitize_context(line) == line

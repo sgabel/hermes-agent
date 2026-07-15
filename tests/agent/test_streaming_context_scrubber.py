@@ -247,3 +247,19 @@ class TestBuildMemoryContextBlockWarnsOnViolation:
 
         assert not any("pre-wrapped" in rec.message for rec in caplog.records)
         assert "plain fact about user" in out
+
+
+class TestScrubberWithPrd052Note:
+    """PRD-052 AC-011: the scrubber is tag-driven (it discards whole
+    <memory-context> spans regardless of the note wording), so the FR-A2
+    wording amendment must not change its behavior — pinned here."""
+
+    def test_span_with_new_note_wording_split_across_deltas_is_stripped(self):
+        from agent.memory_manager import StreamingContextScrubber, build_memory_context_block
+        block = build_memory_context_block("- [2026-06-12 sylva] recalled line")
+        stream = ["before\n", block[:25], block[25:60], block[60:], "\nafter"]
+        scrubber = StreamingContextScrubber()
+        visible = "".join(scrubber.feed(d) for d in stream) + scrubber.flush()
+        assert "recalled line" not in visible
+        assert "partial retrieved excerpts" not in visible
+        assert "before" in visible and "after" in visible

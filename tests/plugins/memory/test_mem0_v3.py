@@ -3,6 +3,7 @@
 import json
 import pytest
 
+import plugins.memory.mem0 as mem0_module
 from plugins.memory.mem0 import Mem0MemoryProvider
 
 
@@ -470,8 +471,9 @@ class TestMem0PrefetchDecommission:
 
         # Chronicle was searched; the mem0 backend was not.
         assert len(chronicle.calls) == 1
-        # PRD-041 FR-1: bounded to top-2, not the legacy top-5.
-        assert chronicle.calls[0][1] == 2
+        # PRD-041 FR-1 / PRD-052 FR-A1: bounded to the provider's resolved
+        # top-k knob, whose DEFAULT stays 2 (never the legacy top-5).
+        assert chronicle.calls[0][1] == provider._recall_assist_top_k == 2
         assert not any(c[0] == "search" for c in backend.captured)
 
     def test_prefetch_noop_without_chronicle(self):
@@ -512,9 +514,10 @@ class TestRecallAssistOnTurnStart:
         if provider._prefetch_thread:
             provider._prefetch_thread.join(timeout=5.0)
 
-        # The current-turn recall question warmed the chronicle (top-2).
+        # The current-turn recall question warmed the chronicle at the
+        # resolved knob depth (default 2 — PRD-052 FR-A1).
         assert len(chronicle.calls) == 1
-        assert chronicle.calls[0][1] == 2
+        assert chronicle.calls[0][1] == provider._recall_assist_top_k == 2
         injected = provider.prefetch("do you remember when you guessed my age?")
         assert "guessed" in injected
 
@@ -559,8 +562,11 @@ class TestRecallAssistOnTurnStart:
         if provider._prefetch_thread:
             provider._prefetch_thread.join(timeout=5.0)
         injected = provider.prefetch("remember when we discussed the budget?")
-        # ~1200-char cap (+ small header/labels) — far below 8000.
-        assert len(injected) < 2000
+        # ~1200-char cap + the PRD-052 fixed frame (header + verify footer,
+        # both cap-exempt) — still far below the legacy 8000.
+        assert len(injected) < 2200
+        assert injected.startswith(mem0_module._RECALL_ASSIST_HEADER)
+        assert injected.rstrip().endswith(mem0_module._RECALL_ASSIST_FOOTER)
 
 
 class TestRecallAssistRouter:
@@ -736,3 +742,115 @@ class TestOSSBackendSafety:
             assert _FakeQdrant.deleted == ["mem0"]
         finally:
             qdrant_client.QdrantClient = orig
+
+
+class TestRecallAssistKnobs:
+    """PRD-052 FR-A1 — depth/cap knobs via the initialize() kwargs plumb.
+    Defaults UNCHANGED at 2/1200 (adversarial F3 refuted deeper defaults on
+    live evidence); overrides clamp to k∈[1,5], chars∈[400,4000]."""
+
+    def _init(self, **kwargs):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session", **kwargs)
+        return provider
+
+    def test_defaults_unchanged_without_kwargs(self):
+        p = self._init()
+        assert p._recall_assist_top_k == 2
+        assert p._recall_assist_max_chars == 1200
+
+    def test_overrides_apply(self):
+        p = self._init(recall_assist_top_k=4, recall_assist_max_chars=2000)
+        assert p._recall_assist_top_k == 4
+        assert p._recall_assist_max_chars == 2000
+
+    @pytest.mark.parametrize("raw,expect", [(0, 1), (-3, 1), (99, 5), ("4", 4)])
+    def test_top_k_clamps(self, raw, expect):
+        assert self._init(recall_assist_top_k=raw)._recall_assist_top_k == expect
+
+    @pytest.mark.parametrize("raw,expect", [(10, 400), (100000, 4000), ("800", 800)])
+    def test_max_chars_clamps(self, raw, expect):
+        assert self._init(recall_assist_max_chars=raw)._recall_assist_max_chars == expect
+
+    def test_garbage_values_fall_back_to_defaults(self):
+        p = self._init(recall_assist_top_k="lots", recall_assist_max_chars=None)
+        assert p._recall_assist_top_k == 2
+        assert p._recall_assist_max_chars == 1200
+
+    def test_knob_reaches_the_search_call(self):
+        chronicle = FakeChronicle(results=[{"date": "2026-06-12", "speaker": "sylva",
+                                            "data": "we discussed the budget governor"}])
+        p = self._init(recall_assist_top_k=3)
+        p._chronicle = chronicle
+        p._backend = FakeBackend()
+        p._had_tool_calls = False
+        p.queue_prefetch("remember when we discussed the budget?")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+        assert chronicle.calls[0][1] == 3
+
+
+class TestRecallAssistFrame:
+    """PRD-052 FR-A2 — data-not-instructions header + verify-first footer,
+    added AFTER dedup and OUTSIDE the char cap."""
+
+    def _provider(self, results):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session")
+        provider._chronicle = FakeChronicle(results=results)
+        provider._backend = FakeBackend()
+        provider._had_tool_calls = False
+        return provider
+
+    def _inject(self, provider, query):
+        provider.queue_prefetch(query)
+        if provider._prefetch_thread:
+            provider._prefetch_thread.join(timeout=5.0)
+        return provider.prefetch(query)
+
+    def test_frame_present_exactly_once_with_intact_footer(self):
+        p = self._provider([{"date": "2026-06-12", "speaker": "sylva",
+                             "data": "we tuned the ranker so eligibility wins"}])
+        injected = self._inject(p, "do you remember when we tuned the ranker?")
+        assert injected.count(mem0_module._RECALL_ASSIST_HEADER) == 1
+        assert injected.count(mem0_module._RECALL_ASSIST_FOOTER) == 1
+        assert injected.startswith(mem0_module._RECALL_ASSIST_HEADER)
+        assert injected.rstrip().endswith(mem0_module._RECALL_ASSIST_FOOTER)
+        assert "we tuned the ranker" in injected
+
+    def test_zero_hits_injects_nothing_no_orphan_frame(self):
+        p = self._provider([])
+        injected = self._inject(p, "do you remember when we tuned the ranker?")
+        assert injected == ""
+
+    def test_all_deduped_injects_nothing_no_orphan_frame(self):
+        # the sole hit is (near-)verbatim the user's question → Jaccard-dropped
+        q = "do you remember when we tuned the ranker so eligibility wins the day"
+        p = self._provider([{"date": "2026-06-12", "speaker": "sylva", "data": q}])
+        injected = self._inject(p, q)
+        assert injected == ""
+
+    def test_frame_lines_survive_sanitize_context(self):
+        """N1: the frame must not match memory_manager's strip patterns, or the
+        wrapper would silently delete it from provider output."""
+        from agent.memory_manager import sanitize_context
+
+        block = (f"{mem0_module._RECALL_ASSIST_HEADER}\n"
+                 "- [2026-06-12 sylva] a recalled line\n"
+                 f"{mem0_module._RECALL_ASSIST_FOOTER}")
+        assert sanitize_context(block) == block
+
+    def test_sidecar_display_payload_carries_no_frame_text(self):
+        """AC-003 parity: the PRD-042 structured payload is presentation-free —
+        frame text never reaches state.db."""
+        import json as _json
+
+        hit = {"date": "2026-06-12", "speaker": "sylva",
+               "data": "we tuned the ranker so eligibility wins"}
+        p = self._provider([hit])
+        self._inject(p, "do you remember when we tuned the ranker?")
+        display = p.take_recall_assist_display()
+        assert display and display["hits"] == [hit]
+        blob = _json.dumps(display)
+        assert mem0_module._RECALL_ASSIST_HEADER not in blob
+        assert mem0_module._RECALL_ASSIST_FOOTER not in blob

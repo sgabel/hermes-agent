@@ -1236,6 +1236,13 @@ def init_agent(
                         "hermes_home": str(get_hermes_home()),
                         "agent_context": "primary",
                     }
+                    # PRD-052 FR-A1: recall-assist knobs ride the provider-init
+                    # kwargs — the only path that reaches the plugin (the
+                    # enabled flag itself is an agent-side call-site gate and
+                    # never arrives here). Absent keys keep provider defaults.
+                    for _ra_key in ("recall_assist_top_k", "recall_assist_max_chars"):
+                        if mem_config.get(_ra_key) is not None:
+                            _init_kwargs[_ra_key] = mem_config.get(_ra_key)
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
                         _init_kwargs["status_callback"] = agent._emit_status
