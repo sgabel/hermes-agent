@@ -6839,21 +6839,41 @@ class TestDelegationSteerGuidance:
             return a
 
     def test_present_for_non_floored_identity_with_delegate_task(self):
-        """Plain test process classifies unmarked_legacy — NOT on the
-        unattended floor — so the steer renders when the tool is resolved."""
-        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
-        agent = self._make_agent("terminal", "delegate_task")
-        prompt = agent._build_system_prompt()
-        assert DELEGATION_STEER_GUIDANCE in prompt
-
-    def test_absent_under_floored_identity(self):
-        """Absence test (a): bind CRON — the same agent, the same resolved
-        tools, but a floored identity → the steer must NOT render."""
+        """The steer renders for a non-floored identity with the tool
+        resolved. Bound explicitly (review NIT: the ambient test-process env
+        would classify unmarked_legacy, but an exported HERMES_CRON_SESSION
+        in a runner would flip it — bind for determinism)."""
         from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
         from autonomy import run_identity
 
         agent = self._make_agent("terminal", "delegate_task")
-        with run_identity.run_identity_scope(run_identity.CRON):
+        with run_identity.run_identity_scope(run_identity.INTERACTIVE_CLI):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE in prompt
+
+    def test_absent_under_every_floored_identity(self):
+        """Absence test (a), parametrized over the WHOLE unattended floor —
+        a future edit to _UNATTENDED_FLOOR is caught here, not in prod."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        assert run_identity._UNATTENDED_FLOOR  # non-empty sanity
+        for identity in sorted(run_identity._UNATTENDED_FLOOR):
+            agent = self._make_agent("terminal", "delegate_task")
+            with run_identity.run_identity_scope(identity):
+                prompt = agent._build_system_prompt()
+            assert DELEGATION_STEER_GUIDANCE not in prompt, identity
+
+    def test_absent_when_classify_run_raises(self):
+        """Fail-closed: no identity verdict → no steer (never the reverse)."""
+        from unittest.mock import patch as _patch
+
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        import autonomy.run_identity as run_identity_mod
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with _patch.object(run_identity_mod, "classify_run",
+                           side_effect=RuntimeError("no verdict")):
             prompt = agent._build_system_prompt()
         assert DELEGATION_STEER_GUIDANCE not in prompt
 

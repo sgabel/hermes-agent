@@ -203,6 +203,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # get the steer, floored ones never do).  Fail-closed: no identity
     # verdict → no steer (a cron/proactive/delegated child must never be
     # nudged into spawning children — T4-unattended surface).
+    # CACHE CAVEAT (review 2026-07-15): the gate runs at COMPOSE time and the
+    # steer lands in the cached stable tier; the no-leak property across the
+    # attended↔floored boundary rests on floored launchers using fresh,
+    # namespaced session_ids (cron_* today). A future floored launcher
+    # (e.g. PRD-034 orchestrated_headless) must NOT resume an attended
+    # session_id — the DB-restored prompt would carry the steer past this gate.
     if "delegate_task" in agent.valid_tool_names:
         try:
             from autonomy.run_identity import classify_run
