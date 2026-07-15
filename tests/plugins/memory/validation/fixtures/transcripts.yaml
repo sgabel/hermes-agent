@@ -1,0 +1,35 @@
+# PRD-050 FR-2 — synthetic transcript corpus for the ingest-fidelity tests.
+#
+# planted_secret: a FAKE OpenAI-shaped key (matches agent/redact.py's
+# ``sk-[A-Za-z0-9_-]{10,}`` prefix pattern). It must never appear verbatim at
+# either capture point: the transcript handed to the summarizer, or the
+# persisted/embedded upsert body.
+meta:
+  planted_secret: "sk-plant3dFAKEsecretABC1234567890"
+
+sessions:
+  - id: substantive_with_secret
+    messages:
+      - {role: system, content: "you are sylva"}
+      - role: user
+        content: >-
+          Let's wire the recall harness today and settle the corpus loader
+          design. For the TEI smoke check use the api key
+          sk-plant3dFAKEsecretABC1234567890 but never store that anywhere —
+          it is strictly for the one-off probe.
+      - role: assistant
+        content: >-
+          I wired the recall harness, validated the corpus loader against the
+          gold mapping, and confirmed the filtered queries compute their
+          allowed_ids from the corpus rather than trusting the search result.
+      - {role: user, content: "Great — commit it once the hermetic tier is green and the driver exits zero."}
+
+  - id: trivial
+    messages:
+      - {role: user, content: "hi"}
+      - {role: assistant, content: "hello"}
+
+  - id: compaction_markers_only
+    messages:
+      - {role: user, content: "[CONTEXT COMPACTION — REFERENCE ONLY] old compacted stuff that must not be re-summarized"}
+      - {role: user, content: "[CONTEXT SUMMARY] a prior summary block"}
