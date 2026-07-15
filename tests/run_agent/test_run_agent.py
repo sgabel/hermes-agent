@@ -6804,3 +6804,93 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestDelegationSteerGuidance:
+    """PRD-017 FR-1/FR-3 — the delegation steer is MECHANICALLY gated at
+    compose time: present iff delegate_task resolved AND the run identity is
+    off the unattended floor. Both absence tests are REQUIRED (adversarial
+    NF-1: cron sessions also resolve delegate_task and render these same
+    stable parts — phrasing-only scoping would be literally true in cron and
+    push T4 child-spawn attempts into the degrade-to-ask queue)."""
+
+    def _make_agent(self, *tool_names):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs(*tool_names),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {}},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_present_for_non_floored_identity_with_delegate_task(self):
+        """The steer renders for a non-floored identity with the tool
+        resolved. Bound explicitly (review NIT: the ambient test-process env
+        would classify unmarked_legacy, but an exported HERMES_CRON_SESSION
+        in a runner would flip it — bind for determinism)."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with run_identity.run_identity_scope(run_identity.INTERACTIVE_CLI):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE in prompt
+
+    def test_absent_under_every_floored_identity(self):
+        """Absence test (a), parametrized over the WHOLE unattended floor —
+        a future edit to _UNATTENDED_FLOOR is caught here, not in prod."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        assert run_identity._UNATTENDED_FLOOR  # non-empty sanity
+        for identity in sorted(run_identity._UNATTENDED_FLOOR):
+            agent = self._make_agent("terminal", "delegate_task")
+            with run_identity.run_identity_scope(identity):
+                prompt = agent._build_system_prompt()
+            assert DELEGATION_STEER_GUIDANCE not in prompt, identity
+
+    def test_absent_when_classify_run_raises(self):
+        """Fail-closed: no identity verdict → no steer (never the reverse)."""
+        from unittest.mock import patch as _patch
+
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        import autonomy.run_identity as run_identity_mod
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with _patch.object(run_identity_mod, "classify_run",
+                           side_effect=RuntimeError("no verdict")):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE not in prompt
+
+    def test_absent_without_delegate_task(self):
+        """Absence test (b): no delegate_task in valid_tool_names → no steer,
+        regardless of identity."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        agent = self._make_agent("terminal", "web_search")
+        prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE not in prompt
+
+    def test_attended_gateway_identity_gets_the_steer(self):
+        """The gateway binds attended per-turn — steer present."""
+        from agent.prompt_builder import DELEGATION_STEER_GUIDANCE
+        from autonomy import run_identity
+
+        agent = self._make_agent("terminal", "delegate_task")
+        with run_identity.run_identity_scope(run_identity.GATEWAY_ATTENDED):
+            prompt = agent._build_system_prompt()
+        assert DELEGATION_STEER_GUIDANCE in prompt
