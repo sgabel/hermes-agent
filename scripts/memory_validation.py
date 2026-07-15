@@ -564,6 +564,7 @@ def _consolidation_replay(failures: List[str]) -> Dict[str, Any]:
                 target_collection="sylva_canon",
                 store=_Store(),
                 db=_DB(),
+                include_chronicle=False,
                 derive_fn=lambda s, a: ([_proposal(stmt_a)], "mv-model"),
             )
             checks["sole_writer_guard"] = "FAIL: writing sylva_canon did not raise"

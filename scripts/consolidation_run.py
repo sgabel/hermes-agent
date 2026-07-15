@@ -39,7 +39,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from plugins.memory.canon.consolidation import run_consolidation  # noqa: E402
+from plugins.memory.canon.consolidation import (  # noqa: E402
+    _CHRONICLE_LOOKBACK_DAYS,
+    run_consolidation,
+)
 
 
 def main() -> int:
@@ -71,9 +74,9 @@ def main() -> int:
     ap.add_argument(
         "--chronicle-days",
         type=int,
-        default=7,
-        help="chronicle lookback window in days (default 7; only ~21 points are "
-        "<=7 days old today — widen for early knob-on trials)",
+        default=_CHRONICLE_LOOKBACK_DAYS,
+        help=f"chronicle lookback window in days (default {_CHRONICLE_LOOKBACK_DAYS}; "
+        "only ~21 points are that recent today — widen for early knob-on trials)",
     )
     args = ap.parse_args()
 

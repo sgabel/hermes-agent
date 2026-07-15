@@ -813,3 +813,38 @@ def test_summary_mentions_chronicle_only_when_used():
     r1 = ConsolidationResult(candidates_written=1, sessions_seen=2, agency_items=3,
                              model="m", chronicle_entries_used=4)
     assert "4 chronicle" in r1.summary()
+
+
+# ── review-nit hardening (PRD-051 code review 2026-07-15) ───────────────────────
+def test_exclusion_wiring_end_to_end_from_gathered_sessions(monkeypatch):
+    """NF-3 end-to-end: stub only _chronicle_points and drive run_consolidation —
+    the exclude set must be built from the ACTUALLY gathered session ids, so a
+    chronicle summary of a fed session never reaches the deriver."""
+    monkeypatch.setattr(C, "_chronicle_points", lambda date_from: [
+        _fixture_point(pid="dup", source="session:s1"),     # summary OF fed session s1
+        _fixture_point(pid="keep", source="session:other"),
+    ])
+    seen = {}
+
+    def spy(sessions, agency, chronicle=None):
+        seen["refs"] = [e["ref"] for e in (chronicle or [])]
+        return [_proposal()], "m"
+
+    run_consolidation(
+        store=_FakeStore(),
+        db=_FakeDB([{"id": "s1", "last_active": "x"}], {"s1": [{"role": "user", "content": "hi"}]}),
+        derive_fn=spy,
+        include_chronicle=True,
+    )
+    assert seen["refs"] == ["chronicle:keep"]
+
+
+def test_gather_scrubs_secrets_from_chronicle_claims(monkeypatch):
+    """Defense-in-depth double-scrub: chronicle data passes _scrub_secrets
+    before reaching the deriver (PRD-037 already redacts at write time)."""
+    calls = []
+    orig = C._scrub_secrets
+    monkeypatch.setattr(C, "_scrub_secrets", lambda t: calls.append(t) or orig(t))
+    monkeypatch.setattr(C, "_chronicle_points", lambda date_from: [_fixture_point()])
+    out = C._gather_chronicle()
+    assert out and "a summarized record" in calls
