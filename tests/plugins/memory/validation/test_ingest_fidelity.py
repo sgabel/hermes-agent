@@ -170,7 +170,8 @@ def test_entries_bounded_and_attributed(monkeypatch):
         assert pl["category"] == "journal"
         assert pl["user_id"] == "sylva"
         assert pl["date"]
-        assert pl["hash"] == hashlib.md5(pl["data"].encode()).hexdigest()
+        # PRD-052 FR-B1: new-entry content hash is SHA-256 (64-hex)
+        assert pl["hash"] == hashlib.sha256(pl["data"].encode()).hexdigest()
 
 
 # ── deterministic ids + idempotent re-ingest ─────────────────────────────────
@@ -182,7 +183,7 @@ def test_deterministic_uuid5_ids(monkeypatch):
         str(
             uuid.uuid5(
                 mem0mod._INGEST_NS,
-                f"session:mv-sess-1:{hashlib.md5(e.encode()).hexdigest()}",
+                f"session:mv-sess-1:{hashlib.sha256(e.encode()).hexdigest()}",
             )
         )
         for e in [
