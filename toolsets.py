@@ -66,6 +66,11 @@ _HERMES_CORE_TOOLS = [
     # authoritative; the attended + unmarked_legacy path additionally runs the
     # local approval+tirith gate. Surface label is run-identity-sourced (PRD-044).
     "ask_claude",
+    # FedPulse read-only DB query, routed through the host RO relay (PRD-048).
+    # Advertised only when the relay socket+token are mounted (check_fn); the
+    # relay's checks (AST validation / schema+customer denylist / read-only txn /
+    # DLP / budget) are authoritative. T1 read (capability_policy._T1_TOOLS).
+    "fedpulse_query",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

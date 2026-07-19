@@ -68,7 +68,7 @@ _T0_TOOLS = frozenset({
 # T1 — read-external (egress to a sanctioned destination). These are exfil
 # surfaces (I6) — allowed within budget + redaction, audited.
 _T1_TOOLS = frozenset({
-    "web_search", "web_extract", "x_search", "ask_claude",
+    "web_search", "web_extract", "x_search", "ask_claude", "fedpulse_query",
     "browser_navigate", "browser_snapshot", "browser_click", "browser_type",
     "browser_select", "browser_scroll", "browser_extract", "browser_screenshot",
     "browser_dialog", "browser_back", "browser_forward", "browser_wait",
