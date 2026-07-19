@@ -225,3 +225,34 @@ def test_parallel_debits_do_not_lose_updates(monkeypatch):
     for t in threads:
         t.join()
     assert budget.get_usage()["totals"]["actions"] == 8 * 50
+
+
+# ---------------------------------------------------------------------------
+# PRD-048 FR-3 — fedpulse_ro_queries kind registered in all three maps
+# (PRD-043 registration contract; mirrors the AC-005a proactive suite).
+# ---------------------------------------------------------------------------
+
+def test_prd048_fedpulse_ro_queries_registered_in_all_three_maps():
+    assert "fedpulse_ro_queries" in budget.KINDS
+    assert budget._KIND_TO_CAP.get("fedpulse_ro_queries") == "max_fedpulse_ro_queries"
+    assert budget._DEFAULT_CAPS["max_fedpulse_ro_queries"] == 200
+
+
+def test_prd048_fedpulse_ro_queries_check_and_debit_no_kind_error(monkeypatch):
+    _set_caps(monkeypatch, max_fedpulse_ro_queries=2)
+    assert budget.check("fedpulse_ro_queries", 1) is True
+    r = budget.debit("fedpulse_ro:relay", "fedpulse_ro_queries", 1)
+    assert r["allowed"] is True
+    usage = budget.get_usage()
+    assert usage["totals"]["fedpulse_ro_queries"] == 1
+    assert usage["by_surface"]["fedpulse_ro:relay"]["fedpulse_ro_queries"] == 1
+    assert usage["remaining"]["fedpulse_ro_queries"] == 1
+
+
+def test_prd048_fedpulse_ro_queries_cap_breach_degrades(monkeypatch):
+    _set_caps(monkeypatch, max_fedpulse_ro_queries=2)
+    assert budget.debit("fedpulse_ro:relay", "fedpulse_ro_queries")["degrade"] is False
+    assert budget.debit("fedpulse_ro:relay", "fedpulse_ro_queries")["degrade"] is False
+    r = budget.debit("fedpulse_ro:relay", "fedpulse_ro_queries")
+    assert r["degrade"] is True
+    assert r["allowed"] is False

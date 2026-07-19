@@ -33,7 +33,8 @@ from autonomy import autonomy_dir
 
 logger = logging.getLogger(__name__)
 
-KINDS = ("actions", "second_opinion_calls", "tokens", "proactive_messages")
+KINDS = ("actions", "second_opinion_calls", "tokens", "proactive_messages",
+         "fedpulse_ro_queries")
 
 
 class BudgetKindError(Exception):
@@ -49,6 +50,9 @@ _DEFAULT_CAPS = {
     "max_autonomous_tokens": 2_000_000,
     # PRD-027 FR-4: daily cap on proactive idle-time outreach messages.
     "max_proactive_messages": 2,
+    # PRD-048 FR-3: daily cap on FedPulse read-only relay queries (placeholder
+    # per the PRD — calibrate after the first audit run).
+    "max_fedpulse_ro_queries": 200,
 }
 _KIND_TO_CAP = {
     "actions": "max_autonomous_actions",
@@ -58,6 +62,8 @@ _KIND_TO_CAP = {
     # in the same change (PRD-043 registration contract) or the surface fails
     # closed / raises BudgetKindError.
     "proactive_messages": "max_proactive_messages",
+    # PRD-048 FR-3 (same all-three-maps contract).
+    "fedpulse_ro_queries": "max_fedpulse_ro_queries",
 }
 
 

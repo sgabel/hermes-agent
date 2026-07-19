@@ -1,0 +1,68 @@
+# Hermes FedPulse read-only query relay (PRD-048 FR-3) — host systemd USER service.
+#
+# Gives the containerized Sylva agent bounded READ access to the live FedPulse
+# Postgres over a unix socket on the gateway-only /opt/relay bind mount. The
+# sylva_ro DB password stays host-side (in ~/.hermes-relay-private, NOT on the
+# mount) and never enters any container. Sibling of hermes-advisory-relay.service.
+#
+# Install (owner go-live — NOT auto-installed; run AFTER the sylva_ro role SQL):
+#   # 1. host-only dir for the DB password (NOT bind-mounted into any container)
+#   mkdir -p ~/.hermes-relay-private && chmod 700 ~/.hermes-relay-private
+#   printf '%s' '<sylva_ro-password-from-role-provision>' > ~/.hermes-relay-private/fedpulse-db.pass
+#   chmod 600 ~/.hermes-relay-private/fedpulse-db.pass
+#   # 2. dedicated bearer on the existing relay mount (separately revocable from advisory)
+#   umask 077; head -c 32 /dev/urandom | base64 > ~/.hermes-relay/fedpulse.token
+#   chmod 600 ~/.hermes-relay/fedpulse.token
+#   # 3. install + start
+#   cp relay/hermes-fedpulse-ro-relay.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hermes-fedpulse-ro-relay.service
+#   loginctl enable-linger "$USER"    # survive logout
+#
+# The socket + bearer live under ~/.hermes-relay (0700, bind-mounted ro into the
+# `hermes` gateway container ONLY). The DB password lives under
+# ~/.hermes-relay-private (host-only, never mounted). pglast must be present in
+# the relay venv (see the Deploy Runbook in the PRD).
+
+[Unit]
+Description=Hermes FedPulse RO Query Relay (AST-validated read-only SQL over UDS — PRD-048)
+After=default.target docker.service
+# The startup self-canary runs a live SELECT 1 + a write drill against the DB
+# container; without a bounded restart, a DB-down state under Restart=on-failure
+# would loop the canary forever. Give up after 5 failures in 5 min.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hermes/hermes-agent
+ExecStart=%h/hermes/hermes-agent/venv/bin/python -m relay.fedpulse_ro_relay
+Restart=on-failure
+RestartSec=30
+
+# Relay-process resource caps.
+MemoryMax=1G
+TasksMax=64
+
+# Hardening: the relay needs to read its own secret files, exec `docker`, and
+# bind its socket under ~/.hermes-relay. It must NOT be able to write outside
+# its own dirs.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Writable: the socket dir (bind) + audit ledger under ~/.hermes/autonomy.
+ReadWritePaths=%h/.hermes-relay %h/.hermes
+# The DB password dir is read-only to the relay (it only reads it).
+ReadOnlyPaths=%h/.hermes-relay-private
+
+# Environment: point the relay at the DB container. The sylva_ro password is
+# read from the file above (NEVER set here as an env var).
+Environment=FEDPULSE_DB_CONTAINER=supabase_db_fedpulse
+Environment=FEDPULSE_DB_NAME=postgres
+Environment=FEDPULSE_DB_USER=sylva_ro
+Environment=FEDPULSE_DB_HOST=127.0.0.1
+Environment=FEDPULSE_DB_PORT=5432
+
+[Install]
+WantedBy=default.target
