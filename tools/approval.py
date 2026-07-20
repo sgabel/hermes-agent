@@ -246,6 +246,19 @@ _HERMES_SECRET_REF = (
     r'autonomy(?:/|\b)|\.migration(?:/|\b)|'
     r'\.(?:ssh|gnupg|aws)(?:/|\b))'
 )
+# PRD-047 increment-2 terminal-side parity: SOUL.md (identity bedrock, read raw
+# into every self-brief) and cron/jobs.json (scheduler job definitions — a write
+# can arm or alter autonomous jobs) are tamper TARGETS the file-tool write guard
+# already hard-denies (file_tools._check_sensitive_path / agent.file_safety
+# build_write_denied_*). Without terminal pairing, `echo x > ~/.hermes/SOUL.md`
+# slips through in local exec mode — the same unpaired-door rationale as
+# _HERMES_CONFIG_PATH above. Deliberately WRITE-target-only, NOT folded into
+# _HERMES_SECRET_REF: these are tamper targets, not secrets — a secret-ref match
+# fires on source-side READS too, which would degrade-to-ask legitimate shell
+# reads (cat SOUL.md, inspecting jobs.json). Built on _HERMES_HOME_PREFIX so the
+# /opt/data/, ~/.hermes/, $HOME/.hermes/, and $HERMES_HOME/ forms all match.
+_HERMES_SOUL_PATH = rf'{_HERMES_HOME_PREFIX}soul\.md\b'
+_HERMES_CRON_JOBS_PATH = rf'{_HERMES_HOME_PREFIX}cron/jobs\.json\b'
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = (
@@ -272,6 +285,8 @@ _SENSITIVE_WRITE_TARGET = (
     rf'{_SSH_SENSITIVE_PATH}|'
     rf'{_HERMES_ENV_PATH}|'
     rf'{_HERMES_CONFIG_PATH}|'
+    rf'{_HERMES_SOUL_PATH}|'
+    rf'{_HERMES_CRON_JOBS_PATH}|'
     rf'{_SHELL_RC_FILES}|'
     rf'{_CREDENTIAL_FILES})'
 )
@@ -536,12 +551,13 @@ DANGEROUS_PATTERNS = [
     (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
     (rf'\bsed\s+-[^\s]*i.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config"),
     (rf'\bsed\s+--in-place\b.*\s{_SYSTEM_CONFIG_PATH}', "in-place edit of system config (long flag)"),
-    # In-place edit of a Hermes-managed security file (~/.hermes/config.yaml or
-    # .env). sed -i bypasses the redirection/tee patterns above because it
-    # mutates the file directly. Pairs the file_tools write_file/patch deny so
-    # the terminal side is not an open door. See #14639.
-    (rf'\bsed\s+-[^\s]*i.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env"),
-    (rf'\bsed\s+--in-place\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (long flag)"),
+    # In-place edit of a Hermes-managed security file (~/.hermes/config.yaml,
+    # .env, SOUL.md, or cron/jobs.json). sed -i bypasses the redirection/tee
+    # patterns above because it mutates the file directly. Pairs the file_tools
+    # write_file/patch deny so the terminal side is not an open door. See
+    # #14639; SOUL.md + cron/jobs.json added for PRD-047 increment-2 parity.
+    (rf'\bsed\s+-[^\s]*i.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH}|{_HERMES_SOUL_PATH}|{_HERMES_CRON_JOBS_PATH})', "in-place edit of Hermes config/env"),
+    (rf'\bsed\s+--in-place\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH}|{_HERMES_SOUL_PATH}|{_HERMES_CRON_JOBS_PATH})', "in-place edit of Hermes config/env (long flag)"),
     # perl -i and ruby -i perform the same in-place mutation as sed -i but are
     # not caught by the -e/-c script-execution pattern above (which targets code
     # evaluation, not file mutation). Pairs the sed -i coverage from #14639.
@@ -550,7 +566,7 @@ DANGEROUS_PATTERNS = [
     # backup suffix (`perl -i.bak`). Match any flag token containing `i`
     # anywhere in the args, not just the first token — `perl -e '...'` (code
     # eval, no -i) does not trip because it has no `-...i` flag token.
-    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
+    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH}|{_HERMES_SOUL_PATH}|{_HERMES_CRON_JOBS_PATH})', "in-place edit of Hermes config/env (perl/ruby)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),

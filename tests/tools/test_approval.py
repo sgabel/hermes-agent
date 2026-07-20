@@ -542,6 +542,133 @@ class TestHermesConfigWriteProtection:
         assert dangerous is False
 
 
+class TestHermesGovernanceWriteProtection:
+    """PRD-047 increment-2 terminal-side parity: SOUL.md (identity bedrock)
+    and cron/jobs.json (scheduler job definitions) are hard-denied on the
+    file-tool surface (file_tools._check_sensitive_path / agent.file_safety
+    build_write_denied_*), so the terminal must gate the same write idioms —
+    otherwise `echo x > ~/.hermes/SOUL.md` slips through in local exec mode.
+    Write-target-only by design: reads stay ungated (tamper targets, not
+    secrets — deliberately NOT in _HERMES_SECRET_REF)."""
+
+    # --- SOUL.md ---
+
+    def test_tee_soul(self):
+        dangerous, key, desc = detect_dangerous_command("echo x | tee ~/.hermes/SOUL.md")
+        assert dangerous is True
+        assert key is not None
+
+    def test_redirect_overwrite_soul(self):
+        dangerous, key, desc = detect_dangerous_command("echo x > ~/.hermes/SOUL.md")
+        assert dangerous is True
+        assert key is not None
+
+    def test_append_soul(self):
+        dangerous, key, desc = detect_dangerous_command("echo 'directive' >> ~/.hermes/SOUL.md")
+        assert dangerous is True
+
+    def test_sed_in_place_soul(self):
+        dangerous, key, desc = detect_dangerous_command("sed -i 's/old/new/' ~/.hermes/SOUL.md")
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+    def test_cp_over_soul(self):
+        dangerous, key, desc = detect_dangerous_command("cp /tmp/evil.md ~/.hermes/SOUL.md")
+        assert dangerous is True
+
+    def test_perl_in_place_soul(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -i -pe 's/x/y/' ~/.hermes/SOUL.md"
+        )
+        assert dangerous is True
+
+    def test_tee_custom_hermes_home_soul(self):
+        dangerous, key, desc = detect_dangerous_command("echo x | tee $HERMES_HOME/SOUL.md")
+        assert dangerous is True
+
+    def test_redirect_opt_data_soul(self):
+        # Container-absolute form (/opt/data = bind-mounted ~/.hermes).
+        dangerous, key, desc = detect_dangerous_command("echo x > /opt/data/SOUL.md")
+        assert dangerous is True
+
+    def test_redirect_absolute_hermes_home_soul(self):
+        soul_path = get_hermes_home() / "SOUL.md"
+        dangerous, key, desc = detect_dangerous_command(f"echo x > {soul_path}")
+        assert dangerous is True
+
+    # --- cron/jobs.json ---
+
+    def test_tee_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command("echo '{}' | tee ~/.hermes/cron/jobs.json")
+        assert dangerous is True
+        assert key is not None
+
+    def test_redirect_overwrite_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command("echo '{}' > ~/.hermes/cron/jobs.json")
+        assert dangerous is True
+
+    def test_sed_in_place_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "sed -i 's/\"enabled\": false/\"enabled\": true/' ~/.hermes/cron/jobs.json"
+        )
+        assert dangerous is True
+        assert "in-place" in desc.lower()
+
+    def test_sed_in_place_long_flag_opt_data_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "sed --in-place 's/false/true/' /opt/data/cron/jobs.json"
+        )
+        assert dangerous is True
+
+    def test_cp_over_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "cp /tmp/evil.json ~/.hermes/cron/jobs.json"
+        )
+        assert dangerous is True
+
+    def test_ruby_in_place_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "ruby -i -pe 'gsub(/false/, \"true\")' ~/.hermes/cron/jobs.json"
+        )
+        assert dangerous is True
+
+    def test_tee_custom_hermes_home_cron_jobs(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "echo x | tee $HERMES_HOME/cron/jobs.json"
+        )
+        assert dangerous is True
+
+    # --- write-target-only design: reads stay ungated ---
+
+    def test_read_soul_safe(self):
+        # SOUL.md is a tamper target, not a secret — deliberately NOT in
+        # _HERMES_SECRET_REF, so the self-brief's raw read (and any shell cat)
+        # stays ungated. Only writes are gated.
+        dangerous, key, desc = detect_dangerous_command("cat ~/.hermes/SOUL.md")
+        assert dangerous is False
+
+    def test_read_cron_jobs_safe(self):
+        dangerous, key, desc = detect_dangerous_command("cat ~/.hermes/cron/jobs.json")
+        assert dangerous is False
+
+    def test_copy_out_of_soul_safe(self):
+        # Reading OUT of SOUL.md (source side) must not trip the dest-anchored
+        # cp pattern — same rationale as the ~/.ssh copy-out carve.
+        dangerous, key, desc = detect_dangerous_command(
+            "cp ~/.hermes/SOUL.md /tmp/soul-backup.md"
+        )
+        assert dangerous is False
+
+    def test_non_hermes_soul_md_safe(self):
+        # A soul.md outside the Hermes home is not a governance file.
+        dangerous, key, desc = detect_dangerous_command("echo x > /tmp/soul.md")
+        assert dangerous is False
+
+    def test_non_hermes_jobs_json_safe(self):
+        dangerous, key, desc = detect_dangerous_command("echo '{}' > ./cron/jobs.json")
+        assert dangerous is False
+
+
 class TestFindExecFullPathRm:
     """Detect find -exec with full-path rm bypasses."""
 
