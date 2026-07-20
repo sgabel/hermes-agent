@@ -101,7 +101,14 @@ services:
     restart: unless-stopped
     profiles: ["exec-plane"]
     entrypoint: ["/opt/hermes/docker/exec-plane/run.sh"]
-    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    # Starts as ROOT (no `user:` override) so run.sh can remap the `hermes`
+    # account to the host UID/GID (matching the shared workspace ownership) and
+    # sshd can privilege-separate. The login session drops to `hermes`
+    # (PermitRootLogin no). Isolation = mounts + network + PID namespace, not
+    # the process uid — the jail mounts no secrets/governance and has no egress.
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
     networks:
       - hermes-exec-bridge
     volumes:
