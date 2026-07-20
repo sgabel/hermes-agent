@@ -16,6 +16,7 @@ Covers:
 """
 
 import uuid
+from datetime import date, timedelta
 from typing import Any, Dict, List
 
 import pytest
@@ -559,10 +560,23 @@ def _chron_entry(ref="chronicle:pt-1", when="2026-07-14", claim="a summarized re
     return {"kind": "chronicle", "claim": claim, "ref": ref, "when": when, "source": source}
 
 
-def _fixture_point(pid="pt-1", date="2026-07-14", data="a summarized record",
+def _fixture_point(pid="pt-1", date=None, data="a summarized record",
                    source="session:zzz"):
+    # Default date is ALWAYS inside the gather window (calendar-rot guard: a
+    # hardcoded "2026-07-14" here silently aged out of the 7-day window and
+    # broke the window test on 2026-07-20 — keep fixture dates relative).
+    if date is None:
+        date = _today().isoformat()
     return {"id": pid, "payload": {"data": data, "date": date, "source": source,
                                    "speaker": "sylva", "category": "journal"}}
+
+
+def _today():
+    return date.today()
+
+
+def _days_ago(n: int) -> str:
+    return (date.today() - timedelta(days=n)).isoformat()
 
 
 # ── AC-001: default-off — zero chronicle reads, exact pre-change call shape ────
@@ -700,10 +714,10 @@ def test_gather_overlap_exclusion_drops_already_fed_sessions(monkeypatch):
 
 def test_gather_window_limit_and_newest_first(monkeypatch):
     pts = [
-        _fixture_point(pid="old", date="2026-01-01"),   # outside window (belt-and-braces)
-        _fixture_point(pid="mid", date="2026-07-12"),
-        _fixture_point(pid="new", date="2026-07-14"),
-        _fixture_point(pid="empty", data="   "),        # blank data dropped
+        _fixture_point(pid="old", date="2026-01-01"),    # outside window (belt-and-braces)
+        _fixture_point(pid="mid", date=_days_ago(6)),    # inside the 7-day window
+        _fixture_point(pid="new", date=_days_ago(1)),    # inside, newer than mid
+        _fixture_point(pid="empty", data="   "),         # blank data dropped
     ]
     monkeypatch.setattr(C, "_chronicle_points", lambda date_from: pts)
     out = C._gather_chronicle(days=7)
@@ -712,7 +726,7 @@ def test_gather_window_limit_and_newest_first(monkeypatch):
     assert "chronicle:old" not in ids and "chronicle:empty" not in ids
 
     monkeypatch.setattr(C, "_chronicle_points", lambda date_from: [
-        _fixture_point(pid=f"p{i}", date="2026-07-14") for i in range(60)
+        _fixture_point(pid=f"p{i}", date=_days_ago(1)) for i in range(60)
     ])
     assert len(C._gather_chronicle(days=7, limit=40)) == 40
 
