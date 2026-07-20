@@ -22,8 +22,13 @@ services:
     restart: unless-stopped
     networks:
       - hermes-agent-deps          # internal-only; reaches deps by service DNS, no route out
+      - hermes-exec-bridge         # PRD-047 FR-4: p2p path to the exec plane (jail); two members ONLY
     volumes:
       - ~/.hermes:/opt/data        # the ONLY host mount (RW)
+      # PRD-047 FR-5: SSH client key INTO the jail (a credential into the exec
+      # plane, not out of it). RO + outside /opt/data = boot-chown-safe
+      # (/opt/relay precedent). Provisioned by scripts/prd047-provision-execbridge.sh.
+      - ~/.hermes-execbridge/client:/opt/execbridge/client:ro
       # PRD-032 enforce-hardening (2026-06-27): layer the security-critical files
       # READ-ONLY over the RW mount so a contained-T2 shell structurally CANNOT
       # write them — closes the "truncate config.yaml turns enforce off" STOP and
@@ -68,6 +73,46 @@ services:
     mem_limit: 48g
     pids_limit: 8192
     oom_score_adj: 500             # agent is sacrificed before the LLM servers (-900)
+
+  # PRD-047 increment 1 — the exec-plane jail (SHIPS DARK: the "exec-plane"
+  # profile means a plain `up -d` NEVER starts this; arming is explicit).
+  #
+  # Trust boundary (PRD-047 FR-1/2/4, jail-design pass folded 2026-07-20):
+  #   - mounts ONLY the two workspace dirs (rw) + skills (ro) + relays (ro,
+  #     PRD-048 carve) + the sshd server material (ro). NO /opt/data root:
+  #     no .env / auth.json / config.yaml / autonomy/ / jobs.json / state.db.
+  #   - entrypoint bypasses /init + stage2 (STOP-3: stock boot would self-seed
+  #     .env/config.yaml/SOUL.md into the namespace) — run.sh starts sshd only.
+  #   - network: hermes-exec-bridge ONLY — no deps net (Qdrant/LLM/TEI/dashboard
+  #     unreachable), no egress net (no Discord proxy, no internet).
+  #   - same image as the gateway; UID pinned to the host user for workspace
+  #     interop; isolation = namespaces + mounts + custody, not the UID number.
+  #
+  # ARMING (owner runbook — after image rebuild + provisioning):
+  #   scripts/prd047-provision-execbridge.sh
+  #   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose -p hermes-agent \
+  #     -f docker-compose.migration.yml --profile exec-plane up -d exec-plane
+  #   then set HERMES_EXEC_BACKEND=jail-ssh on the gateway service + recreate,
+  #   and run scripts/prd047-exec-plane-drills.sh (AC-007..010).
+  exec-plane:
+    image: hermes-agent:migration
+    container_name: hermes-exec
+    hostname: hermes-exec
+    restart: unless-stopped
+    profiles: ["exec-plane"]
+    entrypoint: ["/opt/hermes/docker/exec-plane/run.sh"]
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    networks:
+      - hermes-exec-bridge
+    volumes:
+      - ~/.hermes/work:/opt/data/work
+      - ~/.hermes/workspace:/opt/data/workspace
+      - ~/.hermes/skills:/opt/data/skills:ro
+      - ~/.hermes-relay:/opt/relay:ro
+      - ~/.hermes-execbridge/server:/opt/execbridge/server:ro
+    mem_limit: 8g
+    pids_limit: 2048
+    oom_score_adj: 500
 
   dashboard:
     image: hermes-agent:migration
@@ -158,3 +203,12 @@ networks:
   # Normal egress bridge: ONLY the Discord proxy touches this (its second foot).
   hermes-egress:
     external: true
+  # PRD-047 FR-4 — p2p jail bridge: gateway <-> hermes-exec ONLY. Compose-managed
+  # (NOT external) on purpose: no other stack ever joins it, and it needs no
+  # cutover.sh pre-creation since both members live in this file. internal:true =
+  # no route off the box. Residual (ruled ACCEPT-401): the gateway's :8642 binds
+  # 0.0.0.0 so it is TCP-reachable from the jail over this bridge — mutating/
+  # control/SSE routes are auth-gated and the jail cannot read API_SERVER_KEY;
+  # unauth /health(+/detailed) liveness leak accepted, bound at increment 2.
+  hermes-exec-bridge:
+    internal: true

@@ -1086,6 +1086,50 @@ def _safe_getcwd() -> str:
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
+# PRD-047 FR-5 — dedicated exec-plane selector. Consumed ONLY by the terminal +
+# execute_code execution paths, NEVER by _get_env_config() itself (which
+# file_tools also reads — jail-design pass STOP-4: routing file tools to the
+# jail is out of scope for increment 1). When HERMES_EXEC_BACKEND=jail-ssh, the
+# agent's shell/code exec routes to the isolated hermes-exec plane while file
+# tools stay on the local (gateway) backend. Unset/empty = legacy local exec.
+_EXEC_BACKEND_JAIL_SSH = "jail-ssh"
+
+
+def _exec_backend_is_jail() -> bool:
+    return os.getenv("HERMES_EXEC_BACKEND", "").strip().lower() == _EXEC_BACKEND_JAIL_SSH
+
+
+def _resolve_exec_env_type(base_env_type: str) -> str:
+    """Return the effective env_type for terminal/execute_code dispatch.
+
+    Overrides the base terminal env_type with the exec-plane backend when the
+    HERMES_EXEC_BACKEND flag selects it. Deliberately separate from
+    _get_env_config so file-tool env resolution is unaffected (FR-5/FR-7).
+    """
+    if _exec_backend_is_jail():
+        return _EXEC_BACKEND_JAIL_SSH
+    return base_env_type
+
+
+# PRD-047 STOP-1 (jail-design code review): _active_environments is a SINGLE
+# cache shared by terminal, execute_code, AND file_tools, and _resolve_container_
+# task_id collapses the main agent + all delegate children to "default". Without
+# a distinct key, the first tool to populate "default" wins: a local env cached
+# by a file-tool read would be handed to a jail-routed execute_code MISLABELED
+# jail-ssh (fail-OPEN isolation bypass), or a jail env would be reused by file
+# tools (breaks trusted gateway-side file ops). Namespacing the exec-plane key
+# keeps the two planes' cache slots disjoint: terminal + execute_code share the
+# jail slot; file tools (which never call this) keep the base "local" slot.
+_EXEC_JAIL_KEY_SUFFIX = "::exec-jail"
+
+
+def _exec_plane_cache_key(resolved_task_id: str) -> str:
+    """Namespace the env cache key for the jail exec plane (see above)."""
+    if _exec_backend_is_jail() and not resolved_task_id.endswith(_EXEC_JAIL_KEY_SUFFIX):
+        return f"{resolved_task_id}{_EXEC_JAIL_KEY_SUFFIX}"
+    return resolved_task_id
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1376,10 +1420,26 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         from tools.environments.sylva_sandbox import SylvaSandboxEnvironment
         return SylvaSandboxEnvironment(cwd=cwd, timeout=timeout)
 
+    elif env_type == "jail-ssh":
+        # PRD-047 FR-1/FR-5: the exec-plane jail. Hardened, no-sync SSH backend
+        # pointed at the isolated `hermes-exec` container over the p2p bridge.
+        # Self-contained config from JAIL_SSH_* env (no config.yaml surface);
+        # NOT in the approval container-skip set so the tirith/approval gate
+        # still fires. Fail-closed jail validation runs in its __init__.
+        from tools.environments.jail_ssh import JailSSHEnvironment
+        return JailSSHEnvironment(
+            host=os.getenv("JAIL_SSH_HOST", "hermes-exec"),
+            user=os.getenv("JAIL_SSH_USER", "hermes"),
+            port=int(os.getenv("JAIL_SSH_PORT", "2222")),
+            key_path=os.getenv("JAIL_SSH_KEY", "/opt/execbridge/client/id_ed25519"),
+            cwd=cwd if cwd and cwd.startswith("/opt/data") else "/opt/data/work",
+            timeout=timeout,
+        )
+
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'ssh', or 'sylva-sandbox'"
+            f"'singularity', 'modal', 'daytona', 'ssh', 'sylva-sandbox', or 'jail-ssh'"
         )
 
 
@@ -1907,13 +1967,20 @@ def terminal_tool(
 
         # Get configuration
         config = _get_env_config()
-        env_type = config["env_type"]
+        # PRD-047 FR-5: route the agent's shell exec to the jail plane when the
+        # HERMES_EXEC_BACKEND flag selects it (file tools stay on the base type
+        # via their own _get_env_config read — STOP-4).
+        env_type = _resolve_exec_env_type(config["env_type"])
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        # PRD-047 STOP-1: namespace the exec-plane cache slot so the jail env
+        # never collides with the local file-tool env under the shared
+        # "default" key (fail-open bypass otherwise).
+        effective_task_id = _exec_plane_cache_key(effective_task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``

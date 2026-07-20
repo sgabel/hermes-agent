@@ -1,0 +1,32 @@
+# PRD-047 FR-5 — hardened sshd for the hermes-exec jail plane.
+# Runs NON-ROOT (same-user logins only, no privilege separation needed) on the
+# p2p hermes-exec-bridge. Every forwarding/tunnel channel is off (jail-pass
+# NF-3); no sftp subsystem (file movement happens via the shared workspace
+# mounts, never the SSH channel). Host key + authorized_keys are provisioned
+# host-side (scripts/prd047-provision-execbridge.sh) and mounted read-only.
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /opt/execbridge/server/ssh_host_ed25519_key
+AuthorizedKeysFile /opt/execbridge/server/authorized_keys
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM no
+PermitRootLogin no
+AllowUsers hermes
+DisableForwarding yes
+AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+X11Forwarding no
+PermitTunnel no
+PermitUserEnvironment no
+PermitTTY yes
+MaxSessions 8
+MaxStartups 8
+LoginGraceTime 20
+ClientAliveInterval 60
+ClientAliveCountMax 3
+PidFile /tmp/hermes-exec-sshd.pid
+LogLevel VERBOSE

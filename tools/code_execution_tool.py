@@ -608,16 +608,24 @@ def _get_or_create_env(task_id: str):
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _resolve_container_task_id, _resolve_exec_env_type, _exec_plane_cache_key,
     )
 
-    effective_task_id = _resolve_container_task_id(task_id)
+    # PRD-047 FR-5: report the effective (jail-aware) env_type for cached envs
+    # so the fast-path return matches how the env was actually built.
+    def _eff_env_type() -> str:
+        return _resolve_exec_env_type(_get_env_config()["env_type"])
+
+    # PRD-047 STOP-1: namespace the exec-plane cache slot (see terminal_tool
+    # _exec_plane_cache_key) so a jail-routed exec never reuses — or is reused
+    # by — the local file-tool env under the shared "default" key.
+    effective_task_id = _exec_plane_cache_key(_resolve_container_task_id(task_id))
 
     # Fast path: environment already exists
     with _env_lock:
         if effective_task_id in _active_environments:
             _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+            return _active_environments[effective_task_id], _eff_env_type()
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
     with _creation_locks_lock:
@@ -629,10 +637,12 @@ def _get_or_create_env(task_id: str):
         with _env_lock:
             if effective_task_id in _active_environments:
                 _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+                return _active_environments[effective_task_id], _eff_env_type()
 
         config = _get_env_config()
-        env_type = config["env_type"]
+        # PRD-047 FR-5: build the jail backend when the exec flag selects it
+        # (_resolve_exec_env_type imported at the top of this function).
+        env_type = _resolve_exec_env_type(config["env_type"])
         overrides = _task_env_overrides.get(effective_task_id, {})
 
         if env_type == "docker":
@@ -892,11 +902,17 @@ def _execute_remote(
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
+
+    # PRD-047 FR-6 (jail-design pass STOP-5): on the isolated jail plane, DO NOT
+    # fall back to the full sandbox toolset when the per-turn intersection is
+    # empty — generate no stubs so out-of-allowlist file-RPC tool requests are
+    # denied. The stock fallback is preserved for every non-jail backend so a
+    # dark ship changes no live behavior.
+    if not sandbox_tools and env_type != "jail-ssh":
+        sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     sandbox_id = uuid.uuid4().hex[:12]
     temp_dir = _env_temp_dir(env)
@@ -1102,8 +1118,10 @@ def execute_code(
         return tool_error("No code provided.")
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config
-    env_type = _get_env_config()["env_type"]
+    # PRD-047 FR-5: the jail plane routes execute_code through the remote
+    # (file-RPC) path when HERMES_EXEC_BACKEND=jail-ssh selects it.
+    from tools.terminal_tool import _get_env_config, _resolve_exec_env_type
+    env_type = _resolve_exec_env_type(_get_env_config()["env_type"])
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
