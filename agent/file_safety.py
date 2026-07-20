@@ -46,6 +46,17 @@ def build_write_denied_paths(home: str) -> set[str]:
             # Top-level Anthropic PKCE credential store remains sensitive even
             # when a profile is active; default/non-profile sessions still read it.
             str(hermes_root / ".anthropic_oauth.json"),
+            # PRD-047 increment 2 — identity + memory-backend + schedule state the
+            # agent must never write via a file tool (the exec plane is separately
+            # jailed; this closes the file-tool path). NOTE: auth.json is excluded
+            # on purpose — it's a T4-gated "control file", not hard-denied here
+            # (see TestIsWriteDenied.test_control_files_requested_writable).
+            str(hermes_home / "SOUL.md"),
+            str(hermes_root / "SOUL.md"),
+            str(hermes_home / "mem0.json"),
+            str(hermes_root / "mem0.json"),
+            str(hermes_home / "cron" / "jobs.json"),
+            str(hermes_root / "cron" / "jobs.json"),
             os.path.join(home, ".netrc"),
             os.path.join(home, ".pgpass"),
             os.path.join(home, ".npmrc"),
@@ -60,6 +71,8 @@ def build_write_denied_paths(home: str) -> set[str]:
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
+    hermes_home = _hermes_home_path()
+    hermes_root = _hermes_root_path()
     return [
         os.path.realpath(p) + os.sep
         for p in [
@@ -73,6 +86,10 @@ def build_write_denied_prefixes(home: str) -> list[str]:
             os.path.join(home, ".azure"),
             os.path.join(home, ".config", "gh"),
             os.path.join(home, ".config", "gcloud"),
+            # PRD-047 increment 2 — the governance spine (kill switch / budget /
+            # audit ledger) is never agent-writable via a file tool.
+            str(hermes_home / "autonomy"),
+            str(hermes_root / "autonomy"),
         ]
     ]
 

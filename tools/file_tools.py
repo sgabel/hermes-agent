@@ -371,6 +371,70 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+# PRD-047 increment 2 — Hermes governance + identity + credential state the agent
+# must NEVER write through a file tool. The exec-plane jail (increment 1) closed the
+# EXEC route to these; file tools run gateway-side, so a prompt-injected agent could
+# still rewrite SOUL.md (identity), pause governance (autonomy/QUIESCE), or edit its
+# own schedule (cron/jobs.json) via write_file. This closes that write path. READS
+# are unaffected — this guard only runs on writes, so the self-brief still reads
+# SOUL.md, etc. (Defense-in-depth; the terminal/exec path is separately jailed.)
+_HERMES_PROTECTED_WRITE_BASENAMES = (
+    "SOUL.md",                              # identity bedrock
+    ".env",                                 # secrets (dashboard/api keys)
+    "mem0.json",                            # memory-backend config
+    ".anthropic_oauth.json",
+    os.path.join("cron", "jobs.json"),     # schedule + prompts self-reconfig
+    # NOTE: auth.json is deliberately NOT here — it is a "control file" gated by
+    # the T4 capability classifier + read-block (its writes are OAuth-refresh
+    # territory), not hard-denied. See tests/tools/test_file_operations.py.
+)
+_HERMES_PROTECTED_WRITE_DIRS = (
+    "autonomy",                             # governance spine: QUIESCE, budget, audit ledger
+    "mcp-tokens",                           # OAuth token material
+    "pairing",
+)
+_hermes_protected_write: tuple[frozenset, tuple] | None = None
+
+
+def _get_hermes_protected_write_targets() -> tuple[frozenset, tuple]:
+    """Return (exact_paths, dir_prefixes) of protected Hermes state under the
+    active HERMES_HOME and the global Hermes root (cached). Resolved so symlink
+    or ``..`` traversal to the same file is still caught."""
+    global _hermes_protected_write
+    if _hermes_protected_write is not None:
+        return _hermes_protected_write
+    dirs: list[Path] = []
+    try:
+        from agent.file_safety import _hermes_home_path, _hermes_root_path
+        for base in (_hermes_home_path(), _hermes_root_path()):
+            try:
+                real = Path(os.path.realpath(base))
+                if real not in dirs:
+                    dirs.append(real)
+            except Exception:
+                continue
+    except Exception:
+        try:
+            dirs.append(Path("~/.hermes").expanduser().resolve())
+        except Exception:
+            pass
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for d in dirs:
+        for name in _HERMES_PROTECTED_WRITE_BASENAMES:
+            try:
+                exact.add(os.path.realpath(str(d / name)))
+            except Exception:
+                continue
+        for sub in _HERMES_PROTECTED_WRITE_DIRS:
+            try:
+                prefixes.append(os.path.realpath(str(d / sub)) + os.sep)
+            except Exception:
+                continue
+    _hermes_protected_write = (frozenset(exact), tuple(prefixes))
+    return _hermes_protected_write
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -398,6 +462,23 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+    # PRD-047 increment 2 — Hermes governance / identity / credential state.
+    protected_exact, protected_prefixes = _get_hermes_protected_write_targets()
+    if resolved in protected_exact or normalized in protected_exact:
+        return (
+            f"Refusing to write to protected Hermes state: {filepath}\n"
+            "Identity (SOUL.md), governance (autonomy/), credentials, and the cron "
+            "schedule are not agent-writable. Reads are unaffected; use the proper "
+            "governed path (seed_canon/ratify for identity, 'hermes autonomy' / "
+            "'hermes cron' for governance) instead of a direct file write."
+        )
+    for prefix in protected_prefixes:
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
+            return (
+                f"Refusing to write to protected Hermes state: {filepath}\n"
+                "Governance/token state under autonomy/, mcp-tokens/, pairing/ is not "
+                "agent-writable (kill switch, budget, audit ledger). Reads are unaffected."
+            )
     return None
 
 
