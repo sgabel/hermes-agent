@@ -10,6 +10,7 @@ HostKey /opt/execbridge/server/ssh_host_ed25519_key
 AuthorizedKeysFile /opt/execbridge/server/authorized_keys
 PubkeyAuthentication yes
 PasswordAuthentication no
+PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 UsePAM no

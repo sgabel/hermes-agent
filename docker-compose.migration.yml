@@ -49,6 +49,13 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      # PRD-047 exec-plane flag. DARK BY DEFAULT: empty ⇒ agent shell/code exec
+      # runs local (legacy). Arm by recreating the gateway with the env set:
+      #   HERMES_UID=$(id -u) HERMES_GID=$(id -g) HERMES_EXEC_BACKEND=jail-ssh \
+      #     docker compose -p hermes-agent -f docker-compose.migration.yml \
+      #     up -d --force-recreate gateway
+      # (requires the exec-plane profile container already up + provisioned).
+      - HERMES_EXEC_BACKEND=${HERMES_EXEC_BACKEND:-}
       - HERMES_CONTAINERIZED=1     # NF-3: positive containment probe — local_exec_is_contained
                                    # (T2 re-tier) is honored ONLY when this is set / inside a container
       - MEM0_TELEMETRY=False       # PRD-036: silence mem0ai PostHog telemetry. Read at module-import

@@ -31,6 +31,14 @@ if [ -n "$CUR_UID" ] && [ "$CUR_UID" != "$TARGET_UID" ]; then
     usermod -u "$TARGET_UID" -g "$TARGET_GID" hermes 2>/dev/null || true
 fi
 
+# The image bakes `hermes` as a LOCKED service account (no password). With
+# `UsePAM no`, sshd refuses ALL auth — including pubkey — to a locked account
+# ("User hermes not allowed because account is locked"). Clear the password so
+# pubkey login is permitted. Password login stays impossible: sshd_config sets
+# `PasswordAuthentication no` + `PermitEmptyPasswords no`, and the jail has no
+# other login surface. (Pubkey-only isolated service-account pattern.)
+passwd -d hermes >/dev/null 2>&1 || true
+
 # sshd privilege-separation dir (root-owned, mode 0755). Standard requirement.
 mkdir -p /run/sshd
 chmod 0755 /run/sshd
