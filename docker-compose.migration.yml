@@ -46,6 +46,16 @@ services:
       # re-owns it (FR-11 chown-lock exclusion). The relay itself runs host-side
       # as a systemd USER service; this mount only exposes the socket to reach it.
       - ~/.hermes-relay:/opt/relay:ro
+      # Managed-scope security floor (2026-07-21): a root-owned policy file that
+      # PINS approvals.mode/cron_mode, tirith enabled/fail_open, and
+      # capability_policy_mode. Mounted as a whole RO directory OUTSIDE /opt/data,
+      # so — unlike the config.yaml :ro mount above, which sits on the RW /opt/data
+      # parent and is defeatable by a dir-level rename — this has NO writable parent
+      # overlay and is genuinely immutable to the uid-1000 gateway. Effect
+      # (managed_scope): `hermes config set` on these keys is REFUSED (D2 guard) and
+      # the pinned values OVERRIDE ~/.hermes/config.yaml at load. Edit as root on the
+      # host (/etc/hermes/config.yaml); boot-chown-safe (outside /opt/data).
+      - /etc/hermes:/etc/hermes:ro
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
@@ -56,6 +66,10 @@ services:
       #     up -d --force-recreate gateway
       # (requires the exec-plane profile container already up + provisioned).
       - HERMES_EXEC_BACKEND=${HERMES_EXEC_BACKEND:-}
+      # Managed-scope dir (paired with the /etc/hermes:ro mount above). Explicit
+      # (the code also defaults to /etc/hermes when it is a dir); makes the security
+      # floor unconditional.
+      - HERMES_MANAGED_DIR=/etc/hermes
       - HERMES_CONTAINERIZED=1     # NF-3: positive containment probe — local_exec_is_contained
                                    # (T2 re-tier) is honored ONLY when this is set / inside a container
       - MEM0_TELEMETRY=False       # PRD-036: silence mem0ai PostHog telemetry. Read at module-import
