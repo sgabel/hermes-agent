@@ -124,6 +124,24 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
+
+    # Standalone entry so _get_platform_tools' recovery pass can enable the
+    # tool on any platform whose default composite carries it (cli, cron,
+    # api_server). Without this the tool name exists only inside composites
+    # and no resolution path ever advertises it — it is not a
+    # CONFIGURABLE_TOOLSETS key, so an explicit per-platform toolset list
+    # (e.g. the saved cli config) silently drops it (found live 2026-07-21:
+    # fedpulse_query was dark on every chat surface since the PRD-048 deploy).
+    "fedpulse_query": {
+        "description": (
+            "Read-only FedPulse database query via the host RO relay "
+            "(PRD-048). Advertised only when the relay socket + bearer are "
+            "mounted (check_fn); the relay's AST validation / denylists / "
+            "read-only transaction / DLP / budget are authoritative."
+        ),
+        "tools": ["fedpulse_query"],
+        "includes": []
+    },
     
     "vision": {
         "description": "Image analysis and vision tools",
@@ -443,7 +461,12 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-
+            # Claude advisory second-opinion (PRD-035 relay; check_fn-gated).
+            # Added 2026-07-21 — this hand-maintained list predated the relay
+            # tools, leaving api_server sessions (dashboard chat) without them.
+            "ask_claude",
+            # FedPulse read-only DB query (PRD-048 relay; check_fn-gated).
+            "fedpulse_query",
         ],
         "includes": []
     },
